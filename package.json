@@ -1,0 +1,21 @@
+{
+  "name": "bulwark-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Push notification relay for Bulwark Webmail. Accepts JMAP StateChange bodies and forwards as FCM / APNs pushes so self-hosters don't need their own Firebase project.",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

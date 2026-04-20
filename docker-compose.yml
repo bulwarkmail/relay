@@ -1,0 +1,20 @@
+services:
+  relay:
+    build: .
+    image: bulwark-relay:local
+    container_name: bulwark-relay
+    restart: unless-stopped
+    ports:
+      - 127.0.0.1:3003:3003
+    volumes:
+      - ./data:/app/data
+    environment:
+      - NODE_ENV=production
+      - PORT=3003
+      - PUSH_DATA_DIR=/app/data
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:3003/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
