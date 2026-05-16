@@ -3,8 +3,30 @@ import { URL } from 'node:url';
 import { logger } from './logger.js';
 import { subscriptionStore } from './store.js';
 import { sendFcmPush } from './fcm.js';
-import { isValidFcmToken, isValidSubscriptionId } from './validation.js';
-import type { JmapPushBody, SubscriptionRecord } from './types.js';
+import { getVapidPublicKey, sendWebPush } from './webpush.js';
+import {
+  isValidFcmToken,
+  isValidSubscriptionId,
+  isValidWebPushSubscription,
+} from './validation.js';
+import type {
+  FcmSubscriptionRecord,
+  JmapPushBody,
+  SubscriptionRecord,
+  WebSubscriptionRecord,
+} from './types.js';
+import {
+  registry,
+  httpRequestsTotal,
+  httpDurationSeconds,
+  subscriptionsRegistered,
+  subscriptionsUnregistered,
+  subscriptionsActive,
+  pushesReceived,
+  pushesForwarded,
+  fcmDurationSeconds,
+  webPushDurationSeconds,
+} from './metrics.js';
 
 const PORT = Number(process.env.PORT ?? 3003);
 const HOST = process.env.HOST ?? '0.0.0.0';
@@ -63,6 +85,24 @@ async function readJson(req: http.IncomingMessage): Promise<unknown> {
   });
 }
 
+// The relay is meant to be reachable from any Bulwark deployment's browser
+// frontend, so we serve permissive CORS. There are no cookies or credentials
+// in any request, so `*` here is safe - opaque subscription ids and FCM
+// tokens are the only secrets and clients post them as request bodies.
+const CORS_HEADERS: Record<string, string> = {
+  'access-control-allow-origin': '*',
+  'access-control-allow-methods': 'GET, POST, DELETE, OPTIONS',
+  'access-control-allow-headers': 'content-type',
+  'access-control-max-age': '86400',
+};
+
+function applyCors(req: http.IncomingMessage, res: http.ServerResponse): void {
+  if (!req.headers.origin) return;
+  for (const [k, v] of Object.entries(CORS_HEADERS)) {
+    res.setHeader(k, v);
+  }
+}
+
 function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
@@ -93,15 +133,69 @@ async function handleRegister(
   }
 
   const existing = await subscriptionStore.get(subscriptionId);
-  const record: SubscriptionRecord = {
+  const record: FcmSubscriptionRecord = {
+    kind: 'fcm',
     fcmToken,
-    verificationCode: existing?.verificationCode ?? null,
+    // Always start fresh: a stale verificationCode left over from a previous
+    // (now-expired) JMAP subscription would be returned by /verify polling
+    // before Stalwart's new PushVerification arrives, and the client would
+    // verify with the wrong code. Stalwart re-sends PushVerification on
+    // every fresh subscription, so dropping the old code is safe - the warm
+    // path (existing JMAP sub still alive) skips polling entirely.
+    verificationCode: null,
     createdAt: existing?.createdAt ?? Date.now(),
     lastPushAt: existing?.lastPushAt ?? null,
     accountLabel:
       typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
   };
   await subscriptionStore.put(subscriptionId, record);
+  subscriptionsRegistered.inc({ transport: 'fcm' });
+  await refreshActiveGauge();
+  return sendJson(res, 200, { ok: true });
+}
+
+async function handleRegisterWeb(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  // Refuse the registration up front if the operator hasn't configured VAPID
+  // keys - we'd accept the record but every push would fail.
+  if (!getVapidPublicKey()) {
+    return sendJson(res, 503, { error: 'Web Push not configured' });
+  }
+  const body = (await readJson(req)) as
+    | {
+        subscriptionId?: unknown;
+        subscription?: unknown;
+        accountLabel?: unknown;
+      }
+    | null
+    | undefined;
+  if (!body || typeof body !== 'object') {
+    return sendJson(res, 400, { error: 'Invalid JSON' });
+  }
+  const { subscriptionId, subscription, accountLabel } = body;
+  if (!isValidSubscriptionId(subscriptionId)) {
+    return sendJson(res, 400, { error: 'Invalid subscriptionId' });
+  }
+  if (!isValidWebPushSubscription(subscription)) {
+    return sendJson(res, 400, { error: 'Invalid subscription' });
+  }
+
+  const existing = await subscriptionStore.get(subscriptionId);
+  const record: WebSubscriptionRecord = {
+    kind: 'web',
+    webPush: subscription,
+    // See handleRegister for why we always reset this.
+    verificationCode: null,
+    createdAt: existing?.createdAt ?? Date.now(),
+    lastPushAt: existing?.lastPushAt ?? null,
+    accountLabel:
+      typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
+  };
+  await subscriptionStore.put(subscriptionId, record);
+  subscriptionsRegistered.inc({ transport: 'web' });
+  await refreshActiveGauge();
   return sendJson(res, 200, { ok: true });
 }
 
@@ -112,7 +206,15 @@ async function handleUnregister(
   if (!isValidSubscriptionId(id)) {
     return sendJson(res, 400, { error: 'Invalid subscriptionId' });
   }
+  // Look up the record before deleting so we can attribute the unregister to
+  // the right transport in metrics.
+  const existing = await subscriptionStore.get(id);
   await subscriptionStore.delete(id);
+  subscriptionsUnregistered.inc({
+    reason: 'client',
+    transport: existing?.kind ?? 'unknown',
+  });
+  await refreshActiveGauge();
   return sendJson(res, 200, { ok: true });
 }
 
@@ -150,17 +252,31 @@ async function handleJmap(
   }
 
   if (body['@type'] === 'PushVerification') {
+    pushesReceived.inc({ type: 'PushVerification' });
     record.verificationCode = body.verificationCode;
     await subscriptionStore.put(id, record);
     return sendJson(res, 200, { ok: true });
   }
 
   if (body['@type'] === 'StateChange') {
-    const result = await sendFcmPush(record, body);
+    pushesReceived.inc({ type: 'StateChange' });
+    const result = await dispatchStateChange(record, body);
+    let outcome: 'ok' | 'unregistered' | 'http-4xx' | 'http-5xx' | 'fail';
+    if (result.unregistered) outcome = 'unregistered';
+    else if (result.ok) outcome = 'ok';
+    else if (result.status >= 500) outcome = 'http-5xx';
+    else if (result.status >= 400) outcome = 'http-4xx';
+    else outcome = 'fail';
+    pushesForwarded.inc({ result: outcome, transport: record.kind });
     record.lastPushAt = Date.now();
     await subscriptionStore.put(id, record);
     if (result.unregistered) {
       await subscriptionStore.delete(id);
+      subscriptionsUnregistered.inc({
+        reason: record.kind === 'fcm' ? 'fcm-unregistered' : 'webpush-gone',
+        transport: record.kind,
+      });
+      await refreshActiveGauge();
     }
     return sendJson(res, 200, { ok: result.ok });
   }
@@ -168,13 +284,74 @@ async function handleJmap(
   return sendJson(res, 400, { error: 'Unsupported JMAP push type' });
 }
 
+async function dispatchStateChange(
+  record: SubscriptionRecord,
+  body: Extract<JmapPushBody, { '@type': 'StateChange' }>,
+): Promise<{ ok: boolean; status: number; unregistered: boolean }> {
+  if (record.kind === 'fcm') {
+    const timer = fcmDurationSeconds.startTimer();
+    const result = await sendFcmPush(record, body);
+    timer();
+    return result;
+  }
+  const timer = webPushDurationSeconds.startTimer();
+  const result = await sendWebPush(record, body);
+  timer();
+  return result;
+}
+
+// Refresh the active-subscriptions gauge by counting per-transport. Called
+// after every register/unregister and on every /metrics scrape so the gauge
+// stays consistent with the on-disk state.
+async function refreshActiveGauge(): Promise<void> {
+  const counts = await subscriptionStore.sizeByKind();
+  subscriptionsActive.set({ transport: 'fcm' }, counts.fcm);
+  subscriptionsActive.set({ transport: 'web' }, counts.web);
+}
+
+function normalizeRoute(method: string, path: string): string {
+  if (path === '/' || path === '/index.html') return '/';
+  if (path === '/api/health') return '/api/health';
+  if (path === '/metrics') return '/metrics';
+  if (path === '/api/push/vapid-public-key') return '/api/push/vapid-public-key';
+  if (method === 'POST' && path === '/api/push/register') return '/api/push/register';
+  if (method === 'POST' && path === '/api/push/register/web') return '/api/push/register/web';
+  if (/^\/api\/push\/register\/[^/]+$/.test(path)) return '/api/push/register/:id';
+  if (/^\/api\/push\/verify\/[^/]+$/.test(path)) return '/api/push/verify/:id';
+  if (/^\/api\/push\/jmap\/[^/]+$/.test(path)) return '/api/push/jmap/:id';
+  return 'other';
+}
+
 const server = http.createServer(async (req, res) => {
   const started = Date.now();
   const method = req.method ?? 'GET';
   const url = new URL(req.url ?? '/', 'http://localhost');
   const path = url.pathname;
+  const route = normalizeRoute(method, path);
+  const httpTimer = httpDurationSeconds.startTimer({ method, route });
+
+  applyCors(req, res);
+  if (method === 'OPTIONS') {
+    // Preflight: 204 with the CORS headers already set above.
+    res.writeHead(204);
+    res.end();
+    httpTimer();
+    httpRequestsTotal.inc({ method, route, status: '204' });
+    return;
+  }
 
   try {
+    if (method === 'GET' && path === '/metrics') {
+      await refreshActiveGauge();
+      const body = await registry.metrics();
+      res.writeHead(200, {
+        'content-type': registry.contentType,
+        'cache-control': 'no-store',
+      });
+      res.end(body);
+      return;
+    }
+
     if (method === 'GET' && path === '/api/health') {
       const count = await subscriptionStore.size();
       return sendJson(res, 200, { ok: true, subscriptions: count });
@@ -200,6 +377,18 @@ const server = http.createServer(async (req, res) => {
 
     if (method === 'POST' && path === '/api/push/register') {
       return await handleRegister(req, res);
+    }
+
+    if (method === 'POST' && path === '/api/push/register/web') {
+      return await handleRegisterWeb(req, res);
+    }
+
+    if (method === 'GET' && path === '/api/push/vapid-public-key') {
+      const key = getVapidPublicKey();
+      if (!key) {
+        return sendJson(res, 503, { error: 'Web Push not configured' });
+      }
+      return sendJson(res, 200, { publicKey: key });
     }
 
     const registerIdMatch = path.match(/^\/api\/push\/register\/([^/]+)$/);
@@ -229,6 +418,8 @@ const server = http.createServer(async (req, res) => {
     }
     res.end();
   } finally {
+    httpTimer();
+    httpRequestsTotal.inc({ method, route, status: String(res.statusCode) });
     logger.info('relay: request', {
       method,
       path,

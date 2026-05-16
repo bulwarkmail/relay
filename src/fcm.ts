@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import type { StateChange, SubscriptionRecord } from './types.js';
+import type { FcmSubscriptionRecord, StateChange } from './types.js';
 
 interface ServiceAccount {
   type: string;
@@ -89,7 +89,7 @@ export interface FcmSendResult {
 }
 
 export async function sendFcmPush(
-  record: SubscriptionRecord,
+  record: FcmSubscriptionRecord,
   change: StateChange,
 ): Promise<FcmSendResult> {
   const account = await loadServiceAccount();

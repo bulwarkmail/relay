@@ -24,17 +24,20 @@ mail content: only opaque FCM tokens, state-id hashes, and timing.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/api/push/register` | Mobile app stores its FCM token against an opaque `subscriptionId` |
+| `POST` | `/api/push/register/web` | PWA stores a Web Push subscription (`endpoint` + `keys`) against an opaque `subscriptionId` |
 | `DELETE` | `/api/push/register/:id` | Tear down mapping (logout / uninstall) |
 | `GET` | `/api/push/verify/:id` | Poll for the JMAP `PushVerification` code |
-| `POST` | `/api/push/jmap/:id` | JMAP server posts `PushVerification` or `StateChange` here |
+| `POST` | `/api/push/jmap/:id` | JMAP server posts `PushVerification` or `StateChange` here — relay dispatches FCM or Web Push depending on the stored record |
+| `GET` | `/api/push/vapid-public-key` | Returns the relay's VAPID public key so browsers can subscribe |
 | `GET` | `/api/health` | Liveness probe |
 
 ## What it stores
 
-Per `subscriptionId`: the FCM token, an optional one-shot verification code,
-an optional free-form `accountLabel` (max 120 chars), and timestamps. No user
-identity, no server URL, no mail content. Subscriptions older than 30 days
-without traffic are evicted automatically.
+Per `subscriptionId`: either an FCM token (mobile) or a Web Push subscription
+(`endpoint` + `p256dh`/`auth` keys for the PWA), an optional one-shot
+verification code, an optional free-form `accountLabel` (max 120 chars), and
+timestamps. No user identity, no server URL, no mail content. Subscriptions
+older than 90 days without traffic are evicted automatically.
 
 ## Run locally
 
@@ -60,6 +63,9 @@ docker compose up -d
 | `HOST` | `0.0.0.0` | |
 | `PUSH_DATA_DIR` | `./data` | Where `subscriptions.json` and the FCM key live |
 | `FCM_SERVICE_ACCOUNT_JSON` | unset | Either the full JSON inline or an absolute path — falls back to `$PUSH_DATA_DIR/fcm-service-account.json` |
+| `VAPID_PUBLIC_KEY` | unset | Base64url-encoded P-256 public key for Web Push. Generate with `npx web-push generate-vapid-keys` |
+| `VAPID_PRIVATE_KEY` | unset | Matching private key. Web Push is disabled if either VAPID var is missing |
+| `VAPID_SUBJECT` | `mailto:postmaster@localhost` | `mailto:` or `https:` contact the push services can reach if the relay misbehaves (RFC 8292) |
 
 ## License
 

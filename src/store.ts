@@ -4,7 +4,10 @@ import path from 'node:path';
 import { logger } from './logger.js';
 import type { SubscriptionRecord } from './types.js';
 
-const TTL_MS = 30 * 24 * 60 * 60 * 1000;
+// Aligned with the JMAP PushSubscription expires the mobile client requests
+// (90 days). The relay record gets refreshed on every push, so this only
+// matters for users who go quiet for ~3 months.
+const TTL_MS = 90 * 24 * 60 * 60 * 1000;
 
 function getPushDir(): string {
   return process.env.PUSH_DATA_DIR || path.join(process.cwd(), 'data');
@@ -28,6 +31,7 @@ class SubscriptionStore {
       const raw = await readFile(subscriptionsPath(), 'utf-8');
       const parsed = JSON.parse(raw) as SubscriptionsFile;
       this.cache = parsed.records ?? {};
+      this.migrateLegacyRecords();
       this.evictExpired();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
@@ -77,6 +81,17 @@ class SubscriptionStore {
     return Object.keys(this.cache).length;
   }
 
+  async sizeByKind(): Promise<{ fcm: number; web: number }> {
+    await this.ensureLoaded();
+    let fcm = 0;
+    let web = 0;
+    for (const record of Object.values(this.cache)) {
+      if (record.kind === 'fcm') fcm++;
+      else if (record.kind === 'web') web++;
+    }
+    return { fcm, web };
+  }
+
   private isExpired(record: SubscriptionRecord): boolean {
     const age = Date.now() - (record.lastPushAt ?? record.createdAt);
     return age > TTL_MS;
@@ -85,6 +100,17 @@ class SubscriptionStore {
   private evictExpired(): void {
     for (const [id, record] of Object.entries(this.cache)) {
       if (this.isExpired(record)) delete this.cache[id];
+    }
+  }
+
+  // Records written before the FCM/Web Push split only had `fcmToken`. Stamp
+  // them with `kind: 'fcm'` so the dispatcher in server.ts can branch on it.
+  private migrateLegacyRecords(): void {
+    for (const [id, record] of Object.entries(this.cache)) {
+      const r = record as Partial<SubscriptionRecord> & { fcmToken?: string };
+      if (!r.kind && typeof r.fcmToken === 'string') {
+        this.cache[id] = { ...(r as object), kind: 'fcm' } as SubscriptionRecord;
+      }
     }
   }
 
