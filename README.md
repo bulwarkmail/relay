@@ -27,6 +27,7 @@ mail content: only opaque FCM tokens, state-id hashes, and timing.
 | `POST` | `/api/push/register/web` | PWA stores a Web Push subscription (`endpoint` + `keys`) against an opaque `subscriptionId` |
 | `DELETE` | `/api/push/register/:id` | Tear down mapping (logout / uninstall) |
 | `GET` | `/api/push/verify/:id` | Poll for the JMAP `PushVerification` code |
+| `GET` | `/api/push/active/:id` | Liveness probe — `{ active }` if the subscription has forwarded a push (or was just registered); `404` if unknown. Clients use it to reap dead leftover subscriptions without touching live ones |
 | `POST` | `/api/push/jmap/:id` | JMAP server posts `PushVerification` or `StateChange` here — relay dispatches FCM or Web Push depending on the stored record |
 | `GET` | `/api/push/vapid-public-key` | Returns the relay's VAPID public key so browsers can subscribe |
 | `GET` | `/api/health` | Liveness probe |

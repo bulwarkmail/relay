@@ -33,6 +33,14 @@ const HOST = process.env.HOST ?? '0.0.0.0';
 const MAX_BODY_BYTES = 64 * 1024;
 const REPO_URL = 'https://github.com/bulwarkmail/relay';
 
+// How long after registration we still report a subscription as "active" even
+// though it has never forwarded a push. A freshly-created subscription hasn't
+// received a StateChange yet (the account may simply have no new mail during
+// setup), so without this grace a client racing setup on another device could
+// see the in-progress one as dead and reap it. 10 minutes comfortably covers
+// the JMAP verify window plus slack.
+const ACTIVE_GRACE_MS = 10 * 60 * 1000;
+
 const LANDING_HTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -232,6 +240,31 @@ async function handleVerifyPoll(
   return sendJson(res, 200, { verificationCode: record.verificationCode ?? null });
 }
 
+// Liveness probe used by clients during setup to decide whether a leftover JMAP
+// PushSubscription on the account belongs to a still-active device (keep it) or
+// is dead debris starving the new one's verification (safe to reap). Stalwart
+// hides a subscription's verified state and URL from clients, so the relay -
+// which sees the actual push traffic - is the only place that can tell them
+// apart. A verified, working subscription receives StateChange pushes and so
+// has a non-null lastPushAt; one that never verified never receives a push.
+// 404 (unknown id) deliberately means "not on this relay" so callers leave it
+// alone rather than reaping another relay's or a non-Bulwark client's record.
+async function handleActivePoll(
+  id: string,
+  res: http.ServerResponse,
+): Promise<void> {
+  if (!isValidSubscriptionId(id)) {
+    return sendJson(res, 400, { error: 'Invalid subscriptionId' });
+  }
+  const record = await subscriptionStore.get(id);
+  if (!record) {
+    return sendJson(res, 404, { error: 'Unknown subscription' });
+  }
+  const active =
+    record.lastPushAt != null || Date.now() - record.createdAt < ACTIVE_GRACE_MS;
+  return sendJson(res, 200, { active });
+}
+
 async function handleJmap(
   req: http.IncomingMessage,
   id: string,
@@ -318,6 +351,7 @@ function normalizeRoute(method: string, path: string): string {
   if (method === 'POST' && path === '/api/push/register/web') return '/api/push/register/web';
   if (/^\/api\/push\/register\/[^/]+$/.test(path)) return '/api/push/register/:id';
   if (/^\/api\/push\/verify\/[^/]+$/.test(path)) return '/api/push/verify/:id';
+  if (/^\/api\/push\/active\/[^/]+$/.test(path)) return '/api/push/active/:id';
   if (/^\/api\/push\/jmap\/[^/]+$/.test(path)) return '/api/push/jmap/:id';
   return 'other';
 }
@@ -399,6 +433,11 @@ const server = http.createServer(async (req, res) => {
     const verifyMatch = path.match(/^\/api\/push\/verify\/([^/]+)$/);
     if (method === 'GET' && verifyMatch) {
       return await handleVerifyPoll(decodeURIComponent(verifyMatch[1]), res);
+    }
+
+    const activeMatch = path.match(/^\/api\/push\/active\/([^/]+)$/);
+    if (method === 'GET' && activeMatch) {
+      return await handleActivePoll(decodeURIComponent(activeMatch[1]), res);
     }
 
     const jmapMatch = path.match(/^\/api\/push\/jmap\/([^/]+)$/);
