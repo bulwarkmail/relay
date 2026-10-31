@@ -54,14 +54,21 @@ export const pushesReceived = new Counter({
 
 export const pushesForwarded = new Counter({
   name: 'relay_pushes_forwarded_total',
-  help: 'Push forwarding outcomes by transport',
-  labelNames: ['result', 'transport'] as const,
+  help: 'Push forwarding outcomes by transport and push service HTTP status ("none" = no response)',
+  labelNames: ['result', 'transport', 'status'] as const,
   registers: [registry],
 });
 
 export const fcmDurationSeconds = new Histogram({
   name: 'relay_fcm_send_duration_seconds',
   help: 'Latency of POST to fcm.googleapis.com',
+  buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+  registers: [registry],
+});
+
+export const apnsDurationSeconds = new Histogram({
+  name: 'relay_apns_send_duration_seconds',
+  help: 'Latency of POST to api.push.apple.com (or the sandbox)',
   buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
   registers: [registry],
 });

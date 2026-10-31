@@ -3,10 +3,21 @@ import { URL } from 'node:url';
 import { logger } from './logger.js';
 import { subscriptionStore } from './store.js';
 import { sendFcmPush } from './fcm.js';
+import { getApnsConfig, sendApnsPush } from './apns.js';
 import { getVapidPublicKey, sendWebPush } from './webpush.js';
 import { sendUnifiedPush } from './unifiedpush.js';
 import { isForwardableBody, toForwardPayload } from './payload.js';
 import {
+  classifyForward,
+  failureReason,
+  pushServiceHost,
+  statusLabel,
+  type ForwardOutcome,
+  type SendResult,
+} from './forward-result.js';
+import {
+  isValidApnsEnvironment,
+  isValidApnsToken,
   isValidFcmToken,
   isValidSubscriptionId,
   isValidUnifiedPushEndpoint,
@@ -14,6 +25,7 @@ import {
   isValidWebPushSubscription,
 } from './validation.js';
 import type {
+  ApnsSubscriptionRecord,
   FcmSubscriptionRecord,
   ForwardPayload,
   JmapPushBody,
@@ -31,6 +43,7 @@ import {
   pushesReceived,
   pushesForwarded,
   fcmDurationSeconds,
+  apnsDurationSeconds,
   webPushDurationSeconds,
   upDurationSeconds,
 } from './metrics.js';
@@ -165,6 +178,51 @@ async function handleRegister(
   };
   await subscriptionStore.put(subscriptionId, record);
   subscriptionsRegistered.inc({ transport: 'fcm' });
+  await refreshActiveGauge();
+  return sendJson(res, 200, { ok: true });
+}
+
+// The iOS app. Refused up front when the relay has no APNs key, as Web Push
+// is without VAPID keys: the record would be accepted but every push fail.
+async function handleRegisterApns(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  if (!(await getApnsConfig())) {
+    return sendJson(res, 503, { error: 'APNs not configured' });
+  }
+  const body = (await readJson(req)) as
+    | { subscriptionId?: unknown; deviceToken?: unknown; environment?: unknown; accountLabel?: unknown }
+    | null
+    | undefined;
+  if (!body || typeof body !== 'object') {
+    return sendJson(res, 400, { error: 'Invalid JSON' });
+  }
+  const { subscriptionId, deviceToken, environment, accountLabel } = body;
+  if (!isValidSubscriptionId(subscriptionId)) {
+    return sendJson(res, 400, { error: 'Invalid subscriptionId' });
+  }
+  if (!isValidApnsToken(deviceToken)) {
+    return sendJson(res, 400, { error: 'Invalid deviceToken' });
+  }
+  if (!isValidApnsEnvironment(environment)) {
+    return sendJson(res, 400, { error: 'Invalid environment' });
+  }
+
+  const existing = await subscriptionStore.get(subscriptionId);
+  const record: ApnsSubscriptionRecord = {
+    kind: 'apns',
+    deviceToken: deviceToken.toLowerCase(),
+    environment,
+    // See handleRegister for why we always reset this.
+    verificationCode: null,
+    createdAt: existing?.createdAt ?? Date.now(),
+    lastPushAt: existing?.lastPushAt ?? null,
+    accountLabel:
+      typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
+  };
+  await subscriptionStore.put(subscriptionId, record);
+  subscriptionsRegistered.inc({ transport: 'apns' });
   await refreshActiveGauge();
   return sendJson(res, 200, { ok: true });
 }
@@ -351,14 +409,25 @@ async function handleJmap(
   // messages that passed - both become the same content-blind device payload.
   if (isForwardableBody(body)) {
     pushesReceived.inc({ type: body['@type'] });
-    const result = await dispatch(record, toForwardPayload(body, record.accountLabel));
-    let outcome: 'ok' | 'unregistered' | 'http-4xx' | 'http-5xx' | 'fail';
-    if (result.unregistered) outcome = 'unregistered';
-    else if (result.ok) outcome = 'ok';
-    else if (result.status >= 500) outcome = 'http-5xx';
-    else if (result.status >= 400) outcome = 'http-4xx';
-    else outcome = 'fail';
-    pushesForwarded.inc({ result: outcome, transport: record.kind });
+    let result: SendResult;
+    try {
+      result = await dispatch(record, toForwardPayload(body, record.accountLabel));
+    } catch (error) {
+      // FCM token minting and sending throw on network errors. Count and log
+      // them like any other failed forward, then answer 500 as before so the
+      // JMAP server may retry.
+      const failed = { ok: false, status: 0, unregistered: false, reason: failureReason(error) };
+      pushesForwarded.inc({ result: 'fail', transport: record.kind, status: 'none' });
+      logForwardFailure(id, record, 'fail', failed);
+      return sendJson(res, 500, { error: 'Internal server error' });
+    }
+    const outcome = classifyForward(result);
+    pushesForwarded.inc({
+      result: outcome,
+      transport: record.kind,
+      status: statusLabel(result.status),
+    });
+    if (outcome !== 'ok') logForwardFailure(id, record, outcome, result);
     record.lastPushAt = Date.now();
     await subscriptionStore.put(id, record);
     if (result.unregistered) {
@@ -366,9 +435,11 @@ async function handleJmap(
       const reason =
         record.kind === 'fcm'
           ? 'fcm-unregistered'
-          : record.kind === 'up'
-            ? 'unifiedpush-gone'
-            : 'webpush-gone';
+          : record.kind === 'apns'
+            ? 'apns-unregistered'
+            : record.kind === 'up'
+              ? 'unifiedpush-gone'
+              : 'webpush-gone';
       subscriptionsUnregistered.inc({ reason, transport: record.kind });
       await refreshActiveGauge();
     }
@@ -378,13 +449,40 @@ async function handleJmap(
   return sendJson(res, 400, { error: 'Unsupported JMAP push type' });
 }
 
+// The request log shows a 200 for most failed forwards, so this line is the
+// only record of why a device missed a push.
+function logForwardFailure(
+  id: string,
+  record: SubscriptionRecord,
+  outcome: ForwardOutcome,
+  result: SendResult,
+): void {
+  const fields = {
+    subscriptionId: id,
+    transport: record.kind,
+    host: pushServiceHost(record),
+    outcome,
+    status: result.status,
+    reason: result.reason,
+  };
+  // An expired subscription is routine cleanup, not a delivery problem.
+  if (outcome === 'unregistered') logger.info('relay: push subscription gone', fields);
+  else logger.warn('relay: push not delivered', fields);
+}
+
 async function dispatch(
   record: SubscriptionRecord,
   payload: ForwardPayload,
-): Promise<{ ok: boolean; status: number; unregistered: boolean }> {
+): Promise<SendResult> {
   if (record.kind === 'fcm') {
     const timer = fcmDurationSeconds.startTimer();
     const result = await sendFcmPush(record, payload);
+    timer();
+    return result;
+  }
+  if (record.kind === 'apns') {
+    const timer = apnsDurationSeconds.startTimer();
+    const result = await sendApnsPush(record, payload);
     timer();
     return result;
   }
@@ -406,6 +504,7 @@ async function dispatch(
 async function refreshActiveGauge(): Promise<void> {
   const counts = await subscriptionStore.sizeByKind();
   subscriptionsActive.set({ transport: 'fcm' }, counts.fcm);
+  subscriptionsActive.set({ transport: 'apns' }, counts.apns);
   subscriptionsActive.set({ transport: 'web' }, counts.web);
   subscriptionsActive.set({ transport: 'up' }, counts.up);
 }
@@ -418,6 +517,7 @@ function normalizeRoute(method: string, path: string): string {
   if (method === 'POST' && path === '/api/push/register') return '/api/push/register';
   if (method === 'POST' && path === '/api/push/register/web') return '/api/push/register/web';
   if (method === 'POST' && path === '/api/push/register/unifiedpush') return '/api/push/register/unifiedpush';
+  if (method === 'POST' && path === '/api/push/register/apns') return '/api/push/register/apns';
   if (/^\/api\/push\/register\/[^/]+$/.test(path)) return '/api/push/register/:id';
   if (/^\/api\/push\/verify\/[^/]+$/.test(path)) return '/api/push/verify/:id';
   if (/^\/api\/push\/active\/[^/]+$/.test(path)) return '/api/push/active/:id';
@@ -488,6 +588,10 @@ const server = http.createServer(async (req, res) => {
 
     if (method === 'POST' && path === '/api/push/register/unifiedpush') {
       return await handleRegisterUnifiedPush(req, res);
+    }
+
+    if (method === 'POST' && path === '/api/push/register/apns') {
+      return await handleRegisterApns(req, res);
     }
 
     if (method === 'GET' && path === '/api/push/vapid-public-key') {

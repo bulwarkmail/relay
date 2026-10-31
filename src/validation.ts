@@ -13,6 +13,16 @@ export function isValidFcmToken(value: unknown): value is string {
   );
 }
 
+// APNs device tokens are 32 bytes today, sent as hex; Apple says not to rely
+// on the length, so allow some room.
+export function isValidApnsToken(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-fA-F]{64,200}$/.test(value);
+}
+
+export function isValidApnsEnvironment(value: unknown): value is 'production' | 'sandbox' {
+  return value === 'production' || value === 'sandbox';
+}
+
 // UnifiedPush endpoints point at whatever distributor server the user chose
 // (ntfy.sh, a self-hosted ntfy, NextPush, ...) so unlike Web Push there is no
 // short allowlist of origins - but they must still be https and sanely sized.

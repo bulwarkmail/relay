@@ -1,16 +1,11 @@
 import webpush from 'web-push';
 import { getVapidPublicKey } from './webpush.js';
+import { failureReason, type SendResult } from './forward-result.js';
 import type { ForwardPayload, UnifiedPushSubscriptionRecord } from './types.js';
 
 // Drop the message if the device stays unreachable for an hour - matches the
 // Web Push transport; the app re-syncs over JMAP on next launch anyway.
 const TTL_SECONDS = 60 * 60;
-
-export interface UnifiedPushSendResult {
-  ok: boolean;
-  status: number;
-  unregistered: boolean;
-}
 
 /**
  * Deliver a payload to a UnifiedPush endpoint. Modern connectors (>= 3.0)
@@ -28,7 +23,7 @@ export interface UnifiedPushSendResult {
 export async function sendUnifiedPush(
   record: UnifiedPushSubscriptionRecord,
   payload: ForwardPayload,
-): Promise<UnifiedPushSendResult> {
+): Promise<SendResult> {
   const body = JSON.stringify(payload);
 
   if (record.keys) {
@@ -46,7 +41,12 @@ export async function sendUnifiedPush(
       const status = (error as { statusCode?: number }).statusCode ?? 0;
       // 404 / 410 mean the distributor dropped the registration - mirrors the
       // FCM UNREGISTERED branch so the caller deletes the record.
-      return { ok: false, status, unregistered: status === 404 || status === 410 };
+      return {
+        ok: false,
+        status,
+        unregistered: status === 404 || status === 410,
+        reason: failureReason(error),
+      };
     }
   }
 
@@ -60,14 +60,16 @@ export async function sendUnifiedPush(
       },
       body,
     });
-    // Drain so the socket can be reused; the body itself is uninteresting.
-    await res.arrayBuffer().catch(() => undefined);
+    // Always drain so the socket can be reused; the body only matters as the
+    // distributor's explanation of a failure.
+    const text = await res.text().catch(() => '');
     return {
       ok: res.ok,
       status: res.status,
       unregistered: res.status === 404 || res.status === 410,
+      reason: res.ok ? undefined : failureReason(text),
     };
-  } catch {
-    return { ok: false, status: 0, unregistered: false };
+  } catch (error) {
+    return { ok: false, status: 0, unregistered: false, reason: failureReason(error) };
   }
 }

@@ -8,6 +8,8 @@ services:
       - 127.0.0.1:3003:3003
     volumes:
       - ./data:/app/data
+    env_file:
+      - .env
     environment:
       - NODE_ENV=production
       - PORT=3003

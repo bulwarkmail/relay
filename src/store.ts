@@ -81,17 +81,19 @@ class SubscriptionStore {
     return Object.keys(this.cache).length;
   }
 
-  async sizeByKind(): Promise<{ fcm: number; web: number; up: number }> {
+  async sizeByKind(): Promise<{ fcm: number; apns: number; web: number; up: number }> {
     await this.ensureLoaded();
     let fcm = 0;
+    let apns = 0;
     let web = 0;
     let up = 0;
     for (const record of Object.values(this.cache)) {
       if (record.kind === 'fcm') fcm++;
+      else if (record.kind === 'apns') apns++;
       else if (record.kind === 'web') web++;
       else if (record.kind === 'up') up++;
     }
-    return { fcm, web, up };
+    return { fcm, apns, web, up };
   }
 
   private isExpired(record: SubscriptionRecord): boolean {

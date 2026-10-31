@@ -1,9 +1,11 @@
-// Records exist in one of three flavours: FCM (mobile app), Web Push (PWA in
-// the browser) or UnifiedPush (mobile app without Google Play services).
+// Records exist in one of four flavours: FCM (Android app), APNs (iOS app),
+// Web Push (PWA in the browser) or UnifiedPush (Android app without Google
+// Play services).
 // Older on-disk records predate the discriminator and only have `fcmToken` -
 // the loader fills in `kind: 'fcm'` for those.
 export type SubscriptionRecord =
   | FcmSubscriptionRecord
+  | ApnsSubscriptionRecord
   | WebSubscriptionRecord
   | UnifiedPushSubscriptionRecord;
 
@@ -17,6 +19,15 @@ interface BaseSubscriptionRecord {
 export interface FcmSubscriptionRecord extends BaseSubscriptionRecord {
   kind: 'fcm';
   fcmToken: string;
+}
+
+// The iOS app's APNs device token (hex). `environment` is the APNs host the
+// token belongs to: TestFlight and App Store builds get production tokens,
+// development builds and simulators sandbox ones.
+export interface ApnsSubscriptionRecord extends BaseSubscriptionRecord {
+  kind: 'apns';
+  deviceToken: string;
+  environment: 'production' | 'sandbox';
 }
 
 export interface WebSubscriptionRecord extends BaseSubscriptionRecord {

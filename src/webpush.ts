@@ -1,5 +1,6 @@
 import webpush from 'web-push';
 import { logger } from './logger.js';
+import { failureReason, type SendResult } from './forward-result.js';
 import type { ForwardPayload, WebSubscriptionRecord } from './types.js';
 
 let configured = false;
@@ -31,18 +32,12 @@ export function getVapidPublicKey(): string | null {
   return publicKey;
 }
 
-export interface WebPushSendResult {
-  ok: boolean;
-  status: number;
-  unregistered: boolean;
-}
-
 export async function sendWebPush(
   record: WebSubscriptionRecord,
   payload: ForwardPayload,
-): Promise<WebPushSendResult> {
+): Promise<SendResult> {
   if (!ensureConfigured()) {
-    return { ok: false, status: 0, unregistered: false };
+    return { ok: false, status: 0, unregistered: false, reason: 'VAPID keys not configured' };
   }
 
   // Mirror the FCM payload shape: a wake-up ping plus, at most, the ids of the
@@ -60,6 +55,6 @@ export async function sendWebPush(
     // 404 / 410 mean the push service has dropped the subscription -
     // mirrors the FCM UNREGISTERED branch so the caller deletes the record.
     const unregistered = status === 404 || status === 410;
-    return { ok: false, status, unregistered };
+    return { ok: false, status, unregistered, reason: failureReason(error) };
   }
 }
