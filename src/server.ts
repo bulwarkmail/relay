@@ -151,6 +151,17 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
   res.end(payload);
 }
 
+// What a new registration keeps from the record it replaces.
+function carriedOver(existing: SubscriptionRecord | null) {
+  const now = Date.now();
+  return {
+    createdAt: existing?.createdAt ?? now,
+    lastPushAt: existing?.lastPushAt ?? null,
+    lastRegisteredAt: now,
+    ...(existing?.codeCollectedAt ? { codeCollectedAt: existing.codeCollectedAt } : {}),
+  };
+}
+
 async function handleRegister(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -181,8 +192,7 @@ async function handleRegister(
     // every fresh subscription, so dropping the old code is safe - the warm
     // path (existing JMAP sub still alive) skips polling entirely.
     verificationCode: null,
-    createdAt: existing?.createdAt ?? Date.now(),
-    lastPushAt: existing?.lastPushAt ?? null,
+    ...carriedOver(existing),
     accountLabel:
       typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
   };
@@ -226,8 +236,7 @@ async function handleRegisterApns(
     environment,
     // See handleRegister for why we always reset this.
     verificationCode: null,
-    createdAt: existing?.createdAt ?? Date.now(),
-    lastPushAt: existing?.lastPushAt ?? null,
+    ...carriedOver(existing),
     accountLabel:
       typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
   };
@@ -271,8 +280,7 @@ async function handleRegisterWeb(
     webPush: subscription,
     // See handleRegister for why we always reset this.
     verificationCode: null,
-    createdAt: existing?.createdAt ?? Date.now(),
-    lastPushAt: existing?.lastPushAt ?? null,
+    ...carriedOver(existing),
     accountLabel:
       typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
   };
@@ -319,8 +327,7 @@ async function handleRegisterUnifiedPush(
     keys: keys ?? null,
     // See handleRegister for why we always reset this.
     verificationCode: null,
-    createdAt: existing?.createdAt ?? Date.now(),
-    lastPushAt: existing?.lastPushAt ?? null,
+    ...carriedOver(existing),
     accountLabel:
       typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
   };
@@ -360,6 +367,11 @@ async function handleVerifyPoll(
   if (!record) {
     return sendJson(res, 404, { error: 'Unknown subscription' });
   }
+  if (record.verificationCode && !record.codeCollectedAt) {
+    await subscriptionStore.updateIfCurrent(id, record, (current) => {
+      current.codeCollectedAt = Date.now();
+    });
+  }
   return sendJson(res, 200, { verificationCode: record.verificationCode ?? null });
 }
 
@@ -368,8 +380,9 @@ async function handleVerifyPoll(
 // is dead debris starving the new one's verification (safe to reap). Stalwart
 // hides a subscription's verified state and URL from clients, so the relay -
 // which sees the actual push traffic - is the only place that can tell them
-// apart. A verified, working subscription receives StateChange pushes and so
-// has a non-null lastPushAt; one that never verified never receives a push.
+// apart. A working subscription has either forwarded a push or, on an account
+// that has had no mail yet, had its verification code picked up by the client.
+// One that never verified has done neither, and is the debris this is for.
 // 404 (unknown id) deliberately means "not on this relay" so callers leave it
 // alone rather than reaping another relay's or a non-Bulwark client's record.
 async function handleActivePoll(
@@ -384,7 +397,9 @@ async function handleActivePoll(
     return sendJson(res, 404, { error: 'Unknown subscription' });
   }
   const active =
-    record.lastPushAt != null || Date.now() - record.createdAt < ACTIVE_GRACE_MS;
+    record.lastPushAt != null ||
+    record.codeCollectedAt != null ||
+    Date.now() - record.createdAt < ACTIVE_GRACE_MS;
   return sendJson(res, 200, { active });
 }
 

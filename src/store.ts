@@ -5,8 +5,8 @@ import { logger } from './logger.js';
 import type { SubscriptionRecord } from './types.js';
 
 // Aligned with the JMAP PushSubscription expires the mobile client requests
-// (90 days). The relay record gets refreshed on every push, so this only
-// matters for users who go quiet for ~3 months.
+// (90 days). A push or a registration refreshes the record, so this only
+// matters for devices that have gone away for good.
 const TTL_MS = 90 * 24 * 60 * 60 * 1000;
 
 function getPushDir(): string {
@@ -151,7 +151,7 @@ class SubscriptionStore {
   }
 
   private isExpired(record: SubscriptionRecord): boolean {
-    const age = Date.now() - (record.lastPushAt ?? record.createdAt);
+    const age = Date.now() - Math.max(record.lastPushAt ?? 0, record.lastRegisteredAt ?? 0, record.createdAt);
     return age > TTL_MS;
   }
 

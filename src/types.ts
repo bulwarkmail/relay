@@ -13,6 +13,12 @@ interface BaseSubscriptionRecord {
   verificationCode: string | null;
   createdAt: number;
   lastPushAt: number | null;
+  // When the client last registered. A client checks in on every page load, so
+  // this keeps a subscription whose account simply gets no mail.
+  lastRegisteredAt?: number;
+  // When a client picked up the verification code. Stalwart hides whether a
+  // subscription got verified; this is the closest the relay can see.
+  codeCollectedAt?: number;
   accountLabel?: string;
 }
 

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import {
@@ -322,6 +323,89 @@ describe('GET /api/push/active/:id', () => {
     assert.deepEqual((await getJson(relay.base, `/api/push/active/${id}`)).body, { active: true });
     assert.equal((await getJson(relay.base, `/api/push/active/${newId()}`)).status, 404);
     assert.equal((await getJson(relay.base, '/api/push/active/bad')).status, 400);
+  });
+});
+
+describe('a quiet subscription', () => {
+  const DAY = 24 * 60 * 60 * 1000;
+
+  function seed(records: Record<string, unknown>): string {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-seed-'));
+    fs.writeFileSync(path.join(dataDir, 'subscriptions.json'), JSON.stringify({ records }));
+    return dataDir;
+  }
+
+  function webRecord(fields: Record<string, unknown>) {
+    return {
+      kind: 'web',
+      webPush: { endpoint: service.url('/quiet'), keys: makeDevice().keys },
+      verificationCode: null,
+      createdAt: Date.now() - 30 * 60 * 1000,
+      lastPushAt: null,
+      ...fields,
+    };
+  }
+
+  it('stays active once its client has picked up the verification code, across re-registration and restart', async () => {
+    const id = newId();
+    const own = await startRelay({ dataDir: seed({ [id]: webRecord({ verificationCode: 'code' }) }) });
+    assert.deepEqual((await getJson(own.base, `/api/push/active/${id}`)).body, { active: false }, 'nobody has the code yet');
+    await getJson(own.base, `/api/push/verify/${id}`);
+    assert.deepEqual((await getJson(own.base, `/api/push/active/${id}`)).body, { active: true });
+    await postJson(own.base, '/api/push/register/web', {
+      subscriptionId: id,
+      subscription: { endpoint: service.url('/quiet'), keys: makeDevice().keys },
+    });
+    const again = await own.restart();
+    try {
+      assert.deepEqual((await getJson(again.base, `/api/push/active/${id}`)).body, { active: true });
+    } finally {
+      await again.stop();
+    }
+  });
+
+  it('still reads as dead when no code ever came and no push ever went out', async () => {
+    const id = newId();
+    const own = await startRelay({ dataDir: seed({ [id]: webRecord({}) }) });
+    try {
+      assert.deepEqual((await getJson(own.base, `/api/push/active/${id}`)).body, { active: false });
+    } finally {
+      await own.stop();
+    }
+  });
+
+  it('is kept past 90 days while its client keeps registering', async () => {
+    const alive = newId();
+    const gone = newId();
+    const own = await startRelay({
+      dataDir: seed({
+        [alive]: webRecord({ createdAt: Date.now() - 200 * DAY, lastRegisteredAt: Date.now() - DAY }),
+        [gone]: webRecord({ createdAt: Date.now() - 91 * DAY }),
+      }),
+    });
+    try {
+      assert.equal((await getJson(own.base, `/api/push/verify/${alive}`)).status, 200);
+      assert.equal((await getJson(own.base, `/api/push/verify/${gone}`)).status, 404);
+    } finally {
+      await own.stop();
+    }
+  });
+
+  it('notes each registration without moving createdAt', async () => {
+    const id = newId();
+    const createdAt = Date.now() - 80 * DAY;
+    const own = await startRelay({ dataDir: seed({ [id]: webRecord({ createdAt }) }) });
+    try {
+      await postJson(own.base, '/api/push/register/web', {
+        subscriptionId: id,
+        subscription: { endpoint: service.url('/quiet'), keys: makeDevice().keys },
+      });
+      const stored = storedRecords(own.dataDir)[id];
+      assert.equal(stored.createdAt, createdAt);
+      assert.ok(Date.now() - stored.lastRegisteredAt < 60_000);
+    } finally {
+      await own.stop();
+    }
   });
 });
 
