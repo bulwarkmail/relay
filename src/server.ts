@@ -10,6 +10,7 @@ import { isForwardableBody, toForwardPayload } from './payload.js';
 import {
   classifyForward,
   failureReason,
+  isTemporaryFailure,
   pushServiceHost,
   statusLabel,
   type ForwardOutcome,
@@ -476,7 +477,7 @@ async function handleJmap(
         current.lastPushAt = Date.now();
       });
     }
-    return sendJson(res, 200, { ok: result.ok });
+    return sendJson(res, isTemporaryFailure(result) ? 503 : 200, { ok: result.ok });
   }
 
   return sendJson(res, 400, { error: 'Unsupported JMAP push type' });

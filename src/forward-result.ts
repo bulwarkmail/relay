@@ -31,6 +31,15 @@ export function classifyForward(result: SendResult): ForwardOutcome {
   return 'fail';
 }
 
+// Worth another try, because the service itself says so or never answered. A
+// non-2xx answer makes Stalwart try again a minute later (3 attempts by default),
+// merging what arrived meanwhile into one push, and leave the subscription alone
+// until then. Other refusals won't change a minute later.
+export function isTemporaryFailure(result: SendResult): boolean {
+  if (result.ok || result.unregistered) return false;
+  return result.status === 0 || result.status === 408 || result.status === 429 || result.status >= 500;
+}
+
 // Metric label for the push service's answer. "none" covers network errors,
 // timeouts and a relay without VAPID keys - nothing came back to look at.
 export function statusLabel(status: number): string {

@@ -459,8 +459,44 @@ describe('POST /api/push/jmap/:id', () => {
       const { id } = await registerWeb(pathname);
       const res = await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
       assert.deepEqual(res.body, { ok: false });
+      // Retrying a dead subscription gets nowhere.
+      assert.equal(res.status, 200);
       assert.equal((await getJson(relay.base, `/api/push/verify/${id}`)).status, 404);
       assert.ok(!(id in storedRecords(relay.dataDir)));
+    }
+  });
+
+  it('asks the mail server to retry after a temporary failure, and keeps the record', async () => {
+    for (const status of [429, 500, 502, 503]) {
+      const pathname = `/temporary-${status}`;
+      service.answer(pathname, { status });
+      const { id } = await registerWeb(pathname);
+      const res = await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
+      assert.ok(res.status >= 500, `service ${status} answered the server ${res.status}`);
+      assert.equal((await getJson(relay.base, `/api/push/verify/${id}`)).status, 200);
+    }
+  });
+
+  it('asks the mail server to retry after a network error, and keeps the record', async () => {
+    const id = newId();
+    await postJson(relay.base, '/api/push/register/web', {
+      subscriptionId: id,
+      subscription: { endpoint: 'https://localhost:9/refused', keys: makeDevice().keys },
+    });
+    const res = await postJson(relay.base, `/api/push/jmap/${id}`, stateChange({ a: { EmailDelivery: 's' } }));
+    assert.ok(res.status >= 500);
+    assert.equal((await getJson(relay.base, `/api/push/verify/${id}`)).status, 200);
+  });
+
+  it('does not retry what will never work, and keeps the record', async () => {
+    for (const status of [400, 401, 403, 413]) {
+      const pathname = `/refused-${status}`;
+      service.answer(pathname, { status });
+      const { id } = await registerWeb(pathname);
+      const res = await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
+      assert.equal(res.status, 200);
+      assert.deepEqual(res.body, { ok: false });
+      assert.equal((await getJson(relay.base, `/api/push/verify/${id}`)).status, 200);
     }
   });
 });
