@@ -742,10 +742,24 @@ describe('sending politely', () => {
     assert.equal(both.headers.topic, undefined);
   });
 
-  it('sends other state pings at low urgency', async () => {
+  it('sends pings that say nothing about mail at low urgency', async () => {
     const { id } = await registerWeb('/polite-low');
-    await postJson(relay.base, `/api/push/jmap/${id}`, stateChange({ a: { Email: 's1', Mailbox: 's2' } }));
+    await postJson(relay.base, `/api/push/jmap/${id}`, stateChange({ a: { Mailbox: 's2' } }));
     assert.equal(service.to('/polite-low')[0].headers.urgency, 'low');
+  });
+
+  it('keeps an Email ping out of the new-mail Topic: on a server without EmailDelivery it may be new mail', async () => {
+    const { id } = await registerWeb('/polite-email-only');
+    await postJson(relay.base, `/api/push/jmap/${id}`, stateChange({ a: { Email: 's1', Mailbox: 's2' } }));
+    const sent = service.to('/polite-email-only')[0];
+    assert.equal(sent.headers.urgency, 'normal');
+    assert.equal(sent.headers.topic, undefined);
+  });
+
+  it('sends no Topic on a ping without new mail, so it can\'t replace one with', async () => {
+    const { id } = await registerWeb('/polite-no-topic');
+    await postJson(relay.base, `/api/push/jmap/${id}`, stateChange({ a: { Mailbox: 's1' } }));
+    assert.equal(service.to('/polite-no-topic')[0].headers.topic, undefined);
   });
 
   it('keeps UnifiedPush distributors out of Topic, as they may not know it', async () => {

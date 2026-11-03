@@ -40,12 +40,17 @@ export function deliveryOptions(
     return !!types && typeof types === 'object' && 'EmailDelivery' in types;
   });
   // Stalwart marks every state change "normal". New mail is what the user waits
-  // for, on a phone that may be asleep; the rest is a hint for later.
-  const urgency: Urgency = newMail ? 'high' : 'low';
-  // One account's pings say the same thing, so a device that was offline only
-  // needs the last (RFC 8030 replacement). Two accounts in one push share no such
-  // topic: replacing it could lose one of them.
-  if (accounts.length !== 1) return { urgency };
+  // for, on a phone that may be asleep. A server without EmailDelivery says it as
+  // Email, which also covers everything else. The rest is a hint for later.
+  const anyEmail = accounts.some((account) => {
+    const types = changed[account];
+    return !!types && typeof types === 'object' && 'Email' in types;
+  });
+  const urgency: Urgency = newMail ? 'high' : anyEmail ? 'normal' : 'low';
+  // One account's new-mail pings say the same thing, so a device that was offline
+  // only needs the last (RFC 8030 replacement). Anything else must not replace one,
+  // and two accounts in one push share no such topic: that could lose one of them.
+  if (!newMail || accounts.length !== 1) return { urgency };
   const topic = crypto
     .createHash('sha256')
     .update(`${subscriptionId}\0${accounts[0]}`)
