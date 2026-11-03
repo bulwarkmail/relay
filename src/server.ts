@@ -51,6 +51,7 @@ import {
 const PORT = Number(process.env.PORT ?? 3003);
 const HOST = process.env.HOST ?? '0.0.0.0';
 const MAX_BODY_BYTES = 64 * 1024;
+const OVERSIZE_GRACE_MS = 2000;
 const REPO_URL = 'https://github.com/bulwarkmail/relay';
 
 // How long after registration we still report a subscription as "active" even
@@ -85,20 +86,28 @@ const LANDING_HTML = `<!doctype html>
 </html>
 `;
 
+class PayloadTooLargeError extends Error {}
+
 async function readJson(req: http.IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
+    let tooLarge = false;
     req.on('data', (chunk: Buffer) => {
+      if (tooLarge) return;
       total += chunk.length;
       if (total > MAX_BODY_BYTES) {
-        reject(new Error('Payload too large'));
-        req.destroy();
+        // The rest is read and thrown away: closing the socket now would reset
+        // the connection before the caller gets to see the 413.
+        tooLarge = true;
+        chunks.length = 0;
+        reject(new PayloadTooLargeError('Payload too large'));
         return;
       }
       chunks.push(chunk);
     });
     req.on('end', () => {
+      if (tooLarge) return;
       if (chunks.length === 0) {
         resolve(null);
         return;
@@ -649,7 +658,10 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 404, { error: 'Not found' });
   } catch (error) {
     const msg = error instanceof Error ? error.message : 'Unknown error';
-    if (msg === 'Payload too large') {
+    if (error instanceof PayloadTooLargeError) {
+      res.setHeader('connection', 'close');
+      // Whoever keeps sending after the answer doesn't get to hold the socket.
+      res.once('finish', () => setTimeout(() => req.destroy(), OVERSIZE_GRACE_MS).unref());
       return sendJson(res, 413, { error: msg });
     }
     logger.error('relay: handler failed', { method, path, error: msg });

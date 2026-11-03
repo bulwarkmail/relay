@@ -386,6 +386,27 @@ describe('malformed requests', () => {
   });
 });
 
+describe('oversized bodies', () => {
+  it('answers 413 and leaves the relay working', async () => {
+    const { id } = await registerWeb('/too-big');
+    const big = 'x'.repeat(70 * 1024);
+    for (const pathname of [`/api/push/jmap/${id}`, '/api/push/register/web']) {
+      assert.equal((await postJson(relay.base, pathname, big)).status, 413);
+    }
+    assert.equal(service.to('/too-big').length, 0);
+    assert.equal((await getJson(relay.base, '/api/health')).status, 200);
+  });
+
+  it('answers 413 to a body sent without a length', async () => {
+    const size = 70 * 1024;
+    const answer = await rawRequest(
+      relay.port,
+      `POST /api/push/register/web HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n${size.toString(16)}\r\n${'x'.repeat(size)}\r\n0\r\n\r\n`,
+    );
+    assert.match(answer, /^HTTP\/1\.1 413/);
+  });
+});
+
 describe('anything else', () => {
   it('answers 404 on an unknown path and 204 to a preflight', async () => {
     assert.equal((await getJson(relay.base, '/nothing')).status, 404);
