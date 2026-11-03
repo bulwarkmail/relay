@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
+import { readFile, open, mkdir, rename } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { logger } from './logger.js';
@@ -17,6 +17,10 @@ function subscriptionsPath(): string {
   return path.join(getPushDir(), 'subscriptions.json');
 }
 
+function previousVersionPath(): string {
+  return `${subscriptionsPath()}.bak`;
+}
+
 interface SubscriptionsFile {
   records: Record<string, SubscriptionRecord>;
 }
@@ -25,25 +29,50 @@ class SubscriptionStore {
   private cache: Record<string, SubscriptionRecord> = {};
   private loaded = false;
   private writeQueue: Promise<void> = Promise.resolve();
+  private queuedWrite: Promise<void> | null = null;
 
   async load(): Promise<void> {
+    const target = subscriptionsPath();
+    const records =
+      (await this.readRecords(target)) ?? (await this.readRecords(previousVersionPath()));
+    this.cache = records ?? {};
+    this.migrateLegacyRecords();
+    this.evictExpired();
+    this.loaded = true;
+  }
+
+  // Null when the file is missing or unusable. An unusable file is moved aside,
+  // not left for the next write to replace: it may be every device's only
+  // record, and one register call would otherwise wipe it.
+  private async readRecords(file: string): Promise<Record<string, SubscriptionRecord> | null> {
+    let raw: string;
     try {
-      const raw = await readFile(subscriptionsPath(), 'utf-8');
-      const parsed = JSON.parse(raw) as SubscriptionsFile;
-      this.cache = parsed.records ?? {};
-      this.migrateLegacyRecords();
-      this.evictExpired();
+      raw = await readFile(file, 'utf-8');
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        this.cache = {};
-      } else {
-        logger.warn('store: failed to read subscriptions', {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        logger.error('store: failed to read subscriptions', {
+          file: path.basename(file),
           error: error instanceof Error ? error.message : 'Unknown error',
         });
-        this.cache = {};
       }
+      return null;
     }
-    this.loaded = true;
+    try {
+      const parsed = JSON.parse(raw) as SubscriptionsFile;
+      if (!parsed || typeof parsed.records !== 'object' || parsed.records === null) {
+        throw new Error('no records in the file');
+      }
+      return parsed.records;
+    } catch (error) {
+      const aside = `${file}.corrupt-${Date.now()}`;
+      await rename(file, aside).catch(() => undefined);
+      logger.error('store: subscriptions file is corrupt, moved aside', {
+        file: path.basename(file),
+        aside: path.basename(aside),
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+      return null;
+    }
   }
 
   async ensureLoaded(): Promise<void> {
@@ -143,8 +172,15 @@ class SubscriptionStore {
     }
   }
 
+  // Every write replaces the whole file, so a write that hasn't started yet takes
+  // along whatever changes meanwhile: a burst makes two writes, not one per call.
   private persist(): Promise<void> {
-    const next = this.writeQueue.then(() => this.flush());
+    if (this.queuedWrite) return this.queuedWrite;
+    const next = this.writeQueue.then(() => {
+      this.queuedWrite = null;
+      return this.flush();
+    });
+    this.queuedWrite = next;
     this.writeQueue = next.catch(() => undefined);
     return next;
   }
@@ -157,7 +193,18 @@ class SubscriptionStore {
     const target = subscriptionsPath();
     const tmp = target + '.tmp';
     const payload: SubscriptionsFile = { records: this.cache };
-    await writeFile(tmp, JSON.stringify(payload, null, 2), 'utf-8');
+    // On disk before the rename: a power cut must not leave a renamed, empty file.
+    const handle = await open(tmp, 'w');
+    try {
+      await handle.writeFile(JSON.stringify(payload, null, 2), 'utf-8');
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    // A crash between these two leaves only the previous version, which load reads.
+    await rename(target, previousVersionPath()).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'ENOENT') throw error;
+    });
     await rename(tmp, target);
   }
 }

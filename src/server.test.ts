@@ -479,6 +479,84 @@ describe('anything else', () => {
   });
 });
 
+describe('the store on disk', () => {
+  const FILE = 'subscriptions.json';
+
+  it('keeps a corrupt file aside and comes back from the previous version', async () => {
+    const own = await startRelay();
+    const { id: first } = await registerWeb('/store-1', own);
+    const { id: second } = await registerWeb('/store-2', own);
+    await own.stop();
+    const file = path.join(own.dataDir, FILE);
+    const intact = fs.readFileSync(file);
+    assert.ok(fs.existsSync(`${file}.bak`), 'a previous version is kept');
+    fs.writeFileSync(file, intact.subarray(0, intact.length - 20));
+    const again = await startRelay({ dataDir: own.dataDir });
+    try {
+      assert.equal((await getJson(again.base, `/api/push/verify/${first}`)).status, 200);
+      const aside = fs.readdirSync(own.dataDir).filter((name) => name.includes('corrupt'));
+      assert.equal(aside.length, 1);
+      assert.equal(fs.readFileSync(path.join(own.dataDir, aside[0])).length, intact.length - 20);
+      assert.match(again.logs(), /"level":"error".*subscriptions/);
+      // The newest write was only in the broken file; everything else is back.
+      assert.equal((await getJson(again.base, `/api/push/verify/${second}`)).status, 404);
+    } finally {
+      await again.stop();
+    }
+  });
+
+  it('never replaces a corrupt file when there is nothing to come back from', async () => {
+    const own = await startRelay();
+    const { id } = await registerWeb('/store-3', own);
+    await own.stop();
+    const file = path.join(own.dataDir, FILE);
+    fs.rmSync(`${file}.bak`, { force: true });
+    fs.writeFileSync(file, '{"records":{"oops');
+    const again = await startRelay({ dataDir: own.dataDir });
+    try {
+      assert.equal((await getJson(again.base, `/api/push/verify/${id}`)).status, 404);
+      await registerWeb('/store-4', again);
+      const aside = fs.readdirSync(own.dataDir).filter((name) => name.includes('corrupt'));
+      assert.equal(fs.readFileSync(path.join(own.dataDir, aside[0]), 'utf8'), '{"records":{"oops');
+    } finally {
+      await again.stop();
+    }
+  });
+
+  it('starts from the previous version when the crash came between the two renames', async () => {
+    const own = await startRelay();
+    const { id } = await registerWeb('/store-5', own);
+    await registerWeb('/store-6', own);
+    await own.stop();
+    fs.rmSync(path.join(own.dataDir, FILE));
+    const again = await startRelay({ dataDir: own.dataDir });
+    try {
+      assert.equal((await getJson(again.base, `/api/push/verify/${id}`)).status, 200);
+    } finally {
+      await again.stop();
+    }
+  });
+
+  it('survives many registrations at once', async () => {
+    const own = await startRelay();
+    const ids = Array.from({ length: 60 }, () => newId());
+    const device = makeDevice();
+    const answers = await Promise.all(ids.map((subscriptionId) => postJson(own.base, '/api/push/register/web', {
+      subscriptionId,
+      subscription: { endpoint: service.url('/store-many'), keys: device.keys },
+    })));
+    assert.ok(answers.every((res) => res.status === 200));
+    const again = await own.restart();
+    try {
+      const records = storedRecords(own.dataDir);
+      assert.ok(ids.every((id) => id in records));
+      assert.equal((await getJson(again.base, '/api/health')).body.subscriptions, 60);
+    } finally {
+      await again.stop();
+    }
+  });
+});
+
 describe('restart', () => {
   it('keeps subscriptions and their codes', async () => {
     const own = await startRelay();
