@@ -55,30 +55,36 @@ default, merging whatever arrived meanwhile into one push.
 | --- | --- | --- |
 | 2xx | | `200 { ok: true }` |
 | 404, 410 (FCM `UNREGISTERED`, APNs `Unregistered`, `BadDeviceToken`, `DeviceTokenNotForTopic`) | Deletes the record | `200 { ok: false }` |
-| 429, 408, 5xx, no answer within 8 s, network error | Keeps the record | `503 { ok: false }` |
+| 429, 408, 5xx, no answer within 8 s, network error, a name that resolves to no public address | Keeps the record | `503 { ok: false }` (`500` when FCM or APNs can't be reached at all) |
 | Any other 4xx | Keeps the record, logs it | `200 { ok: false }` |
 
 ## How it treats the push services
 
-- **Urgency.** New mail goes out at high urgency, or what the client asked for in
-  its `emailPush` config. Other state pings go out at low urgency.
-- **Topic.** Web Push state pings for one account carry an RFC 8030 `Topic`, so a
-  device that was offline gets the last one, not all of them. `EmailPush` pushes
+- **Urgency**, for Web Push and UnifiedPush. New mail goes out at high urgency, or
+  what the client asked for in its `emailPush` config. A ping with `Email` but no
+  `EmailDelivery` goes at normal urgency, anything else at low. FCM and APNs always
+  go at high priority.
+- **Topic.** Web Push pings for new mail in one account carry an RFC 8030 `Topic`,
+  so a device that was offline gets the last one, not all of them. `EmailPush` pushes
   don't, since each names other messages. UnifiedPush gets no Topic.
 - **Burst limit.** Web Push and UnifiedPush subscriptions get 10 pushes at once and
   one more every 20 seconds. Past that the relay answers `429` without calling the
   service, and the mail server's next attempt carries everything that piled up.
 - **Backoff.** After a `429`, or any answer with `Retry-After`, the relay leaves that
   subscription alone for as long as the service says (60 seconds without a header,
-  an hour at most). After 20 `429`s from one host within a minute it leaves the
-  whole host alone for that long. Held pushes count in `relay_pushes_held_total`.
+  an hour at most). Stalwart gives up after about two minutes, so a longer wait costs
+  the alerts in between: the service asked for it, and each one is in the log. After
+  `429`s for 20 different devices on one host within a minute it leaves the whole
+  host alone, for two minutes at most. Browsers and native apps count separately. Held
+  pushes count in `relay_pushes_held_total`.
 
 ## Which endpoints it calls
 
 Only `https` URLs without credentials, on public addresses. Names without a dot,
-`.local`, `.internal` and the like are refused at registration, and what a name
-resolves to is checked again on every connection. A stored record that fails this
-is deleted instead of called. Redirects are not followed. To reach a distributor
+`.local`, `.internal` and the like are refused at registration. A stored record with
+such a name is deleted instead of called. What a name resolves to is checked on every
+connection, and counts as a temporary failure when it isn't public. Redirects are not
+followed, and only the first 4 KB of an answer are read. To reach a distributor
 on your own network, name it in `PUSH_ALLOW_PRIVATE_ENDPOINTS`.
 
 ## What it stores
@@ -97,9 +103,10 @@ payloads, and to the distributor on a UnifiedPush endpoint without keys.
 Subscriptions with no push and no registration for 90 days are evicted.
 
 The store is `subscriptions.json` in `PUSH_DATA_DIR`, written atomically, with the
-previous version as `subscriptions.json.bak`. A file that can't be read is kept as
+previous version as `subscriptions.json.bak`. A file that isn't valid is kept as
 `subscriptions.json.corrupt-<time>` and logged as an error, and the relay starts
-from the previous version.
+from the previous version. A file that can't be read at all (permissions, a bad
+mount) stops the relay at startup with an error, so it can't overwrite the store.
 
 ## What it logs
 
@@ -139,10 +146,10 @@ docker compose up -d
 | `APNS_KEY` | `$PUSH_DATA_DIR/apns-key.p8` | The `.p8` key, inline PEM or a path |
 | `APNS_TOPIC` | `org.bulwarkmail.mobile` | Bundle id of the app |
 | `PUSH_ALLOW_PRIVATE_ENDPOINTS` | unset | Comma-separated hosts that may be called even though they aren't public, such as your own ntfy |
-| `PUSH_FORWARD_TIMEOUT_MS` | `8000` | How long one attempt at a push service may take. Keep it below the mail server's own timeout (Stalwart: 10 s), or the same push goes out twice |
+| `PUSH_FORWARD_TIMEOUT_MS` | `8000` | How long one attempt at a push service may take, start to finish. Keep it below the mail server's own timeout (Stalwart: 10 s), or the same push goes out twice |
 | `PUSH_SUBSCRIPTION_BURST` | `10` | Pushes one Web Push or UnifiedPush subscription may get at once |
 | `PUSH_SUBSCRIPTION_REFILL_MS` | `20000` | Time until one more is allowed |
-| `PUSH_HOST_THROTTLE_LIMIT` | `20` | `429`s from one host within a minute before the whole host is left alone |
+| `PUSH_HOST_THROTTLE_LIMIT` | `20` | Devices getting a `429` from one host within a minute before the whole host is left alone |
 | `FCM_ORIGIN`, `APNS_ORIGIN` | the real services | Point every push at another server, for tests |
 
 ## License
