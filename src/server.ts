@@ -762,9 +762,17 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
   }
 }
 
-server.listen(PORT, HOST, () => {
-  logger.info('relay: listening', { host: HOST, port: PORT });
-});
+subscriptionStore.load().then(
+  () => {
+    server.listen(PORT, HOST, () => {
+      logger.info('relay: listening', { host: HOST, port: PORT });
+    });
+  },
+  () => {
+    // Already logged. A restart loop gets noticed; losing the store doesn't.
+    process.exit(1);
+  },
+);
 
 const shutdown = (signal: string) => {
   logger.info('relay: shutting down', { signal });

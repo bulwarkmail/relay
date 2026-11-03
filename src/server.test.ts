@@ -1108,6 +1108,36 @@ describe('the store on disk', () => {
   });
 });
 
+describe('starting up', () => {
+  it('refuses to run on a store it cannot read, and leaves it alone', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-seed-'));
+    // A read error other than "not there": a directory in the file's place.
+    fs.mkdirSync(path.join(dataDir, 'subscriptions.json'));
+    fs.writeFileSync(path.join(dataDir, 'subscriptions.json', 'still-here'), 'x');
+    await assert.rejects(startRelay({ dataDir }), /relay exited during start/);
+    assert.ok(fs.existsSync(path.join(dataDir, 'subscriptions.json', 'still-here')));
+  });
+
+  it('has the store loaded before it takes any request', async () => {
+    const seeded = newId();
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-seed-'));
+    fs.writeFileSync(path.join(dataDir, 'subscriptions.json'), JSON.stringify({ records: { [seeded]: { kind: 'web', webPush: { endpoint: service.url('/seeded'), keys: makeDevice().keys }, verificationCode: null, createdAt: Date.now(), lastPushAt: null } } }));
+    const own = await startRelay({ dataDir, skipHealthCheck: true });
+    try {
+      const ids = Array.from({ length: 40 }, () => newId());
+      const device = makeDevice();
+      const answers = await Promise.all(ids.map((subscriptionId) => postJson(own.base, '/api/push/register/web', {
+        subscriptionId,
+        subscription: { endpoint: service.url('/first-load'), keys: device.keys },
+      })));
+      assert.ok(answers.every((res) => res.status === 200));
+      assert.equal((await getJson(own.base, '/api/health')).body.subscriptions, 41);
+    } finally {
+      await own.stop();
+    }
+  });
+});
+
 describe('restart', () => {
   it('keeps subscriptions and their codes', async () => {
     const own = await startRelay();

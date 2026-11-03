@@ -31,8 +31,15 @@ class SubscriptionStore {
   private loaded = false;
   private writeQueue: Promise<void> = Promise.resolve();
   private queuedWrite: Promise<void> | null = null;
+  private loading: Promise<void> | null = null;
 
-  async load(): Promise<void> {
+  /** Once, whoever asks. Rejects when a store exists that can't be read: see readRecords. */
+  load(): Promise<void> {
+    this.loading ??= this.readFromDisk();
+    return this.loading;
+  }
+
+  private async readFromDisk(): Promise<void> {
     const target = subscriptionsPath();
     const records =
       (await this.readRecords(target)) ?? (await this.readRecords(previousVersionPath()));
@@ -51,13 +58,14 @@ class SubscriptionStore {
     try {
       raw = await readFile(file, 'utf-8');
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        logger.error('store: failed to read subscriptions', {
-          file: path.basename(file),
-          error: error instanceof Error ? error.message : 'Unknown error',
-        });
-      }
-      return null;
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      // Unreadable, not missing: permissions, a bad mount. Starting empty would
+      // replace every device's record with the next write, so this stops here.
+      logger.error('store: failed to read subscriptions', {
+        file: path.basename(file),
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+      throw error;
     }
     try {
       const parsed = JSON.parse(raw) as SubscriptionsFile;

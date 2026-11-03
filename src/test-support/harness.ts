@@ -178,7 +178,7 @@ async function freePort(): Promise<number> {
   });
 }
 
-export async function startRelay(options: { env?: Record<string, string>; dataDir?: string; vapid?: boolean } = {}): Promise<RunningRelay> {
+export async function startRelay(options: { env?: Record<string, string>; dataDir?: string; vapid?: boolean; skipHealthCheck?: boolean } = {}): Promise<RunningRelay> {
   const dataDir = options.dataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'relay-route-'));
   const port = await freePort();
   const vapid = options.vapid === false ? {} : testVapid();
@@ -218,8 +218,9 @@ export async function startRelay(options: { env?: Record<string, string>; dataDi
   for (;;) {
     if (hasExited) throw new Error(`relay exited during start: ${output}`);
     try {
-      const res = await fetch(`${base}/api/health`);
-      if (res.ok) break;
+      // The route that touches the store could hide what a first request sees.
+      const res = await fetch(options.skipHealthCheck ? `${base}/nothing` : `${base}/api/health`);
+      if (res.ok || options.skipHealthCheck) break;
     } catch {
       // Not listening yet.
     }
