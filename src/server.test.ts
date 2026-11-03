@@ -1107,6 +1107,46 @@ describe('a verification arriving during a registration', () => {
   });
 });
 
+describe('after a forward', () => {
+  it('only a push that went out counts for liveness', async () => {
+    const id = newId();
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-seed-'));
+    fs.writeFileSync(path.join(dataDir, 'subscriptions.json'), JSON.stringify({
+      records: { [id]: { kind: 'web', webPush: { endpoint: service.url('/counted'), keys: makeDevice().keys }, verificationCode: null, createdAt: Date.now() - 3600_000, lastPushAt: null } },
+    }));
+    const own = await startRelay({ dataDir });
+    try {
+      service.answer('/counted', { status: 403 });
+      await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
+      assert.deepEqual((await getJson(own.base, `/api/push/active/${id}`)).body, { active: false });
+      service.answer('/counted', { status: 201 });
+      await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e2']));
+      assert.deepEqual((await getJson(own.base, `/api/push/active/${id}`)).body, { active: true });
+    } finally {
+      await own.stop();
+    }
+  });
+
+  it('a store that can\'t be written does not make the mail server send it again', async () => {
+    const own = await startRelay();
+    try {
+      const { id } = await registerWeb('/disk-full', own);
+      // Nothing can be written from here on.
+      fs.mkdirSync(path.join(own.dataDir, 'subscriptions.json.tmp'));
+      const res = await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
+      assert.equal(res.status, 200);
+      assert.deepEqual(res.body, { ok: true });
+      assert.equal(service.to('/disk-full').length, 1);
+      assert.match(own.logs(), /"level":"error"/);
+      // A registration does have to fail: the client must not think it's stored.
+      const refused = await postJson(own.base, '/api/push/register/web', { subscriptionId: newId(), subscription: { endpoint: service.url('/disk-full'), keys: makeDevice().keys } });
+      assert.equal(refused.status, 500);
+    } finally {
+      await own.stop();
+    }
+  });
+});
+
 describe('anything else', () => {
   it('answers 404 on an unknown path and 204 to a preflight', async () => {
     assert.equal((await getJson(relay.base, '/nothing')).status, 404);

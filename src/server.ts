@@ -488,8 +488,14 @@ async function handleJmap(
       status: statusLabel(result.status),
     });
     if (outcome !== 'ok') logForwardFailure(id, record, outcome, result);
+    // The push is out. A store that can't take the news is worth an error in the log,
+    // not a failure answer that makes the mail server send it again.
+    const logStoreFailure = (error: unknown) => {
+      logger.error('relay: could not save after a forward', { error: error instanceof Error ? error.message : 'Unknown error' });
+      return false;
+    };
     if (result.unregistered) {
-      const removed = await subscriptionStore.deleteIfCurrent(id, record);
+      const removed = await subscriptionStore.deleteIfCurrent(id, record).catch(logStoreFailure);
       const reason =
         record.kind === 'fcm'
           ? 'fcm-unregistered'
@@ -503,10 +509,11 @@ async function handleJmap(
         forwardPolicy.remove(id);
       }
       await refreshActiveGauge();
-    } else {
+    } else if (result.ok) {
+      // Only what really went out: /active and the 90 days go by this.
       await subscriptionStore.updateIfCurrent(id, record, (current) => {
         current.lastPushAt = Date.now();
-      });
+      }).catch(logStoreFailure);
     }
     if (result.retryAfterSeconds !== undefined) {
       res.setHeader('retry-after', String(result.retryAfterSeconds));
