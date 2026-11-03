@@ -178,7 +178,7 @@ async function sendWithProject(
   };
 
   const res = await fetch(
-    `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(account.project_id)}/messages:send`,
+    `${process.env.FCM_ORIGIN || 'https://fcm.googleapis.com'}/v1/projects/${encodeURIComponent(account.project_id)}/messages:send`,
     {
       method: 'POST',
       headers: {
