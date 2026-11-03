@@ -112,6 +112,59 @@ function publicLookup(hostname: string, options: LookupOptions, callback: Lookup
 /** For every request to a caller-chosen endpoint. */
 export const publicOnlyAgent = new https.Agent({ keepAlive: true, lookup: publicLookup as never });
 
+// Enough for the push service's explanation of a failure.
+const MAX_ANSWER_BYTES = 4096;
+
+export interface EndpointAnswer {
+  status: number;
+  text: string;
+  retryAfter: string | undefined;
+}
+
+/**
+ * One POST to a caller-chosen endpoint. Not through the web-push library's own
+ * sender, which reads any answer whole into a string and only times out on silence:
+ * an endpoint someone registered for the purpose could crash the relay with the
+ * first and outlast the mail server's patience with the second. It also parses the
+ * URL differently than the check above. Redirects are not followed.
+ */
+export function postToEndpoint(
+  endpoint: string,
+  headers: Record<string, string | number>,
+  body: Buffer | string,
+  timeoutMs: number,
+): Promise<EndpointAnswer> {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      new URL(endpoint),
+      { method: 'POST', agent: publicOnlyAgent, headers, signal: AbortSignal.timeout(timeoutMs) },
+      (res) => {
+        const answer = (text: string): EndpointAnswer => ({
+          status: res.statusCode ?? 0,
+          text,
+          retryAfter: typeof res.headers['retry-after'] === 'string' ? res.headers['retry-after'] : undefined,
+        });
+        let text = '';
+        let size = 0;
+        res.setEncoding('utf8');
+        res.on('data', (chunk: string) => {
+          size += chunk.length;
+          if (size <= MAX_ANSWER_BYTES) text += chunk;
+          else {
+            // The status is all that's needed: this connection is not worth finishing.
+            resolve(answer(text));
+            req.destroy();
+          }
+        });
+        res.on('end', () => resolve(answer(text)));
+        res.on('error', reject);
+      },
+    );
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
 /** The reason a send was refused before anything left the relay, if the DNS lookup refused it. */
 export function isNotPublicError(error: unknown): boolean {
   const code = (error as { code?: unknown } | null)?.code;

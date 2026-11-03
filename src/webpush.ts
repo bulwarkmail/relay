@@ -1,9 +1,12 @@
 import webpush from 'web-push';
 import { logger } from './logger.js';
-import { isNotPublicError, isPublicEndpointUrl, publicOnlyAgent } from './endpoint-guard.js';
+import { isNotPublicError, isPublicEndpointUrl, postToEndpoint } from './endpoint-guard.js';
 import { failureReason, forwardTimeoutMs, type SendResult } from './forward-result.js';
 import { parseRetryAfter, type DeliveryOptions } from './forward-policy.js';
 import type { ForwardPayload, WebSubscriptionRecord } from './types.js';
+
+// Drop the message if the device stays offline for an hour.
+const PUSH_TTL_SECONDS = 60 * 60;
 
 let configured = false;
 let publicKey: string | null = null;
@@ -56,27 +59,41 @@ export async function sendWebPush(
   if (!isPublicEndpointUrl(record.webPush.endpoint)) return endpointRefused();
 
   try {
-    const res = await webpush.sendNotification(record.webPush, JSON.stringify(payload), {
-      TTL: 60 * 60, // seconds — drop if the device is offline for an hour
+    return await sendEncrypted(record.webPush, payload, {
       urgency: delivery.urgency,
       ...(delivery.topic ? { topic: delivery.topic } : {}),
-      timeout: forwardTimeoutMs(),
-      agent: publicOnlyAgent,
     });
-    return { ok: true, status: res.statusCode, unregistered: false };
   } catch (error) {
     if (isNotPublicError(error)) return endpointRefused();
-    const status = (error as { statusCode?: number }).statusCode ?? 0;
-    // 404 / 410 mean the push service has dropped the subscription -
-    // mirrors the FCM UNREGISTERED branch so the caller deletes the record.
-    const unregistered = status === 404 || status === 410;
-    const retryAfterSeconds = parseRetryAfter((error as { headers?: Record<string, unknown> }).headers?.['retry-after']);
-    return {
-      ok: false,
-      status,
-      unregistered,
-      reason: failureReason(error),
-      ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
-    };
+    return { ok: false, status: 0, unregistered: false, reason: failureReason(error) };
   }
+}
+
+// The library builds and encrypts the request (RFC 8291, VAPID when configured).
+// Sending it stays here, see postToEndpoint. 404 and 410 mean the service dropped
+// the subscription: the caller deletes the record.
+export async function sendEncrypted(
+  subscription: { endpoint: string; keys: { p256dh: string; auth: string } },
+  payload: ForwardPayload,
+  options: { urgency: string; topic?: string },
+): Promise<SendResult> {
+  const details = webpush.generateRequestDetails(subscription, JSON.stringify(payload), {
+    TTL: PUSH_TTL_SECONDS,
+    ...options,
+  } as webpush.RequestOptions);
+  const { status, text, retryAfter } = await postToEndpoint(
+    subscription.endpoint,
+    details.headers as Record<string, string | number>,
+    details.body as Buffer,
+    forwardTimeoutMs(),
+  );
+  const ok = status >= 200 && status < 300;
+  const retryAfterSeconds = parseRetryAfter(retryAfter);
+  return {
+    ok,
+    status,
+    unregistered: status === 404 || status === 410,
+    reason: ok ? undefined : failureReason(text || `HTTP ${status}`),
+    ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
+  };
 }

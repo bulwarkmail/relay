@@ -33,6 +33,10 @@ interface Answer {
   hang?: boolean;
   body?: string;
   delayMs?: number;
+  /** Keep the answer's body coming, one byte at this interval. */
+  dripMs?: number;
+  /** Stream this many bytes of body. */
+  floodBytes?: number;
 }
 
 export interface FakePushService {
@@ -45,6 +49,9 @@ export interface FakePushService {
   answer(pathname: string, how: Answer): void;
   close(): Promise<void>;
 }
+
+/** How much of a floodBytes answer actually went out. */
+export const floodSent = { bytes: 0 };
 
 export async function startFakePushService(): Promise<FakePushService> {
   const answers = new Map<string, Answer>();
@@ -60,6 +67,31 @@ export async function startFakePushService(): Promise<FakePushService> {
         requests.push({ path: pathname, method: req.method ?? '', headers: req.headers, body: Buffer.concat(chunks), at: Date.now() });
         const how = answers.get(pathname) ?? {};
         if (how.hang) return;
+        if (how.dripMs) {
+          res.writeHead(how.status ?? 201);
+          const timer = setInterval(() => res.write('x'), how.dripMs);
+          res.on('close', () => clearInterval(timer));
+          return;
+        }
+        if (how.floodBytes) {
+          res.writeHead(how.status ?? 500);
+          const chunk = Buffer.alloc(64 * 1024, 'x');
+          let left = how.floodBytes;
+          const pump = () => {
+            while (left > 0) {
+              left -= chunk.length;
+              floodSent.bytes += chunk.length;
+              if (!res.write(chunk)) {
+                res.once('drain', pump);
+                return;
+              }
+            }
+            res.end();
+          };
+          res.on('close', () => { left = 0; });
+          pump();
+          return;
+        }
         setTimeout(() => {
           res.writeHead(how.status ?? 201, how.headers ?? {});
           res.end(how.body ?? '');

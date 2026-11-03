@@ -6,6 +6,7 @@ import { after, before, describe, it } from 'node:test';
 import {
   apnsKeyPem,
   emailPush,
+  floodSent,
   getJson,
   makeDevice,
   newId,
@@ -917,6 +918,51 @@ describe('ids that are names of object internals', () => {
       assert.equal((await getJson(own.base, '/api/health')).status, 200);
       assert.equal((await getJson(own.base, `/api/push/verify/${newId()}`)).status, 404);
       assert.equal((await fetch(`${own.base}/metrics`)).status, 200);
+    } finally {
+      await own.stop();
+    }
+  });
+});
+
+describe('a push service that misbehaves on purpose', () => {
+  it('gives up on an answer that keeps trickling, whatever the transport', async () => {
+    const own = await startRelay({ env: { PUSH_FORWARD_TIMEOUT_MS: '400' } });
+    try {
+      for (const [pathname, route, fields] of [
+        ['/drip-web', '/api/push/register/web', (url: string) => ({ subscription: { endpoint: url, keys: makeDevice().keys } })],
+        ['/drip-up', '/api/push/register/unifiedpush', (url: string) => ({ endpoint: url, keys: makeDevice().keys })],
+        ['/drip-plain', '/api/push/register/unifiedpush', (url: string) => ({ endpoint: url })],
+      ] as const) {
+        service.answer(pathname, { dripMs: 100 });
+        const id = newId();
+        await postJson(own.base, route, { subscriptionId: id, ...fields(service.url(pathname)) });
+        const started = Date.now();
+        const res = await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
+        assert.ok(Date.now() - started < 1500, `${pathname} took ${Date.now() - started} ms`);
+        assert.ok(res.status === 503 || res.status === 200, `${pathname}: ${res.status}`);
+      }
+    } finally {
+      await own.stop();
+    }
+  });
+
+  it('does not read a huge answer into memory', async () => {
+    const own = await startRelay();
+    try {
+      const total = 64 * 1024 * 1024;
+      for (const [pathname, route, fields] of [
+        ['/flood-web', '/api/push/register/web', (url: string) => ({ subscription: { endpoint: url, keys: makeDevice().keys } })],
+        ['/flood-plain', '/api/push/register/unifiedpush', (url: string) => ({ endpoint: url })],
+      ] as const) {
+        service.answer(pathname, { floodBytes: total });
+        floodSent.bytes = 0;
+        const id = newId();
+        await postJson(own.base, route, { subscriptionId: id, ...fields(service.url(pathname)) });
+        const res = await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
+        assert.ok(res.status >= 500, `${pathname}: ${res.status}`);
+        assert.ok(floodSent.bytes < total / 4, `${pathname} read ${floodSent.bytes} bytes`);
+      }
+      assert.equal(own.exited(), false);
     } finally {
       await own.stop();
     }
