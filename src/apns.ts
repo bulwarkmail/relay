@@ -176,7 +176,13 @@ export async function sendApnsPush(
     let text = '';
     let retryAfter: unknown;
     req.setEncoding('utf8');
-    req.setTimeout(forwardTimeoutMs(), () => req.close(http2.constants.NGHTTP2_CANCEL));
+    // On the whole exchange, not on silence. A connection that goes quiet may be
+    // gone without either end knowing, so the next push gets a new one.
+    const deadline = setTimeout(() => {
+      req.close(http2.constants.NGHTTP2_CANCEL);
+      session.destroy();
+    }, forwardTimeoutMs());
+    req.on('close', () => clearTimeout(deadline));
     req.on('response', (headers) => {
       status = Number(headers[':status'] ?? 0);
       retryAfter = headers['retry-after'];

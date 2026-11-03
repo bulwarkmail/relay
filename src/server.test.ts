@@ -969,6 +969,51 @@ describe('a push service that misbehaves on purpose', () => {
   });
 });
 
+describe('the native transports against a slow service', () => {
+  it('opens a new APNs connection after one that stopped answering', async () => {
+    const apns = await startFakeApns();
+    apns.hang(true);
+    const own = await startRelay({
+      env: { PUSH_FORWARD_TIMEOUT_MS: '300', APNS_KEY: apnsKeyPem(), APNS_KEY_ID: 'KEYID12345', APNS_TEAM_ID: 'TEAM123456', APNS_ORIGIN: apns.origin },
+    });
+    try {
+      const id = newId();
+      await postJson(own.base, '/api/push/register/apns', { subscriptionId: id, deviceToken: 'ab'.repeat(32), environment: 'production' });
+      assert.ok((await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']))).status >= 500);
+      apns.hang(false);
+      assert.equal((await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e2']))).status, 200);
+      assert.equal(apns.sessionCount(), 2);
+    } finally {
+      await own.stop();
+      await apns.close();
+    }
+  });
+
+  it('keeps FCM within one deadline, token and send together', async () => {
+    service.answer('/oauth/slow-token', {
+      status: 200,
+      delayMs: 300,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ access_token: 't', expires_in: 3600 }),
+    });
+    service.answer('/v1/projects/slow-project/messages:send', { status: 200, delayMs: 300, body: '{}' });
+    const own = await startRelay({
+      env: {
+        PUSH_FORWARD_TIMEOUT_MS: '500',
+        FCM_ORIGIN: service.url('').replace(/\/$/, ''),
+        FCM_SERVICE_ACCOUNT_JSON: JSON.stringify(serviceAccount('slow-project', service.url('/oauth/slow-token'))),
+      },
+    });
+    try {
+      const id = newId();
+      await postJson(own.base, '/api/push/register', { subscriptionId: id, fcmToken: 'f'.repeat(100) });
+      assert.ok((await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']))).status >= 500);
+    } finally {
+      await own.stop();
+    }
+  });
+});
+
 describe('anything else', () => {
   it('answers 404 on an unknown path and 204 to a preflight', async () => {
     assert.equal((await getJson(relay.base, '/nothing')).status, 404);

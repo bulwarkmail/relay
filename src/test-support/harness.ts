@@ -318,6 +318,8 @@ export function rawRequest(port: number, text: string, timeoutMs = 3000): Promis
 
 export interface FakeApns {
   origin: string;
+  /** Connections accepted so far. */
+  sessionCount(): number;
   requests: { path: string; headers: http2.IncomingHttpHeaders; body: string }[];
   answer(status: number, body?: string): void;
   hang(on: boolean): void;
@@ -331,7 +333,9 @@ export async function startFakeApns(): Promise<FakeApns> {
   let hanging = false;
   const server = http2.createSecureServer({ cert: fs.readFileSync(CERT_FILE), key: fs.readFileSync(KEY_FILE) });
   const sessions = new Set<http2.ServerHttp2Session>();
+  let sessionCount = 0;
   server.on('session', (session) => {
+    sessionCount += 1;
     sessions.add(session);
     session.on('close', () => sessions.delete(session));
   });
@@ -351,6 +355,7 @@ export async function startFakeApns(): Promise<FakeApns> {
   const port = (server.address() as net.AddressInfo).port;
   return {
     origin: `https://localhost:${port}`,
+    sessionCount: () => sessionCount,
     requests,
     answer: (nextStatus, nextBody = '') => { status = nextStatus; text = nextBody; },
     hang: (on) => { hanging = on; },

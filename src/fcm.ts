@@ -77,7 +77,7 @@ function base64url(buf: Buffer | string): string {
   return b.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-async function mintAccessToken(project: FcmProject): Promise<string> {
+async function mintAccessToken(project: FcmProject, signal: AbortSignal): Promise<string> {
   const now = Date.now();
   if (project.accessToken && project.accessToken.expiresAt - 60_000 > now) {
     return project.accessToken.token;
@@ -108,7 +108,7 @@ async function mintAccessToken(project: FcmProject): Promise<string> {
       grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
       assertion: jwt,
     }),
-    signal: AbortSignal.timeout(forwardTimeoutMs()),
+    signal,
   });
   if (!res.ok) {
     throw new Error(`FCM oauth2 token failed: ${res.status} ${await res.text()}`);
@@ -148,8 +148,10 @@ export async function sendFcmPush(
     status: 0,
     unregistered: false,
   };
+  // One deadline for the lot: the mail server waits 10 s, however many steps it takes.
+  const signal = AbortSignal.timeout(forwardTimeoutMs());
   for (const project of ordered) {
-    result = await sendWithProject(project, record, payload);
+    result = await sendWithProject(project, record, payload, signal);
     if (!result.senderMismatch) break;
   }
   if (result.ok && result.projectId) projectForToken.set(record.fcmToken, result.projectId);
@@ -162,9 +164,10 @@ async function sendWithProject(
   project: FcmProject,
   record: FcmSubscriptionRecord,
   payload: ForwardPayload,
+  signal: AbortSignal,
 ): Promise<FcmSendResult & { senderMismatch: boolean; projectId: string }> {
   const { account } = project;
-  const accessToken = await mintAccessToken(project);
+  const accessToken = await mintAccessToken(project, signal);
   // Data-only push so onMessageReceived always fires — the app enriches it
   // (sender/subject/avatar) via JMAP fetch before posting a notification.
   // FCM data values must be strings, hence the JSON-encoded fields.
@@ -193,7 +196,7 @@ async function sendWithProject(
         'content-type': 'application/json',
       },
       body: JSON.stringify(message),
-      signal: AbortSignal.timeout(forwardTimeoutMs()),
+      signal,
     },
   );
 
