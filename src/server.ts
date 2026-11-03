@@ -474,7 +474,8 @@ async function handleJmap(
       logForwardFailure(id, record, 'fail', failed);
       return sendJson(res, 500, { error: 'Internal server error' });
     }
-    forwardPolicy.note(id, record, result);
+    // A record replaced meanwhile points at another endpoint, which this says nothing about.
+    if (await subscriptionStore.isCurrent(id, record)) forwardPolicy.note(id, record, result);
     const outcome = classifyForward(result);
     pushesForwarded.inc({
       result: outcome,

@@ -62,6 +62,11 @@ function positiveEnv(name: string, fallback: number): number {
 const DEFAULT_BACKOFF_SECONDS = 60;
 const MAX_BACKOFF_SECONDS = 3600;
 const HOST_WINDOW_MS = 60_000;
+// However long one answer asks for: this stops every subscription on the service,
+// and the mail server gives up on a held push after two minutes.
+const MAX_HOST_HOLD_SECONDS = 120;
+const MAX_TRACKED_HOSTS = 1000;
+const MAX_TRACKED_SUBSCRIPTIONS = 100_000;
 
 export interface Hold {
   reason: 'rate-limit' | 'push-service-backoff' | 'push-service-throttle';
@@ -71,6 +76,19 @@ export interface Hold {
 interface Bucket {
   tokens: number;
   updatedAt: number;
+}
+
+// The same host name can serve browsers and native apps (fcm.googleapis.com), under
+// different senders and quotas.
+export function hostThrottleKey(record: SubscriptionRecord, host: string): string {
+  return `${record.kind}:${host}`;
+}
+
+// Who a 429 counts for: subscriptions on one endpoint are one device.
+function deviceOf(record: SubscriptionRecord): string {
+  if (record.kind === 'web') return record.webPush.endpoint;
+  if (record.kind === 'up') return record.endpoint;
+  return record.kind === 'fcm' ? record.fcmToken : record.deviceToken;
 }
 
 export function parseRetryAfter(value: unknown, now = Date.now()): number | undefined {
@@ -84,7 +102,7 @@ export function parseRetryAfter(value: unknown, now = Date.now()): number | unde
 class ForwardPolicy {
   private buckets = new Map<string, Bucket>();
   private backoffs = new Map<string, number>();
-  private hostThrottles = new Map<string, { hits: number; windowStart: number; until: number }>();
+  private hostThrottles = new Map<string, { devices: Set<string>; windowStart: number; until: number }>();
 
   /** Whether this push should stay here for now. Takes a token when it goes out. */
   hold(id: string, record: SubscriptionRecord, now = Date.now()): Hold | null {
@@ -95,7 +113,7 @@ class ForwardPolicy {
       }
       this.backoffs.delete(id);
     }
-    const host = this.hostThrottles.get(pushServiceHost(record));
+    const host = this.hostThrottles.get(hostThrottleKey(record, pushServiceHost(record)));
     if (host && host.until > now) {
       return { reason: 'push-service-throttle', retryAfterSeconds: Math.ceil((host.until - now) / 1000) };
     }
@@ -125,16 +143,31 @@ class ForwardPolicy {
     const seconds = Math.min(result.retryAfterSeconds ?? DEFAULT_BACKOFF_SECONDS, MAX_BACKOFF_SECONDS);
     this.backoffs.set(id, now + seconds * 1000);
     if (!throttled) return;
-    const name = pushServiceHost(record);
+    const name = hostThrottleKey(record, pushServiceHost(record));
     const host = this.hostThrottles.get(name);
     const current = host && now - host.windowStart < HOST_WINDOW_MS
       ? host
-      : { hits: 0, windowStart: now, until: 0 };
-    current.hits += 1;
-    if (current.hits >= positiveEnv('PUSH_HOST_THROTTLE_LIMIT', 20)) {
-      current.until = now + seconds * 1000;
+      : { devices: new Set<string>(), windowStart: now, until: host?.until ?? 0 };
+    const limit = positiveEnv('PUSH_HOST_THROTTLE_LIMIT', 20);
+    if (current.devices.size < limit) current.devices.add(deviceOf(record));
+    if (current.devices.size >= limit) {
+      current.until = now + Math.min(seconds, MAX_HOST_HOLD_SECONDS) * 1000;
     }
     this.hostThrottles.set(name, current);
+    this.prune(now);
+  }
+
+  // Hosts are the caller's choice, and records go away without this hearing of it.
+  private prune(now: number): void {
+    if (this.hostThrottles.size > MAX_TRACKED_HOSTS) {
+      for (const [name, host] of this.hostThrottles) {
+        if (now - host.windowStart >= HOST_WINDOW_MS && host.until <= now) this.hostThrottles.delete(name);
+      }
+    }
+    if (this.backoffs.size > MAX_TRACKED_SUBSCRIPTIONS) {
+      for (const [id, until] of this.backoffs) if (until <= now) this.backoffs.delete(id);
+    }
+    if (this.buckets.size > MAX_TRACKED_SUBSCRIPTIONS) this.buckets.clear();
   }
 
   /** The record is gone or points somewhere new: what the old endpoint earned doesn't apply. */

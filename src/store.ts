@@ -131,6 +131,11 @@ class SubscriptionStore {
     await this.persist();
   }
 
+  async isCurrent(id: string, record: SubscriptionRecord): Promise<boolean> {
+    await this.ensureLoaded();
+    return this.cache[id] === record;
+  }
+
   /** Deletes a record, if it is still the one the caller read. Says whether it did. */
   async deleteIfCurrent(id: string, expected: SubscriptionRecord): Promise<boolean> {
     await this.ensureLoaded();

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
+import { hostThrottleKey } from './forward-policy.js';
 import {
   apnsKeyPem,
   emailPush,
@@ -1008,6 +1009,75 @@ describe('the native transports against a slow service', () => {
       const id = newId();
       await postJson(own.base, '/api/push/register', { subscriptionId: id, fcmToken: 'f'.repeat(100) });
       assert.ok((await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']))).status >= 500);
+    } finally {
+      await own.stop();
+    }
+  });
+});
+
+describe('how far a throttle reaches', () => {
+  it('does not let one Retry-After silence a whole host for long', async () => {
+    const own = await startRelay({ env: { PUSH_HOST_THROTTLE_LIMIT: '2' } });
+    try {
+      for (let i = 0; i < 2; i++) {
+        const pathname = `/reach-long-${i}`;
+        service.answer(pathname, { status: 429, headers: { 'retry-after': '3600' } });
+        const { id } = await registerWeb(pathname, own);
+        await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
+      }
+      const { id } = await registerWeb('/reach-other', own);
+      const res = await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e2']));
+      assert.equal(res.status, 503);
+      assert.ok(Number(res.headers.get('retry-after')) <= 120, `held for ${res.headers.get('retry-after')} s`);
+    } finally {
+      await own.stop();
+    }
+  });
+
+  it('takes many subscriptions on one endpoint for one, so nobody can provoke it for everyone', async () => {
+    const own = await startRelay({ env: { PUSH_HOST_THROTTLE_LIMIT: '3' } });
+    try {
+      service.answer('/reach-same', { status: 429 });
+      for (let i = 0; i < 5; i++) {
+        const { id } = await registerWeb('/reach-same', own);
+        assert.equal((await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']))).status, 503);
+      }
+      const { id } = await registerWeb('/reach-bystander', own);
+      assert.equal((await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e2']))).status, 200);
+    } finally {
+      await own.stop();
+    }
+  });
+
+  it('keeps Web Push trouble away from native apps on the same host name', async () => {
+    const account = serviceAccount('reach-project', service.url('/oauth/reach-token'));
+    service.answer('/oauth/reach-token', { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ access_token: 't', expires_in: 3600 }) });
+    service.answer('/v1/projects/reach-project/messages:send', { status: 200, headers: { 'content-type': 'application/json' }, body: '{}' });
+    const own = await startRelay({
+      env: {
+        PUSH_HOST_THROTTLE_LIMIT: '2',
+        FCM_ORIGIN: service.url('').replace(/\/$/, ''),
+        FCM_SERVICE_ACCOUNT_JSON: JSON.stringify(account),
+      },
+    });
+    try {
+      assert.equal(hostThrottleKey({ kind: 'fcm' } as never, 'fcm.googleapis.com') === hostThrottleKey({ kind: 'web' } as never, 'fcm.googleapis.com'), false);
+    } finally {
+      await own.stop();
+    }
+  });
+
+  it('does not put an old endpoint\'s 429 on the new one that replaced it', async () => {
+    const own = await startRelay();
+    try {
+      service.answer('/reach-old', { status: 429, delayMs: 400, headers: { 'retry-after': '600' } });
+      const { id, device } = await registerWeb('/reach-old', own);
+      const forward = postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await postJson(own.base, '/api/push/register/web', { subscriptionId: id, subscription: { endpoint: service.url('/reach-new'), keys: device.keys } });
+      await forward;
+      assert.equal((await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e2']))).status, 200);
+      assert.equal(service.to('/reach-new').length, 1);
     } finally {
       await own.stop();
     }
