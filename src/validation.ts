@@ -1,8 +1,12 @@
 import { isPublicEndpointUrl } from './endpoint-guard.js';
 import type { WebPushSubscription } from './types.js';
 
+// The names plain objects inherit. Never what a client generates, and a store or
+// label keyed on one could reach the object prototype.
+const RESERVED_IDS = new Set(['__proto__', 'constructor', 'prototype', 'hasOwnProperty', 'toString', 'valueOf']);
+
 export function isValidSubscriptionId(id: unknown): id is string {
-  return typeof id === 'string' && /^[A-Za-z0-9_-]{8,128}$/.test(id);
+  return typeof id === 'string' && /^[A-Za-z0-9_-]{8,128}$/.test(id) && !RESERVED_IDS.has(id);
 }
 
 export function isValidFcmToken(value: unknown): value is string {

@@ -26,7 +26,8 @@ interface SubscriptionsFile {
 }
 
 class SubscriptionStore {
-  private cache: Record<string, SubscriptionRecord> = {};
+  // Without a prototype, so no id can ever read or write an inherited property.
+  private cache: Record<string, SubscriptionRecord> = Object.create(null);
   private loaded = false;
   private writeQueue: Promise<void> = Promise.resolve();
   private queuedWrite: Promise<void> | null = null;
@@ -35,7 +36,8 @@ class SubscriptionStore {
     const target = subscriptionsPath();
     const records =
       (await this.readRecords(target)) ?? (await this.readRecords(previousVersionPath()));
-    this.cache = records ?? {};
+    this.cache = Object.assign(Object.create(null), records ?? {});
+    delete this.cache['__proto__'];
     this.migrateLegacyRecords();
     this.evictExpired();
     this.loaded = true;

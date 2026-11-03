@@ -615,7 +615,17 @@ function decodeId(segment: string): string {
   }
 }
 
-const server = http.createServer(async (req, res) => {
+// An unhandled rejection ends the process, so nothing that goes wrong with one
+// request may get past this.
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch((error) => {
+    logger.error('relay: request failed', { error: error instanceof Error ? error.message : 'Unknown error' });
+    if (!res.headersSent) res.writeHead(500);
+    res.end();
+  });
+});
+
+async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const started = Date.now();
   const method = req.method ?? 'GET';
   // A request target like `//` is no URL at all. Thrown from here it would take
@@ -750,7 +760,7 @@ const server = http.createServer(async (req, res) => {
       ms: Date.now() - started,
     });
   }
-});
+}
 
 server.listen(PORT, HOST, () => {
   logger.info('relay: listening', { host: HOST, port: PORT });

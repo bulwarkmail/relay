@@ -885,6 +885,44 @@ describe('wrong methods', () => {
   });
 });
 
+describe('ids that are names of object internals', () => {
+  it('answers like any other unknown id and keeps running', async () => {
+    const own = await startRelay();
+    try {
+      for (const id of ['__proto__', 'constructor', 'prototype', 'hasOwnProperty', 'toString']) {
+        const verification = await postJson(own.base, `/api/push/jmap/${id}`, pushVerification('x'));
+        assert.ok(verification.status === 404 || verification.status === 400, `${id}: ${verification.status}`);
+        assert.ok([400, 404].includes((await getJson(own.base, `/api/push/verify/${id}`)).status), id);
+        assert.ok([400, 404].includes((await getJson(own.base, `/api/push/active/${id}`)).status), id);
+        assert.ok([200, 400].includes((await getJson(own.base, `/api/push/register/${id}`, 'DELETE')).status), id);
+        const register = await postJson(own.base, '/api/push/register/web', {
+          subscriptionId: id,
+          subscription: { endpoint: service.url('/proto'), keys: makeDevice().keys },
+        });
+        assert.equal(register.status, 400, id);
+      }
+      assert.equal(own.exited(), false);
+      assert.equal((await getJson(own.base, '/api/health')).status, 200);
+      assert.equal((await fetch(`${own.base}/metrics`)).status, 200);
+    } finally {
+      await own.stop();
+    }
+  });
+
+  it('keeps a record with such a name from an old store out of the object prototype', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-seed-'));
+    fs.writeFileSync(path.join(dataDir, 'subscriptions.json'), '{"records":{"__proto__":{"kind":"fcm","fcmToken":"x","verificationCode":"polluted","createdAt":1,"lastPushAt":null}}}');
+    const own = await startRelay({ dataDir });
+    try {
+      assert.equal((await getJson(own.base, '/api/health')).status, 200);
+      assert.equal((await getJson(own.base, `/api/push/verify/${newId()}`)).status, 404);
+      assert.equal((await fetch(`${own.base}/metrics`)).status, 200);
+    } finally {
+      await own.stop();
+    }
+  });
+});
+
 describe('anything else', () => {
   it('answers 404 on an unknown path and 204 to a preflight', async () => {
     assert.equal((await getJson(relay.base, '/nothing')).status, 404);
