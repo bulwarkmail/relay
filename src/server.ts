@@ -7,6 +7,7 @@ import { getApnsConfig, sendApnsPush } from './apns.js';
 import { getVapidPublicKey, sendWebPush } from './webpush.js';
 import { sendUnifiedPush } from './unifiedpush.js';
 import { isForwardableBody, toForwardPayload } from './payload.js';
+import { deliveryOptions, forwardPolicy, type DeliveryOptions } from './forward-policy.js';
 import {
   classifyForward,
   failureReason,
@@ -43,6 +44,7 @@ import {
   subscriptionsActive,
   pushesReceived,
   pushesForwarded,
+  pushesHeld,
   fcmDurationSeconds,
   apnsDurationSeconds,
   webPushDurationSeconds,
@@ -153,8 +155,9 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
 }
 
 // What a new registration keeps from the record it replaces.
-function carriedOver(existing: SubscriptionRecord | null) {
+function carriedOver(id: string, existing: SubscriptionRecord | null) {
   const now = Date.now();
+  forwardPolicy.forget(id);
   return {
     createdAt: existing?.createdAt ?? now,
     lastPushAt: existing?.lastPushAt ?? null,
@@ -193,7 +196,7 @@ async function handleRegister(
     // every fresh subscription, so dropping the old code is safe - the warm
     // path (existing JMAP sub still alive) skips polling entirely.
     verificationCode: null,
-    ...carriedOver(existing),
+    ...carriedOver(subscriptionId, existing),
     accountLabel:
       typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
   };
@@ -237,7 +240,7 @@ async function handleRegisterApns(
     environment,
     // See handleRegister for why we always reset this.
     verificationCode: null,
-    ...carriedOver(existing),
+    ...carriedOver(subscriptionId, existing),
     accountLabel:
       typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
   };
@@ -281,7 +284,7 @@ async function handleRegisterWeb(
     webPush: subscription,
     // See handleRegister for why we always reset this.
     verificationCode: null,
-    ...carriedOver(existing),
+    ...carriedOver(subscriptionId, existing),
     accountLabel:
       typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
   };
@@ -328,7 +331,7 @@ async function handleRegisterUnifiedPush(
     keys: keys ?? null,
     // See handleRegister for why we always reset this.
     verificationCode: null,
-    ...carriedOver(existing),
+    ...carriedOver(subscriptionId, existing),
     accountLabel:
       typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
   };
@@ -349,6 +352,7 @@ async function handleUnregister(
   // the right transport in metrics.
   const existing = await subscriptionStore.get(id);
   await subscriptionStore.delete(id);
+  forwardPolicy.remove(id);
   subscriptionsUnregistered.inc({
     reason: 'client',
     transport: existing?.kind ?? 'unknown',
@@ -441,9 +445,20 @@ async function handleJmap(
   // messages that passed - both become the same content-blind device payload.
   if (isForwardableBody(body)) {
     pushesReceived.inc({ type: body['@type'] });
+    const hold = forwardPolicy.hold(id, record);
+    if (hold) {
+      pushesHeld.inc({ reason: hold.reason, transport: record.kind });
+      logger.info('relay: push held back', { subscriptionId: id, transport: record.kind, ...hold });
+      res.setHeader('retry-after', String(hold.retryAfterSeconds));
+      return sendJson(res, hold.reason === 'rate-limit' ? 429 : 503, { ok: false, held: hold.reason });
+    }
     let result: SendResult;
     try {
-      result = await dispatch(record, toForwardPayload(body, record.accountLabel));
+      result = await dispatch(
+        record,
+        toForwardPayload(body, record.accountLabel),
+        deliveryOptions(id, body, req.headers.urgency),
+      );
     } catch (error) {
       // FCM token minting and sending throw on network errors. Count and log
       // them like any other failed forward, then answer 500 as before so the
@@ -453,6 +468,7 @@ async function handleJmap(
       logForwardFailure(id, record, 'fail', failed);
       return sendJson(res, 500, { error: 'Internal server error' });
     }
+    forwardPolicy.note(id, record, result);
     const outcome = classifyForward(result);
     pushesForwarded.inc({
       result: outcome,
@@ -470,12 +486,18 @@ async function handleJmap(
             : record.kind === 'up'
               ? 'unifiedpush-gone'
               : 'webpush-gone';
-      if (removed) subscriptionsUnregistered.inc({ reason, transport: record.kind });
+      if (removed) {
+        subscriptionsUnregistered.inc({ reason, transport: record.kind });
+        forwardPolicy.remove(id);
+      }
       await refreshActiveGauge();
     } else {
       await subscriptionStore.updateIfCurrent(id, record, (current) => {
         current.lastPushAt = Date.now();
       });
+    }
+    if (result.retryAfterSeconds !== undefined) {
+      res.setHeader('retry-after', String(result.retryAfterSeconds));
     }
     return sendJson(res, isTemporaryFailure(result) ? 503 : 200, { ok: result.ok });
   }
@@ -507,6 +529,7 @@ function logForwardFailure(
 async function dispatch(
   record: SubscriptionRecord,
   payload: ForwardPayload,
+  delivery: DeliveryOptions,
 ): Promise<SendResult> {
   if (record.kind === 'fcm') {
     const timer = fcmDurationSeconds.startTimer();
@@ -522,12 +545,12 @@ async function dispatch(
   }
   if (record.kind === 'up') {
     const timer = upDurationSeconds.startTimer();
-    const result = await sendUnifiedPush(record, payload);
+    const result = await sendUnifiedPush(record, payload, delivery);
     timer();
     return result;
   }
   const timer = webPushDurationSeconds.startTimer();
-  const result = await sendWebPush(record, payload);
+  const result = await sendWebPush(record, payload, delivery);
   timer();
   return result;
 }

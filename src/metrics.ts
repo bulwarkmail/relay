@@ -59,6 +59,13 @@ export const pushesForwarded = new Counter({
   registers: [registry],
 });
 
+export const pushesHeld = new Counter({
+  name: 'relay_pushes_held_total',
+  help: 'Pushes answered with "try again later" without calling the push service, by reason',
+  labelNames: ['reason', 'transport'] as const,
+  registers: [registry],
+});
+
 export const fcmDurationSeconds = new Histogram({
   name: 'relay_fcm_send_duration_seconds',
   help: 'Latency of POST to fcm.googleapis.com',

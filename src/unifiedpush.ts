@@ -3,6 +3,7 @@ import https from 'node:https';
 import { isNotPublicError, isPublicEndpointUrl, publicOnlyAgent } from './endpoint-guard.js';
 import { endpointRefused, getVapidPublicKey } from './webpush.js';
 import { failureReason, forwardTimeoutMs, type SendResult } from './forward-result.js';
+import { parseRetryAfter, type DeliveryOptions } from './forward-policy.js';
 import type { ForwardPayload, UnifiedPushSubscriptionRecord } from './types.js';
 
 // Drop the message if the device stays unreachable for an hour - matches the
@@ -25,6 +26,7 @@ const TTL_SECONDS = 60 * 60;
 export async function sendUnifiedPush(
   record: UnifiedPushSubscriptionRecord,
   payload: ForwardPayload,
+  delivery: DeliveryOptions,
 ): Promise<SendResult> {
   if (!isPublicEndpointUrl(record.endpoint)) return endpointRefused();
   const body = JSON.stringify(payload);
@@ -37,7 +39,7 @@ export async function sendUnifiedPush(
       const res = await webpush.sendNotification(
         { endpoint: record.endpoint, keys: record.keys },
         body,
-        { TTL: TTL_SECONDS, urgency: 'high', timeout: forwardTimeoutMs(), agent: publicOnlyAgent },
+        { TTL: TTL_SECONDS, urgency: delivery.urgency, timeout: forwardTimeoutMs(), agent: publicOnlyAgent },
       );
       return { ok: true, status: res.statusCode, unregistered: false };
     } catch (error) {
@@ -45,23 +47,27 @@ export async function sendUnifiedPush(
       const status = (error as { statusCode?: number }).statusCode ?? 0;
       // 404 / 410 mean the distributor dropped the registration - mirrors the
       // FCM UNREGISTERED branch so the caller deletes the record.
+      const retryAfterSeconds = parseRetryAfter((error as { headers?: Record<string, unknown> }).headers?.['retry-after']);
       return {
         ok: false,
         status,
         unregistered: status === 404 || status === 410,
         reason: failureReason(error),
+        ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
       };
     }
   }
 
   try {
-    const { status, text } = await postPlain(record.endpoint, body);
+    const { status, text, retryAfter } = await postPlain(record.endpoint, body, delivery);
     const ok = status >= 200 && status < 300;
+    const retryAfterSeconds = parseRetryAfter(retryAfter);
     return {
       ok,
       status,
       unregistered: status === 404 || status === 410,
       reason: ok ? undefined : failureReason(text || `HTTP ${status}`),
+      ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
     };
   } catch (error) {
     if (isNotPublicError(error)) return endpointRefused();
@@ -71,7 +77,11 @@ export async function sendUnifiedPush(
 
 // Not fetch: it follows redirects, and a distributor could send the relay
 // anywhere with one. A redirect counts as a failure here.
-function postPlain(endpoint: string, body: string): Promise<{ status: number; text: string }> {
+function postPlain(
+  endpoint: string,
+  body: string,
+  delivery: DeliveryOptions,
+): Promise<{ status: number; text: string; retryAfter: unknown }> {
   return new Promise((resolve, reject) => {
     const req = https.request(
       endpoint,
@@ -81,7 +91,7 @@ function postPlain(endpoint: string, body: string): Promise<{ status: number; te
         timeout: forwardTimeoutMs(),
         headers: {
           TTL: String(TTL_SECONDS),
-          Urgency: 'high',
+          Urgency: delivery.urgency,
           'content-type': 'application/json',
           'content-length': Buffer.byteLength(body),
         },
@@ -94,7 +104,7 @@ function postPlain(endpoint: string, body: string): Promise<{ status: number; te
         res.on('data', (chunk: string) => {
           if (text.length < 1024) text += chunk;
         });
-        res.on('end', () => resolve({ status: res.statusCode ?? 0, text }));
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, text, retryAfter: res.headers['retry-after'] }));
         res.on('error', reject);
       },
     );

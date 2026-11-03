@@ -705,6 +705,120 @@ describe('endpoints the relay must not call', () => {
   });
 });
 
+describe('sending politely', () => {
+  it('passes the urgency the server asked for on an EmailPush and sends no Topic', async () => {
+    const { id } = await registerWeb('/polite-email');
+    const res = await fetch(`${relay.base}/api/push/jmap/${id}`, {
+      method: 'POST',
+      headers: { urgency: 'normal' },
+      body: JSON.stringify(emailPush('a', ['e1'])),
+    });
+    assert.equal(res.status, 200);
+    const sent = service.to('/polite-email')[0];
+    assert.equal(sent.headers.urgency, 'normal');
+    assert.equal(sent.headers.topic, undefined);
+  });
+
+  it('sends new mail on the state-change path at high urgency under one Topic per account', async () => {
+    const { id } = await registerWeb('/polite-state');
+    await postJson(relay.base, `/api/push/jmap/${id}`, stateChange({ a: { EmailDelivery: 's1' } }));
+    await postJson(relay.base, `/api/push/jmap/${id}`, stateChange({ a: { EmailDelivery: 's2' } }));
+    await postJson(relay.base, `/api/push/jmap/${id}`, stateChange({ b: { EmailDelivery: 's3' } }));
+    await postJson(relay.base, `/api/push/jmap/${id}`, stateChange({ a: { EmailDelivery: 's4' }, b: { EmailDelivery: 's5' } }));
+    const [first, second, other, both] = service.to('/polite-state');
+    assert.equal(first.headers.urgency, 'high');
+    assert.match(String(first.headers.topic), /^[A-Za-z0-9_-]{1,32}$/);
+    assert.equal(second.headers.topic, first.headers.topic);
+    assert.notEqual(other.headers.topic, first.headers.topic);
+    // A device that was offline must not lose one of the two accounts to a replacement.
+    assert.equal(both.headers.topic, undefined);
+  });
+
+  it('sends other state pings at low urgency', async () => {
+    const { id } = await registerWeb('/polite-low');
+    await postJson(relay.base, `/api/push/jmap/${id}`, stateChange({ a: { Email: 's1', Mailbox: 's2' } }));
+    assert.equal(service.to('/polite-low')[0].headers.urgency, 'low');
+  });
+
+  it('keeps UnifiedPush distributors out of Topic, as they may not know it', async () => {
+    const id = newId();
+    await postJson(relay.base, '/api/push/register/unifiedpush', { subscriptionId: id, endpoint: service.url('/polite-up'), keys: makeDevice().keys });
+    await postJson(relay.base, `/api/push/jmap/${id}`, stateChange({ a: { EmailDelivery: 's1' } }));
+    const sent = service.to('/polite-up')[0];
+    assert.equal(sent.headers.urgency, 'high');
+    assert.equal(sent.headers.topic, undefined);
+  });
+
+  it('holds back after a burst to one subscription, and lets it through again after the refill', async () => {
+    const own = await startRelay({ env: { PUSH_SUBSCRIPTION_BURST: '3', PUSH_SUBSCRIPTION_REFILL_MS: '600' } });
+    try {
+      const { id } = await registerWeb('/polite-burst', own);
+      const statuses: number[] = [];
+      for (let i = 0; i < 5; i++) {
+        const res = await postJson(own.base, `/api/push/jmap/${id}`, stateChange({ a: { EmailDelivery: `s${i}` } }));
+        statuses.push(res.status);
+        if (res.status === 429) assert.ok(Number(res.headers.get('retry-after')) >= 1);
+      }
+      assert.deepEqual(statuses, [200, 200, 200, 429, 429]);
+      assert.equal(service.to('/polite-burst').length, 3, 'nothing went out while held');
+      // A verification is never held: the client is waiting for it.
+      assert.equal((await postJson(own.base, `/api/push/jmap/${id}`, pushVerification('code'))).status, 200);
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      assert.equal((await postJson(own.base, `/api/push/jmap/${id}`, stateChange({ a: { EmailDelivery: 'later' } }))).status, 200);
+      assert.equal(service.to('/polite-burst').length, 4);
+    } finally {
+      await own.stop();
+    }
+  });
+
+  it('leaves a service alone for as long as its Retry-After says', async () => {
+    const own = await startRelay();
+    try {
+      service.answer('/polite-429', { status: 429, headers: { 'retry-after': '120' } });
+      const { id } = await registerWeb('/polite-429', own);
+      const first = await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
+      assert.equal(first.status, 503);
+      assert.equal(first.headers.get('retry-after'), '120');
+      const second = await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e2']));
+      assert.equal(second.status, 503);
+      assert.equal(service.to('/polite-429').length, 1, 'the second push stayed here');
+      assert.ok(Number(second.headers.get('retry-after')) <= 120);
+      // Others on that service are not affected by one subscription's 429.
+      const { id: other } = await registerWeb('/polite-other', own);
+      assert.equal((await postJson(own.base, `/api/push/jmap/${other}`, emailPush('a', ['e3']))).status, 200);
+      // A fresh registration is a fresh endpoint.
+      service.answer('/polite-429', { status: 201 });
+      await postJson(own.base, '/api/push/register/web', {
+        subscriptionId: id,
+        subscription: { endpoint: service.url('/polite-429'), keys: makeDevice().keys },
+      });
+      assert.equal((await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e4']))).status, 200);
+    } finally {
+      await own.stop();
+    }
+  });
+
+  it('stops calling a service that throttles many subscriptions at once', async () => {
+    const own = await startRelay({ env: { PUSH_HOST_THROTTLE_LIMIT: '3' } });
+    try {
+      for (let i = 0; i < 3; i++) {
+        const pathname = `/polite-host-${i}`;
+        service.answer(pathname, { status: 429 });
+        const { id } = await registerWeb(pathname, own);
+        assert.equal((await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']))).status, 503);
+      }
+      const { id } = await registerWeb('/polite-host-healthy', own);
+      const res = await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e2']));
+      assert.equal(res.status, 503);
+      assert.equal(service.to('/polite-host-healthy').length, 0);
+      const metrics = await (await fetch(`${own.base}/metrics`)).text();
+      assert.match(metrics, /relay_pushes_held_total\{reason="push-service-throttle",transport="web"\} 1/);
+    } finally {
+      await own.stop();
+    }
+  });
+});
+
 describe('anything else', () => {
   it('answers 404 on an unknown path and 204 to a preflight', async () => {
     assert.equal((await getJson(relay.base, '/nothing')).status, 404);

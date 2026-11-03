@@ -11,6 +11,8 @@ export interface SendResult {
   status: number;
   unregistered: boolean;
   reason?: string;
+  // The service's Retry-After, when it sent one.
+  retryAfterSeconds?: number;
 }
 
 const MAX_REASON_CHARS = 200;

@@ -2,6 +2,7 @@ import webpush from 'web-push';
 import { logger } from './logger.js';
 import { isNotPublicError, isPublicEndpointUrl, publicOnlyAgent } from './endpoint-guard.js';
 import { failureReason, forwardTimeoutMs, type SendResult } from './forward-result.js';
+import { parseRetryAfter, type DeliveryOptions } from './forward-policy.js';
 import type { ForwardPayload, WebSubscriptionRecord } from './types.js';
 
 let configured = false;
@@ -42,6 +43,7 @@ export function endpointRefused(): SendResult {
 export async function sendWebPush(
   record: WebSubscriptionRecord,
   payload: ForwardPayload,
+  delivery: DeliveryOptions,
 ): Promise<SendResult> {
   if (!ensureConfigured()) {
     return { ok: false, status: 0, unregistered: false, reason: 'VAPID keys not configured' };
@@ -56,7 +58,8 @@ export async function sendWebPush(
   try {
     const res = await webpush.sendNotification(record.webPush, JSON.stringify(payload), {
       TTL: 60 * 60, // seconds — drop if the device is offline for an hour
-      urgency: 'high',
+      urgency: delivery.urgency,
+      ...(delivery.topic ? { topic: delivery.topic } : {}),
       timeout: forwardTimeoutMs(),
       agent: publicOnlyAgent,
     });
@@ -67,6 +70,13 @@ export async function sendWebPush(
     // 404 / 410 mean the push service has dropped the subscription -
     // mirrors the FCM UNREGISTERED branch so the caller deletes the record.
     const unregistered = status === 404 || status === 410;
-    return { ok: false, status, unregistered, reason: failureReason(error) };
+    const retryAfterSeconds = parseRetryAfter((error as { headers?: Record<string, unknown> }).headers?.['retry-after']);
+    return {
+      ok: false,
+      status,
+      unregistered,
+      reason: failureReason(error),
+      ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
+    };
   }
 }

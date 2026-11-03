@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { failureReason, forwardTimeoutMs, type SendResult } from './forward-result.js';
+import { parseRetryAfter } from './forward-policy.js';
 import type { FcmSubscriptionRecord, ForwardPayload } from './types.js';
 
 interface ServiceAccount {
@@ -206,6 +207,7 @@ async function sendWithProject(
   const errStatus = fcmError?.status ?? '';
   const unregistered =
     res.status === 404 || errStatus === 'UNREGISTERED' || errStatus === 'NOT_FOUND';
+  const retryAfterSeconds = parseRetryAfter(res.headers.get('retry-after') ?? undefined);
 
   return {
     ok: res.ok,
@@ -216,6 +218,7 @@ async function sendWithProject(
     reason: res.ok
       ? undefined
       : failureReason(fcmError ? `${errStatus}: ${fcmError.message ?? ''}` : rawBody),
+    ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
     body: parsed,
   };
 }

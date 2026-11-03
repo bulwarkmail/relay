@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import http2 from 'node:http2';
 import path from 'node:path';
 import { failureReason, forwardTimeoutMs, type SendResult } from './forward-result.js';
+import { parseRetryAfter } from './forward-policy.js';
 import type { ApnsSubscriptionRecord, ForwardPayload } from './types.js';
 
 // Direct delivery to Apple Push Notification service for the iOS app.
@@ -173,10 +174,12 @@ export async function sendApnsPush(
     });
     let status = 0;
     let text = '';
+    let retryAfter: unknown;
     req.setEncoding('utf8');
     req.setTimeout(forwardTimeoutMs(), () => req.close(http2.constants.NGHTTP2_CANCEL));
     req.on('response', (headers) => {
       status = Number(headers[':status'] ?? 0);
+      retryAfter = headers['retry-after'];
     });
     req.on('data', (chunk: string) => {
       text += chunk;
@@ -187,7 +190,11 @@ export async function sendApnsPush(
         resolve({ ok: false, status: 0, unregistered: false, reason: 'no response from APNs' });
         return;
       }
-      resolve(classifyApnsResponse(status, text));
+      const retryAfterSeconds = parseRetryAfter(retryAfter);
+      resolve({
+        ...classifyApnsResponse(status, text),
+        ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
+      });
     });
     req.on('error', reject);
     req.end(body);
