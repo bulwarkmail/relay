@@ -57,6 +57,31 @@ describe('isPublicEndpointHost', () => {
     }
   });
 
+  it('refuses names another URL parser would read as an address', () => {
+    for (const url of [
+      'https://127.0.0.1;.example.com/x',
+      'https://127.0.0.1%3B.example.com/x',
+      'https://127.0.0.1,.example.com/x',
+      'https://10.0.0.1!.example.com/x',
+      "https://10.0.0.1'.example.com/x",
+      'https://foo_bar.example.com/x',
+    ]) {
+      assert.equal(isPublicEndpointUrl(url), false, url);
+    }
+  });
+
+  it('refuses IPv6 forms that carry a private IPv4 address', () => {
+    for (const url of [
+      'https://[::127.0.0.1]/x',
+      'https://[::7f00:1]/x',
+      'https://[2002:7f00:1::]/x',
+      'https://[2001:0:7f00:1::]/x',
+      'https://[::ffff:0:7f00:1]/x',
+    ]) {
+      assert.equal(isPublicEndpointUrl(url), false, url);
+    }
+  });
+
   it('lets an operator name private hosts', () => {
     process.env.PUSH_ALLOW_PRIVATE_ENDPOINTS = 'ntfy.lan, 10.0.0.5';
     try {

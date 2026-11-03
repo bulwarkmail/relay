@@ -32,8 +32,10 @@ for (const [network, prefix] of [
   blocked.addSubnet(network, prefix, 'ipv4');
 }
 for (const [network, prefix] of [
-  ['::', 128],
-  ['::1', 128],
+  ['::', 96], // IPv4-compatible, ::1 included
+  ['::ffff:0:0:0', 96], // SIIT
+  ['2002::', 16], // 6to4
+  ['2001::', 32], // Teredo
   ['64:ff9b::', 96],
   ['64:ff9b:1::', 48],
   ['100::', 64],
@@ -68,6 +70,9 @@ function isPublicHostname(hostname: string): boolean {
   if (net.isIP(host)) return isPublicAddress(host);
   // A name without a dot is a container or a machine on this network.
   if (!host.includes('.')) return false;
+  // What's in a DNS name, nothing more: other URL parsers read something like
+  // `127.0.0.1;.example.com` as the address in front.
+  if (!/^[a-z0-9.-]+$/.test(host)) return false;
   return !LOCAL_SUFFIXES.some((suffix) => host.endsWith(suffix));
 }
 
@@ -110,7 +115,13 @@ function publicLookup(hostname: string, options: LookupOptions, callback: Lookup
 }
 
 /** For every request to a caller-chosen endpoint. */
-export const publicOnlyAgent = new https.Agent({ keepAlive: true, lookup: publicLookup as never });
+export const publicOnlyAgent = new https.Agent({
+  keepAlive: true,
+  // Hosts are the caller's choice, so idle connections to them can't pile up.
+  maxFreeSockets: 16,
+  timeout: 30_000,
+  lookup: publicLookup as never,
+});
 
 // Enough for the push service's explanation of a failure.
 const MAX_ANSWER_BYTES = 4096;

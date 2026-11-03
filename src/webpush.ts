@@ -64,8 +64,9 @@ export async function sendWebPush(
       ...(delivery.topic ? { topic: delivery.topic } : {}),
     });
   } catch (error) {
-    if (isNotPublicError(error)) return endpointRefused();
-    return { ok: false, status: 0, unregistered: false, reason: failureReason(error) };
+    // Unlike a refused name, what a name resolves to changes: this is a temporary
+    // failure, so one bad DNS answer doesn't cost the device its record.
+    return { ok: false, status: 0, unregistered: false, reason: isNotPublicError(error) ? 'endpoint resolves to no public address' : failureReason(error) };
   }
 }
 
