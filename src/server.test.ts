@@ -10,6 +10,7 @@ import {
   newId,
   postJson,
   pushVerification,
+  rawRequest,
   serviceAccount,
   startFakeApns,
   startFakePushService,
@@ -365,6 +366,23 @@ describe('POST /api/push/jmap/:id', () => {
       assert.equal((await getJson(relay.base, `/api/push/verify/${id}`)).status, 404);
       assert.ok(!(id in storedRecords(relay.dataDir)));
     }
+  });
+});
+
+describe('malformed requests', () => {
+  it('survives a request target that is not a URL', async () => {
+    const answer = await rawRequest(relay.port, 'GET // HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
+    assert.match(answer, /^HTTP\/1\.1 400/);
+    assert.equal(relay.exited(), false);
+    assert.equal((await getJson(relay.base, '/api/health')).status, 200);
+  });
+
+  it('answers 400 to broken percent-encoding in an id', async () => {
+    for (const pathname of ['/api/push/verify/%E0%A4%A', '/api/push/active/%E0%A4%A', '/api/push/register/%E0%A4%A']) {
+      const method = pathname.includes('register') ? 'DELETE' : 'GET';
+      assert.equal((await getJson(relay.base, pathname, method)).status, 400);
+    }
+    assert.equal((await postJson(relay.base, '/api/push/jmap/%E0%A4%A', emailPush('a', ['e1']))).status, 400);
   });
 });
 

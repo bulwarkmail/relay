@@ -525,11 +525,35 @@ function normalizeRoute(method: string, path: string): string {
   return 'other';
 }
 
+function requestPath(target: string | undefined): string | null {
+  try {
+    return new URL(target ?? '/', 'http://localhost').pathname;
+  } catch {
+    return null;
+  }
+}
+
+// Broken percent-encoding comes back as a string no id validator accepts, so
+// the handler answers it like any other bad id.
+function decodeId(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return '';
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const started = Date.now();
   const method = req.method ?? 'GET';
-  const url = new URL(req.url ?? '/', 'http://localhost');
-  const path = url.pathname;
+  // A request target like `//` is no URL at all. Thrown from here it would take
+  // the whole process down, since this callback's promise has no handler.
+  const path = requestPath(req.url);
+  if (path === null) {
+    sendJson(res, 400, { error: 'Bad request target' });
+    httpRequestsTotal.inc({ method, route: 'other', status: '400' });
+    return;
+  }
   const route = normalizeRoute(method, path);
   const httpTimer = httpDurationSeconds.startTimer({ method, route });
 
@@ -604,22 +628,22 @@ const server = http.createServer(async (req, res) => {
 
     const registerIdMatch = path.match(/^\/api\/push\/register\/([^/]+)$/);
     if (method === 'DELETE' && registerIdMatch) {
-      return await handleUnregister(decodeURIComponent(registerIdMatch[1]), res);
+      return await handleUnregister(decodeId(registerIdMatch[1]), res);
     }
 
     const verifyMatch = path.match(/^\/api\/push\/verify\/([^/]+)$/);
     if (method === 'GET' && verifyMatch) {
-      return await handleVerifyPoll(decodeURIComponent(verifyMatch[1]), res);
+      return await handleVerifyPoll(decodeId(verifyMatch[1]), res);
     }
 
     const activeMatch = path.match(/^\/api\/push\/active\/([^/]+)$/);
     if (method === 'GET' && activeMatch) {
-      return await handleActivePoll(decodeURIComponent(activeMatch[1]), res);
+      return await handleActivePoll(decodeId(activeMatch[1]), res);
     }
 
     const jmapMatch = path.match(/^\/api\/push\/jmap\/([^/]+)$/);
     if (method === 'POST' && jmapMatch) {
-      return await handleJmap(req, decodeURIComponent(jmapMatch[1]), res);
+      return await handleJmap(req, decodeId(jmapMatch[1]), res);
     }
 
     return sendJson(res, 404, { error: 'Not found' });
