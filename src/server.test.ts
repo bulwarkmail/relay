@@ -824,6 +824,45 @@ describe('sending politely', () => {
   });
 });
 
+describe('what the logs hold', () => {
+  it('no subscription id, endpoint path, key, code or message property', async () => {
+    const own = await startRelay();
+    try {
+      const device = makeDevice();
+      const id = newId();
+      service.answer('/log-secret-path', { status: 500, body: 'failed at https://service.example/log-secret-echo' });
+      await postJson(own.base, '/api/push/register/web', {
+        subscriptionId: id,
+        subscription: { endpoint: service.url('/log-secret-path'), keys: device.keys },
+        accountLabel: 'log-secret-label@example.org',
+      });
+      await postJson(own.base, `/api/push/jmap/${id}`, pushVerification('log-secret-code'));
+      await getJson(own.base, `/api/push/verify/${id}`);
+      await getJson(own.base, `/api/push/active/${id}`);
+      await postJson(own.base, `/api/push/jmap/${id}`, {
+        '@type': 'EmailPush',
+        accountId: 'a',
+        emails: [{ id: 'log-secret-id', subject: 'log-secret-subject' }],
+      });
+      const gone = await registerWeb('/log-gone-path', own);
+      service.answer('/log-gone-path', { status: 410 });
+      await postJson(own.base, `/api/push/jmap/${gone.id}`, emailPush('a', ['e1']));
+      await getJson(own.base, `/api/push/register/${id}`, 'DELETE');
+      await getJson(own.base, `/api/push/verify/${newId()}abc`);
+      const logs = own.logs();
+      assert.match(logs, /relay: push not delivered/);
+      for (const secret of [id, gone.id, 'log-secret', 'log-gone-path', device.keys.p256dh, device.keys.auth]) {
+        assert.ok(!logs.includes(secret), `logs hold ${secret}`);
+      }
+      // Still traceable: an operator can tell requests for one subscription apart.
+      assert.match(logs, /"route":"\/api\/push\/jmap\/:id"/);
+      assert.match(logs, /"subscription":"[0-9a-f]{12}"/);
+    } finally {
+      await own.stop();
+    }
+  });
+});
+
 describe('anything else', () => {
   it('answers 404 on an unknown path and 204 to a preflight', async () => {
     assert.equal((await getJson(relay.base, '/nothing')).status, 404);

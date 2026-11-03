@@ -12,6 +12,7 @@ import {
   classifyForward,
   failureReason,
   isTemporaryFailure,
+  logRef,
   pushServiceHost,
   statusLabel,
   type ForwardOutcome,
@@ -453,7 +454,7 @@ async function handleJmap(
     const hold = forwardPolicy.hold(id, record);
     if (hold) {
       pushesHeld.inc({ reason: hold.reason, transport: record.kind });
-      logger.info('relay: push held back', { subscriptionId: id, transport: record.kind, ...hold });
+      logger.info('relay: push held back', { subscription: logRef(id), transport: record.kind, ...hold });
       res.setHeader('retry-after', String(hold.retryAfterSeconds));
       return sendJson(res, hold.reason === 'rate-limit' ? 429 : 503, { ok: false, held: hold.reason });
     }
@@ -519,7 +520,7 @@ function logForwardFailure(
   result: SendResult,
 ): void {
   const fields = {
-    subscriptionId: id,
+    subscription: logRef(id),
     transport: record.kind,
     host: pushServiceHost(record),
     outcome,
@@ -717,7 +718,7 @@ const server = http.createServer(async (req, res) => {
       res.once('finish', () => setTimeout(() => req.destroy(), OVERSIZE_GRACE_MS).unref());
       return sendJson(res, 413, { error: msg });
     }
-    logger.error('relay: handler failed', { method, path, error: msg });
+    logger.error('relay: handler failed', { method, route, error: msg });
     if (!res.headersSent) {
       return sendJson(res, 500, { error: 'Internal server error' });
     }
@@ -725,9 +726,11 @@ const server = http.createServer(async (req, res) => {
   } finally {
     httpTimer();
     httpRequestsTotal.inc({ method, route, status: String(res.statusCode) });
+    const id = path.split('/').at(-1) ?? '';
     logger.info('relay: request', {
       method,
-      path,
+      route,
+      ...(route.endsWith(':id') ? { subscription: logRef(decodeId(id)) } : {}),
       status: res.statusCode,
       ms: Date.now() - started,
     });

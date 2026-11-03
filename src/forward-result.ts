@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { SubscriptionRecord } from './types.js';
 
 export type ForwardOutcome = 'ok' | 'unregistered' | 'http-4xx' | 'http-5xx' | 'fail';
@@ -31,6 +32,12 @@ export function classifyForward(result: SendResult): ForwardOutcome {
   if (result.status >= 500) return 'http-5xx';
   if (result.status >= 400) return 'http-4xx';
   return 'fail';
+}
+
+// What the logs call a subscription: enough to follow one through them, nothing
+// to act with. The id itself is all it takes to replace or delete a record.
+export function logRef(id: string): string {
+  return createHash('sha256').update(id).digest('hex').slice(0, 12);
 }
 
 // Worth another try, because the service itself says so or never answered. A
@@ -78,7 +85,8 @@ export function failureReason(error: unknown): string | undefined {
       (error as { code?: unknown }).code;
     if (typeof code === 'string' && !text.includes(code)) text += ` (${code})`;
   }
-  text = text.replace(/\s+/g, ' ').trim();
+  // A service may quote the URL it was called on, which is the capability.
+  text = text.replace(/https?:\/\/\S+/gi, '<url>').replace(/\s+/g, ' ').trim();
   if (!text) return undefined;
   return text.length > MAX_REASON_CHARS ? `${text.slice(0, MAX_REASON_CHARS)}…` : text;
 }
