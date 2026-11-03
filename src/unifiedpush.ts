@@ -1,5 +1,7 @@
 import webpush from 'web-push';
-import { getVapidPublicKey } from './webpush.js';
+import https from 'node:https';
+import { isNotPublicError, isPublicEndpointUrl, publicOnlyAgent } from './endpoint-guard.js';
+import { endpointRefused, getVapidPublicKey } from './webpush.js';
 import { failureReason, forwardTimeoutMs, type SendResult } from './forward-result.js';
 import type { ForwardPayload, UnifiedPushSubscriptionRecord } from './types.js';
 
@@ -24,6 +26,7 @@ export async function sendUnifiedPush(
   record: UnifiedPushSubscriptionRecord,
   payload: ForwardPayload,
 ): Promise<SendResult> {
+  if (!isPublicEndpointUrl(record.endpoint)) return endpointRefused();
   const body = JSON.stringify(payload);
 
   if (record.keys) {
@@ -34,10 +37,11 @@ export async function sendUnifiedPush(
       const res = await webpush.sendNotification(
         { endpoint: record.endpoint, keys: record.keys },
         body,
-        { TTL: TTL_SECONDS, urgency: 'high', timeout: forwardTimeoutMs() },
+        { TTL: TTL_SECONDS, urgency: 'high', timeout: forwardTimeoutMs(), agent: publicOnlyAgent },
       );
       return { ok: true, status: res.statusCode, unregistered: false };
     } catch (error) {
+      if (isNotPublicError(error)) return endpointRefused();
       const status = (error as { statusCode?: number }).statusCode ?? 0;
       // 404 / 410 mean the distributor dropped the registration - mirrors the
       // FCM UNREGISTERED branch so the caller deletes the record.
@@ -51,26 +55,51 @@ export async function sendUnifiedPush(
   }
 
   try {
-    const res = await fetch(record.endpoint, {
-      method: 'POST',
-      headers: {
-        TTL: String(TTL_SECONDS),
-        Urgency: 'high',
-        'content-type': 'application/json',
-      },
-      body,
-      signal: AbortSignal.timeout(forwardTimeoutMs()),
-    });
-    // Always drain so the socket can be reused; the body only matters as the
-    // distributor's explanation of a failure.
-    const text = await res.text().catch(() => '');
+    const { status, text } = await postPlain(record.endpoint, body);
+    const ok = status >= 200 && status < 300;
     return {
-      ok: res.ok,
-      status: res.status,
-      unregistered: res.status === 404 || res.status === 410,
-      reason: res.ok ? undefined : failureReason(text),
+      ok,
+      status,
+      unregistered: status === 404 || status === 410,
+      reason: ok ? undefined : failureReason(text || `HTTP ${status}`),
     };
   } catch (error) {
+    if (isNotPublicError(error)) return endpointRefused();
     return { ok: false, status: 0, unregistered: false, reason: failureReason(error) };
   }
+}
+
+// Not fetch: it follows redirects, and a distributor could send the relay
+// anywhere with one. A redirect counts as a failure here.
+function postPlain(endpoint: string, body: string): Promise<{ status: number; text: string }> {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      endpoint,
+      {
+        method: 'POST',
+        agent: publicOnlyAgent,
+        timeout: forwardTimeoutMs(),
+        headers: {
+          TTL: String(TTL_SECONDS),
+          Urgency: 'high',
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        // Always drain so the socket can be reused; the body only matters as
+        // the distributor's explanation of a failure.
+        let text = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk: string) => {
+          if (text.length < 1024) text += chunk;
+        });
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, text }));
+        res.on('error', reject);
+      },
+    );
+    req.on('timeout', () => req.destroy(new Error('Socket timeout')));
+    req.on('error', reject);
+    req.end(body);
+  });
 }

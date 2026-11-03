@@ -121,7 +121,7 @@ describe('POST /api/push/register/web', () => {
     ['a short id', { subscriptionId: 'short', subscription: {} }],
     ['an id with slashes', { subscriptionId: 'aaaaaaaa/../bbbb', subscription: {} }],
     ['no keys', { subscriptionId: 'abcdefgh1', subscription: { endpoint: 'https://push.example.org/x' } }],
-    ['plain http', { subscriptionId: 'abcdefgh1', subscription: { endpoint: 'http://push.example.org/x', keys: { p256dh: 'x'.repeat(87), auth: 'y'.repeat(22) } } }],
+    ['plain http', { subscriptionId: 'abcdefgh1', subscription: { endpoint: 'http://push.example.org/x', keys: { p256dh: makeDevice().keys.p256dh, auth: makeDevice().keys.auth } } }],
     ['a non-string endpoint', { subscriptionId: 'abcdefgh1', subscription: { endpoint: 5, keys: {} } }],
   ] as const) {
     it(`answers 400 to ${name}`, async () => {
@@ -628,6 +628,79 @@ describe('a push service that never answers', () => {
     } finally {
       await own.stop();
       await apns.close();
+    }
+  });
+});
+
+describe('endpoints the relay must not call', () => {
+  const guarded = () => startRelay({ env: { PUSH_ALLOW_PRIVATE_ENDPOINTS: '' } });
+
+  it('refuses private, loopback and metadata addresses at registration', async () => {
+    const own = await guarded();
+    try {
+      for (const endpoint of [
+        service.url('/ssrf'),
+        'https://127.0.0.1/x',
+        'https://[::1]/x',
+        'https://169.254.169.254/latest/meta-data/',
+        'https://10.0.0.1/x',
+        'https://relay-test/x',
+        'https://user:pw@push.example.org/x',
+      ]) {
+        const web = await postJson(own.base, '/api/push/register/web', { subscriptionId: newId(), subscription: { endpoint, keys: makeDevice().keys } });
+        assert.equal(web.status, 400, `web ${endpoint}`);
+        const up = await postJson(own.base, '/api/push/register/unifiedpush', { subscriptionId: newId(), endpoint });
+        assert.equal(up.status, 400, `up ${endpoint}`);
+      }
+      assert.equal(service.to('/ssrf').length, 0);
+    } finally {
+      await own.stop();
+    }
+  });
+
+  it('never calls a stored record that points somewhere private, and removes it', async () => {
+    const web = newId();
+    const up = newId();
+    const plain = newId();
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-seed-'));
+    const base = { verificationCode: null, createdAt: Date.now(), lastPushAt: null };
+    fs.writeFileSync(path.join(dataDir, 'subscriptions.json'), JSON.stringify({
+      records: {
+        [web]: { ...base, kind: 'web', webPush: { endpoint: service.url('/ssrf-web'), keys: makeDevice().keys } },
+        [up]: { ...base, kind: 'up', endpoint: service.url('/ssrf-up'), keys: makeDevice().keys },
+        [plain]: { ...base, kind: 'up', endpoint: service.url('/ssrf-plain'), keys: null },
+      },
+    }));
+    const own = await startRelay({ dataDir, env: { PUSH_ALLOW_PRIVATE_ENDPOINTS: '' } });
+    try {
+      for (const id of [web, up, plain]) {
+        const res = await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
+        assert.equal(res.status, 200);
+        assert.deepEqual(res.body, { ok: false });
+        assert.equal((await getJson(own.base, `/api/push/verify/${id}`)).status, 404);
+      }
+      for (const pathname of ['/ssrf-web', '/ssrf-up', '/ssrf-plain']) assert.equal(service.to(pathname).length, 0, pathname);
+    } finally {
+      await own.stop();
+    }
+  });
+
+  it('does not follow a redirect from a legacy UnifiedPush distributor', async () => {
+    service.answer('/up-redirect', { status: 302, headers: { location: service.url('/redirected-inside') } });
+    const id = newId();
+    await postJson(relay.base, '/api/push/register/unifiedpush', { subscriptionId: id, endpoint: service.url('/up-redirect') });
+    const res = await postJson(relay.base, `/api/push/jmap/${id}`, stateChange({ a: { EmailDelivery: 's' } }));
+    assert.deepEqual(res.body, { ok: false });
+    assert.equal(service.to('/redirected-inside').length, 0);
+  });
+
+  it('refuses keys that cannot encrypt anything', async () => {
+    for (const keys of [
+      { p256dh: 'x'.repeat(87), auth: 'y'.repeat(22) },
+      { p256dh: makeDevice().keys.p256dh, auth: 'y'.repeat(40) },
+    ]) {
+      const web = await postJson(relay.base, '/api/push/register/web', { subscriptionId: newId(), subscription: { endpoint: service.url('/bad-keys'), keys } });
+      assert.equal(web.status, 400);
     }
   });
 });

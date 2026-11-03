@@ -1,5 +1,6 @@
 import webpush from 'web-push';
 import { logger } from './logger.js';
+import { isNotPublicError, isPublicEndpointUrl, publicOnlyAgent } from './endpoint-guard.js';
 import { failureReason, forwardTimeoutMs, type SendResult } from './forward-result.js';
 import type { ForwardPayload, WebSubscriptionRecord } from './types.js';
 
@@ -32,6 +33,12 @@ export function getVapidPublicKey(): string | null {
   return publicKey;
 }
 
+// A record from before these checks, or a host whose DNS changed. It will never
+// be called, so the caller removes it.
+export function endpointRefused(): SendResult {
+  return { ok: false, status: 0, unregistered: true, reason: 'endpoint is not a public address' };
+}
+
 export async function sendWebPush(
   record: WebSubscriptionRecord,
   payload: ForwardPayload,
@@ -44,14 +51,18 @@ export async function sendWebPush(
   // delivered messages. The service worker turns this into an enriched system
   // notification by JMAP-fetching the email itself - so the relay never sees
   // mail content.
+  if (!isPublicEndpointUrl(record.webPush.endpoint)) return endpointRefused();
+
   try {
     const res = await webpush.sendNotification(record.webPush, JSON.stringify(payload), {
       TTL: 60 * 60, // seconds — drop if the device is offline for an hour
       urgency: 'high',
       timeout: forwardTimeoutMs(),
+      agent: publicOnlyAgent,
     });
     return { ok: true, status: res.statusCode, unregistered: false };
   } catch (error) {
+    if (isNotPublicError(error)) return endpointRefused();
     const status = (error as { statusCode?: number }).statusCode ?? 0;
     // 404 / 410 mean the push service has dropped the subscription -
     // mirrors the FCM UNREGISTERED branch so the caller deletes the record.
