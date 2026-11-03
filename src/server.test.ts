@@ -547,6 +547,55 @@ describe('a push still in flight', () => {
   });
 });
 
+describe('a push service that never answers', () => {
+  it('gives up before the mail server does, for every transport', async () => {
+    const apns = await startFakeApns();
+    apns.hang(true);
+    const account = serviceAccount('hang-project', service.url('/oauth/hang-token'));
+    service.answer('/oauth/hang-token', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ access_token: 't', expires_in: 3600 }),
+    });
+    service.answer('/v1/projects/hang-project/messages:send', { hang: true });
+    service.answer('/hang-web', { hang: true });
+    service.answer('/hang-up-keys', { hang: true });
+    service.answer('/hang-up-plain', { hang: true });
+    const own = await startRelay({
+      env: {
+        PUSH_FORWARD_TIMEOUT_MS: '400',
+        APNS_KEY: apnsKeyPem(),
+        APNS_KEY_ID: 'KEYID12345',
+        APNS_TEAM_ID: 'TEAM123456',
+        APNS_ORIGIN: apns.origin,
+        FCM_ORIGIN: service.url('').replace(/\/$/, ''),
+        FCM_SERVICE_ACCOUNT_JSON: JSON.stringify(account),
+      },
+    });
+    try {
+      const registrations: [string, unknown][] = [
+        ['/api/push/register/web', { subscription: { endpoint: service.url('/hang-web'), keys: makeDevice().keys } }],
+        ['/api/push/register/unifiedpush', { endpoint: service.url('/hang-up-keys'), keys: makeDevice().keys }],
+        ['/api/push/register/unifiedpush', { endpoint: service.url('/hang-up-plain') }],
+        ['/api/push/register/apns', { deviceToken: 'ab'.repeat(32), environment: 'production' }],
+        ['/api/push/register', { fcmToken: 'f'.repeat(100) }],
+      ];
+      for (const [route, fields] of registrations) {
+        const id = newId();
+        assert.equal((await postJson(own.base, route, { subscriptionId: id, ...(fields as object) })).status, 200);
+        const started = Date.now();
+        const res = await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
+        assert.ok(Date.now() - started < 5000, `${route} took ${Date.now() - started} ms`);
+        assert.ok(res.status === 200 || res.status >= 500, `${route} answered ${res.status}`);
+        assert.equal((await getJson(own.base, `/api/push/verify/${id}`)).status, 200, 'a timeout keeps the record');
+      }
+    } finally {
+      await own.stop();
+      await apns.close();
+    }
+  });
+});
+
 describe('anything else', () => {
   it('answers 404 on an unknown path and 204 to a preflight', async () => {
     assert.equal((await getJson(relay.base, '/nothing')).status, 404);

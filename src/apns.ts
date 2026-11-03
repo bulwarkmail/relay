@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import http2 from 'node:http2';
 import path from 'node:path';
-import { failureReason, type SendResult } from './forward-result.js';
+import { failureReason, forwardTimeoutMs, type SendResult } from './forward-result.js';
 import type { ApnsSubscriptionRecord, ForwardPayload } from './types.js';
 
 // Direct delivery to Apple Push Notification service for the iOS app.
@@ -23,7 +23,6 @@ const HOSTS = {
 } as const;
 
 const JWT_LIFETIME_MS = 40 * 60 * 1000;
-const REQUEST_TIMEOUT_MS = 15_000;
 
 export interface ApnsConfig {
   keyPem: string;
@@ -175,7 +174,7 @@ export async function sendApnsPush(
     let status = 0;
     let text = '';
     req.setEncoding('utf8');
-    req.setTimeout(REQUEST_TIMEOUT_MS, () => req.close(http2.constants.NGHTTP2_CANCEL));
+    req.setTimeout(forwardTimeoutMs(), () => req.close(http2.constants.NGHTTP2_CANCEL));
     req.on('response', (headers) => {
       status = Number(headers[':status'] ?? 0);
     });

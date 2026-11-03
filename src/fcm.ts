@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { failureReason, type SendResult } from './forward-result.js';
+import { failureReason, forwardTimeoutMs, type SendResult } from './forward-result.js';
 import type { FcmSubscriptionRecord, ForwardPayload } from './types.js';
 
 interface ServiceAccount {
@@ -102,6 +102,7 @@ async function mintAccessToken(project: FcmProject): Promise<string> {
       grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
       assertion: jwt,
     }),
+    signal: AbortSignal.timeout(forwardTimeoutMs()),
   });
   if (!res.ok) {
     throw new Error(`FCM oauth2 token failed: ${res.status} ${await res.text()}`);
@@ -186,6 +187,7 @@ async function sendWithProject(
         'content-type': 'application/json',
       },
       body: JSON.stringify(message),
+      signal: AbortSignal.timeout(forwardTimeoutMs()),
     },
   );
 

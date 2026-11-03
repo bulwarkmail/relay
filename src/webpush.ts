@@ -1,6 +1,6 @@
 import webpush from 'web-push';
 import { logger } from './logger.js';
-import { failureReason, type SendResult } from './forward-result.js';
+import { failureReason, forwardTimeoutMs, type SendResult } from './forward-result.js';
 import type { ForwardPayload, WebSubscriptionRecord } from './types.js';
 
 let configured = false;
@@ -48,6 +48,7 @@ export async function sendWebPush(
     const res = await webpush.sendNotification(record.webPush, JSON.stringify(payload), {
       TTL: 60 * 60, // seconds — drop if the device is offline for an hour
       urgency: 'high',
+      timeout: forwardTimeoutMs(),
     });
     return { ok: true, status: res.statusCode, unregistered: false };
   } catch (error) {

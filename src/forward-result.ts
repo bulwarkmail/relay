@@ -15,6 +15,14 @@ export interface SendResult {
 
 const MAX_REASON_CHARS = 200;
 
+// How long one attempt at the push service may take. Stalwart's own request
+// times out after 10 s and it tries again then, so a slower answer here would
+// turn into the same push sent twice.
+export function forwardTimeoutMs(): number {
+  const configured = Number(process.env.PUSH_FORWARD_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : 8000;
+}
+
 export function classifyForward(result: SendResult): ForwardOutcome {
   if (result.unregistered) return 'unregistered';
   if (result.ok) return 'ok';

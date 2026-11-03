@@ -1,6 +1,6 @@
 import webpush from 'web-push';
 import { getVapidPublicKey } from './webpush.js';
-import { failureReason, type SendResult } from './forward-result.js';
+import { failureReason, forwardTimeoutMs, type SendResult } from './forward-result.js';
 import type { ForwardPayload, UnifiedPushSubscriptionRecord } from './types.js';
 
 // Drop the message if the device stays unreachable for an hour - matches the
@@ -34,7 +34,7 @@ export async function sendUnifiedPush(
       const res = await webpush.sendNotification(
         { endpoint: record.endpoint, keys: record.keys },
         body,
-        { TTL: TTL_SECONDS, urgency: 'high' },
+        { TTL: TTL_SECONDS, urgency: 'high', timeout: forwardTimeoutMs() },
       );
       return { ok: true, status: res.statusCode, unregistered: false };
     } catch (error) {
@@ -59,6 +59,7 @@ export async function sendUnifiedPush(
         'content-type': 'application/json',
       },
       body,
+      signal: AbortSignal.timeout(forwardTimeoutMs()),
     });
     // Always drain so the socket can be reused; the body only matters as the
     // distributor's explanation of a failure.
