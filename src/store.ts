@@ -76,6 +76,31 @@ class SubscriptionStore {
     }
   }
 
+  /**
+   * Changes a record, if it is still the one the caller read. A registration or
+   * a delete can come in while a push is on its way to the service; the caller's
+   * copy is out of date then and must not be written back.
+   */
+  async updateIfCurrent(
+    id: string,
+    expected: SubscriptionRecord,
+    change: (record: SubscriptionRecord) => void,
+  ): Promise<void> {
+    await this.ensureLoaded();
+    if (this.cache[id] !== expected) return;
+    change(expected);
+    await this.persist();
+  }
+
+  /** Deletes a record, if it is still the one the caller read. Says whether it did. */
+  async deleteIfCurrent(id: string, expected: SubscriptionRecord): Promise<boolean> {
+    await this.ensureLoaded();
+    if (this.cache[id] !== expected) return false;
+    delete this.cache[id];
+    await this.persist();
+    return true;
+  }
+
   async size(): Promise<number> {
     await this.ensureLoaded();
     return Object.keys(this.cache).length;

@@ -27,6 +27,14 @@ export interface PushRequest {
   at: number;
 }
 
+interface Answer {
+  status?: number;
+  headers?: Record<string, string>;
+  hang?: boolean;
+  body?: string;
+  delayMs?: number;
+}
+
 export interface FakePushService {
   port: number;
   url(pathname: string): string;
@@ -34,12 +42,12 @@ export interface FakePushService {
   /** Requests to one path. */
   to(pathname: string): PushRequest[];
   /** How a path answers from now on. Unlisted paths answer 201. */
-  answer(pathname: string, how: { status?: number; headers?: Record<string, string>; hang?: boolean; body?: string }): void;
+  answer(pathname: string, how: Answer): void;
   close(): Promise<void>;
 }
 
 export async function startFakePushService(): Promise<FakePushService> {
-  const answers = new Map<string, { status?: number; headers?: Record<string, string>; hang?: boolean; body?: string }>();
+  const answers = new Map<string, Answer>();
   const requests: PushRequest[] = [];
   const sockets = new Set<net.Socket>();
   const server = https.createServer(
@@ -52,8 +60,10 @@ export async function startFakePushService(): Promise<FakePushService> {
         requests.push({ path: pathname, method: req.method ?? '', headers: req.headers, body: Buffer.concat(chunks), at: Date.now() });
         const how = answers.get(pathname) ?? {};
         if (how.hang) return;
-        res.writeHead(how.status ?? 201, how.headers ?? {});
-        res.end(how.body ?? '');
+        setTimeout(() => {
+          res.writeHead(how.status ?? 201, how.headers ?? {});
+          res.end(how.body ?? '');
+        }, how.delayMs ?? 0);
       });
     },
   );

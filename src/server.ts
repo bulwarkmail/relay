@@ -414,8 +414,9 @@ async function handleJmap(
       return sendJson(res, 400, { error: 'Invalid verification code' });
     }
     pushesReceived.inc({ type: 'PushVerification' });
-    record.verificationCode = code;
-    await subscriptionStore.put(id, record);
+    await subscriptionStore.updateIfCurrent(id, record, (current) => {
+      current.verificationCode = code;
+    });
     return sendJson(res, 200, { ok: true });
   }
 
@@ -443,10 +444,8 @@ async function handleJmap(
       status: statusLabel(result.status),
     });
     if (outcome !== 'ok') logForwardFailure(id, record, outcome, result);
-    record.lastPushAt = Date.now();
-    await subscriptionStore.put(id, record);
     if (result.unregistered) {
-      await subscriptionStore.delete(id);
+      const removed = await subscriptionStore.deleteIfCurrent(id, record);
       const reason =
         record.kind === 'fcm'
           ? 'fcm-unregistered'
@@ -455,8 +454,12 @@ async function handleJmap(
             : record.kind === 'up'
               ? 'unifiedpush-gone'
               : 'webpush-gone';
-      subscriptionsUnregistered.inc({ reason, transport: record.kind });
+      if (removed) subscriptionsUnregistered.inc({ reason, transport: record.kind });
       await refreshActiveGauge();
+    } else {
+      await subscriptionStore.updateIfCurrent(id, record, (current) => {
+        current.lastPushAt = Date.now();
+      });
     }
     return sendJson(res, 200, { ok: result.ok });
   }

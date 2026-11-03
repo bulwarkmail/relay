@@ -419,6 +419,50 @@ describe('oversized bodies', () => {
   });
 });
 
+describe('a push still in flight', () => {
+  const recordOf = (id: string) => storedRecords(relay.dataDir)[id];
+
+  it('does not undo a registration that came in meanwhile', async () => {
+    const pathname = '/race-register';
+    service.answer(pathname, { status: 201, delayMs: 400 });
+    const { id, device } = await registerWeb(pathname);
+    const forward = postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await postJson(relay.base, '/api/push/register/web', {
+      subscriptionId: id,
+      subscription: { endpoint: service.url('/race-fresh'), keys: device.keys },
+    });
+    await forward;
+    assert.equal(recordOf(id).webPush.endpoint, service.url('/race-fresh'));
+  });
+
+  it('does not bring back a record deleted meanwhile', async () => {
+    const pathname = '/race-delete';
+    service.answer(pathname, { status: 201, delayMs: 400 });
+    const { id } = await registerWeb(pathname);
+    const forward = postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await getJson(relay.base, `/api/push/register/${id}`, 'DELETE');
+    await forward;
+    assert.equal(recordOf(id), undefined);
+    assert.equal((await getJson(relay.base, `/api/push/verify/${id}`)).status, 404);
+  });
+
+  it('does not delete a registration whose new endpoint is fine when the old one comes back gone', async () => {
+    const pathname = '/race-gone';
+    service.answer(pathname, { status: 410, delayMs: 400 });
+    const { id, device } = await registerWeb(pathname);
+    const forward = postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await postJson(relay.base, '/api/push/register/web', {
+      subscriptionId: id,
+      subscription: { endpoint: service.url('/race-gone-fresh'), keys: device.keys },
+    });
+    await forward;
+    assert.equal(recordOf(id)?.webPush.endpoint, service.url('/race-gone-fresh'));
+  });
+});
+
 describe('anything else', () => {
   it('answers 404 on an unknown path and 204 to a preflight', async () => {
     assert.equal((await getJson(relay.base, '/nothing')).status, 404);
