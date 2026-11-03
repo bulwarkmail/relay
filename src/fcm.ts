@@ -61,6 +61,11 @@ async function loadProjects(): Promise<FcmProject[]> {
   return cachedProjects;
 }
 
+/** Whether this relay has a Firebase project to send through. */
+export async function isFcmConfigured(): Promise<boolean> {
+  return loadProjects().then(() => true, () => false);
+}
+
 /** Test hook: forget loaded accounts, tokens and which project took which token. */
 export function resetFcmState(): void {
   cachedProjects = null;

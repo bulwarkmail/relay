@@ -2,7 +2,7 @@ import http from 'node:http';
 import { URL } from 'node:url';
 import { logger } from './logger.js';
 import { subscriptionStore } from './store.js';
-import { sendFcmPush } from './fcm.js';
+import { isFcmConfigured, sendFcmPush } from './fcm.js';
 import { getApnsConfig, sendApnsPush } from './apns.js';
 import { getVapidPublicKey, sendWebPush } from './webpush.js';
 import { sendUnifiedPush } from './unifiedpush.js';
@@ -170,6 +170,11 @@ async function handleRegister(
   req: http.IncomingMessage,
   res: http.ServerResponse,
 ): Promise<void> {
+  // Refused up front like the other transports: the app gets told now, instead
+  // of a record that looks fine and a 500 on every push.
+  if (!(await isFcmConfigured())) {
+    return sendJson(res, 503, { error: 'FCM not configured' });
+  }
   const body = (await readJson(req)) as
     | { subscriptionId?: unknown; fcmToken?: unknown; accountLabel?: unknown }
     | null

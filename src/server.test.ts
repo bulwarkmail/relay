@@ -183,10 +183,9 @@ describe('POST /api/push/register/unifiedpush', () => {
 });
 
 describe('POST /api/push/register (FCM)', () => {
-  it('answers 400 to bad input', async () => {
-    assert.equal((await postJson(relay.base, '/api/push/register', '{nope')).status, 400);
-    assert.equal((await postJson(relay.base, '/api/push/register', { subscriptionId: 'abcdefgh1', fcmToken: 'short' })).status, 400);
-    assert.equal((await postJson(relay.base, '/api/push/register', { subscriptionId: 'x', fcmToken: 'a'.repeat(100) })).status, 400);
+  it('answers 503 on a relay without Firebase credentials', async () => {
+    const res = await postJson(relay.base, '/api/push/register', { subscriptionId: newId(), fcmToken: 'a'.repeat(100) });
+    assert.equal(res.status, 503);
   });
 });
 
@@ -225,6 +224,12 @@ describe('APNs and FCM against fakes', () => {
   after(async () => {
     await native.stop();
     await apns.close();
+  });
+
+  it('answers 400 to bad FCM input', async () => {
+    assert.equal((await postJson(native.base, '/api/push/register', '{nope')).status, 400);
+    assert.equal((await postJson(native.base, '/api/push/register', { subscriptionId: 'abcdefgh1', fcmToken: 'short' })).status, 400);
+    assert.equal((await postJson(native.base, '/api/push/register', { subscriptionId: 'x', fcmToken: 'a'.repeat(100) })).status, 400);
   });
 
   it('sends APNs a content-blind alert with the ids', async () => {
