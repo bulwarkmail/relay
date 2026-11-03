@@ -304,6 +304,18 @@ describe('GET /api/push/verify/:id', () => {
   });
 });
 
+describe('PushVerification bodies', () => {
+  it('refuses a code that is not a short string, and keeps the good one', async () => {
+    const { id } = await registerWeb('/verify-junk');
+    await postJson(relay.base, `/api/push/jmap/${id}`, pushVerification('good'));
+    for (const verificationCode of [undefined, 5, { a: 1 }, '', 'x'.repeat(1024)]) {
+      const res = await postJson(relay.base, `/api/push/jmap/${id}`, { '@type': 'PushVerification', pushSubscriptionId: 'b', verificationCode });
+      assert.equal(res.status, 400);
+    }
+    assert.deepEqual((await getJson(relay.base, `/api/push/verify/${id}`)).body, { verificationCode: 'good' });
+  });
+});
+
 describe('GET /api/push/active/:id', () => {
   it('says active for a fresh record, 404 for an unknown id, 400 for a bad one', async () => {
     const { id } = await registerWeb('/active');

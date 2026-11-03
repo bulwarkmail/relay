@@ -52,6 +52,7 @@ const PORT = Number(process.env.PORT ?? 3003);
 const HOST = process.env.HOST ?? '0.0.0.0';
 const MAX_BODY_BYTES = 64 * 1024;
 const OVERSIZE_GRACE_MS = 2000;
+const MAX_VERIFICATION_CODE_CHARS = 512;
 const REPO_URL = 'https://github.com/bulwarkmail/relay';
 
 // How long after registration we still report a subscription as "active" even
@@ -407,8 +408,13 @@ async function handleJmap(
   }
 
   if (body['@type'] === 'PushVerification') {
+    // Stalwart sends 32 characters; this ends up on disk and in a client's poll.
+    const code: unknown = body.verificationCode;
+    if (typeof code !== 'string' || code.length === 0 || code.length > MAX_VERIFICATION_CODE_CHARS) {
+      return sendJson(res, 400, { error: 'Invalid verification code' });
+    }
     pushesReceived.inc({ type: 'PushVerification' });
-    record.verificationCode = body.verificationCode;
+    record.verificationCode = code;
     await subscriptionStore.put(id, record);
     return sendJson(res, 200, { ok: true });
   }
