@@ -423,7 +423,7 @@ async function handleJmap(
     return sendJson(res, 400, { error: 'Invalid subscriptionId' });
   }
 
-  const record = await subscriptionStore.get(id);
+  let record = await subscriptionStore.get(id);
   if (!record) {
     return sendJson(res, 404, { error: 'Unknown subscription' });
   }
@@ -431,6 +431,11 @@ async function handleJmap(
   const body = (await readJson(req)) as JmapPushBody | null | undefined;
   if (!body || typeof body !== 'object' || typeof body['@type'] !== 'string') {
     return sendJson(res, 400, { error: 'Invalid JMAP push body' });
+  }
+  // As it is now: a body can take its time, and a registration may have come in.
+  record = await subscriptionStore.get(id);
+  if (!record) {
+    return sendJson(res, 404, { error: 'Unknown subscription' });
   }
 
   if (body['@type'] === 'PushVerification') {

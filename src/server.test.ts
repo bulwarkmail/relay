@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
@@ -1078,6 +1079,28 @@ describe('how far a throttle reaches', () => {
       await forward;
       assert.equal((await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e2']))).status, 200);
       assert.equal(service.to('/reach-new').length, 1);
+    } finally {
+      await own.stop();
+    }
+  });
+});
+
+describe('a verification arriving during a registration', () => {
+  it('is kept', async () => {
+    const own = await startRelay();
+    try {
+      const { id, device } = await registerWeb('/slow-body', own);
+      // Headers now, body later, as a slow network would.
+      const body = JSON.stringify(pushVerification('slow-code'));
+      const socket = net.connect(own.port, '127.0.0.1');
+      await new Promise<void>((resolve) => socket.once('connect', () => resolve()));
+      socket.write(`POST /api/push/jmap/${id} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: ${body.length}\r\n\r\n`);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      await postJson(own.base, '/api/push/register/web', { subscriptionId: id, subscription: { endpoint: service.url('/slow-body'), keys: device.keys } });
+      socket.resume();
+      socket.write(body);
+      await new Promise((resolve) => socket.once('close', resolve));
+      assert.deepEqual((await getJson(own.base, `/api/push/verify/${id}`)).body, { verificationCode: 'slow-code' });
     } finally {
       await own.stop();
     }
