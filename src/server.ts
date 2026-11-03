@@ -588,6 +588,15 @@ function normalizeRoute(method: string, path: string): string {
   return 'other';
 }
 
+function allowedMethod(path: string): string | null {
+  if (['/api/health', '/metrics', '/api/push/vapid-public-key'].includes(path)) return 'GET';
+  if (['/api/push/register', '/api/push/register/web', '/api/push/register/unifiedpush', '/api/push/register/apns'].includes(path)) return 'POST';
+  if (/^\/api\/push\/register\/[^/]+$/.test(path)) return 'DELETE';
+  if (/^\/api\/push\/(verify|active)\/[^/]+$/.test(path)) return 'GET';
+  if (/^\/api\/push\/jmap\/[^/]+$/.test(path)) return 'POST';
+  return null;
+}
+
 function requestPath(target: string | undefined): string | null {
   try {
     return new URL(target ?? '/', 'http://localhost').pathname;
@@ -690,7 +699,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     const registerIdMatch = path.match(/^\/api\/push\/register\/([^/]+)$/);
-    if (method === 'DELETE' && registerIdMatch) {
+    // `/register/unifiedpush` would pass for an id here.
+    if (method === 'DELETE' && registerIdMatch && allowedMethod(path) === 'DELETE') {
       return await handleUnregister(decodeId(registerIdMatch[1]), res);
     }
 
@@ -709,6 +719,11 @@ const server = http.createServer(async (req, res) => {
       return await handleJmap(req, decodeId(jmapMatch[1]), res);
     }
 
+    const allowed = allowedMethod(path);
+    if (allowed) {
+      res.setHeader('allow', `${allowed}, OPTIONS`);
+      return sendJson(res, 405, { error: 'Method not allowed' });
+    }
     return sendJson(res, 404, { error: 'Not found' });
   } catch (error) {
     const msg = error instanceof Error ? error.message : 'Unknown error';

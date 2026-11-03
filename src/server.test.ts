@@ -863,6 +863,28 @@ describe('what the logs hold', () => {
   });
 });
 
+describe('wrong methods', () => {
+  it('answers 405 with Allow on a known path', async () => {
+    for (const [pathname, method, allow] of [
+      ['/api/push/register', 'GET', 'POST'],
+      ['/api/push/register/web', 'PUT', 'POST'],
+      ['/api/push/register/unifiedpush', 'DELETE', 'POST'],
+      ['/api/push/register/apns', 'GET', 'POST'],
+      ['/api/push/register/abcdefgh1', 'GET', 'DELETE'],
+      ['/api/push/verify/abcdefgh1', 'POST', 'GET'],
+      ['/api/push/active/abcdefgh1', 'DELETE', 'GET'],
+      ['/api/push/jmap/abcdefgh1', 'GET', 'POST'],
+      ['/api/push/vapid-public-key', 'POST', 'GET'],
+      ['/api/health', 'POST', 'GET'],
+      ['/metrics', 'POST', 'GET'],
+    ] as const) {
+      const res = await getJson(relay.base, pathname, method);
+      assert.equal(res.status, 405, `${method} ${pathname}`);
+      assert.equal(res.headers.get('allow'), `${allow}, OPTIONS`);
+    }
+  });
+});
+
 describe('anything else', () => {
   it('answers 404 on an unknown path and 204 to a preflight', async () => {
     assert.equal((await getJson(relay.base, '/nothing')).status, 404);
