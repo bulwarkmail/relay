@@ -5,7 +5,7 @@ import { afterEach, describe, it, mock } from 'node:test';
 import { publicOnlyAgent } from './endpoint-guard.js';
 import { sendUnifiedPush } from './unifiedpush.js';
 import { sendWebPush } from './webpush.js';
-import { makeDevice } from './test-support/harness.js';
+import { makeDevice, testVapid } from './test-support/harness.js';
 import type { ForwardPayload, UnifiedPushSubscriptionRecord, WebSubscriptionRecord } from './types.js';
 
 // The name passes the check; what it resolves to doesn't. Nothing here leaves the machine.
@@ -35,8 +35,8 @@ describe('a public name that resolves to something private', () => {
 
   it('keeps the record: DNS may be wrong for a moment, and the mail server tries again', async () => {
     resolvesTo('0.0.0.0', 4);
-    process.env.VAPID_PUBLIC_KEY = 'BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjBJuBkr3qBUYIHBQFLXYp5Nksh8U';
-    process.env.VAPID_PRIVATE_KEY = 'UUxI4O8-FbRouAevSmBQ6o18hgE4nSG3qwvJTfKc-ls';
+    process.env.VAPID_PUBLIC_KEY = testVapid().VAPID_PUBLIC_KEY;
+    process.env.VAPID_PRIVATE_KEY = testVapid().VAPID_PRIVATE_KEY;
     const device = makeDevice();
     const web: WebSubscriptionRecord = { ...base, kind: 'web', webPush: { endpoint: 'https://rebind.example.org/w', keys: device.keys } };
     const up: UnifiedPushSubscriptionRecord = { ...base, kind: 'up', endpoint: 'https://rebind.example.org/u', keys: null };
