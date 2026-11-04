@@ -84,8 +84,8 @@ const LANDING_HTML = `<!doctype html>
 </head>
 <body>
 <h1>Bulwark Push Relay</h1>
-<p>When your mail server has something new, this pings your phone. That's the whole job.</p>
-<p>It doesn't see the mail. Not the subject, not the sender, not a byte of the body. Just a ping and a push token.</p>
+<p>When your mail server has something new, this pings your phone.</p>
+<p>It doesn't see the mail, not even the subject or the sender. All it gets is a push token and the ping.</p>
 <p>Source: <a href="${REPO_URL}">${REPO_URL}</a></p>
 </body>
 </html>
