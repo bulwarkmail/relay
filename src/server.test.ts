@@ -44,6 +44,12 @@ function storedRecords(dataDir: string): Record<string, any> {
   return JSON.parse(fs.readFileSync(path.join(dataDir, 'subscriptions.json'), 'utf8')).records;
 }
 
+const METRICS_TOKEN = 'scrape-secret-0123456789';
+
+function scrape(target: RunningRelay): Promise<Response> {
+  return fetch(`${target.base}/metrics`, { headers: { authorization: `Bearer ${METRICS_TOKEN}` } });
+}
+
 async function registerWeb(pathname: string, target: RunningRelay = relay, label = 'alice@example.org') {
   const id = newId();
   const device = makeDevice();
@@ -66,15 +72,46 @@ describe('GET /api/health and /metrics', () => {
     assert.equal(res.body.subscriptions, before + 1);
   });
 
-  it('serves Prometheus metrics with no subscription id or endpoint in them', async () => {
-    const { id } = await registerWeb('/metrics-secret-path');
-    await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
-    const res = await fetch(`${relay.base}/metrics`);
-    const text = await res.text();
-    assert.equal(res.status, 200);
-    assert.match(text, /relay_pushes_forwarded_total\{[^}]*transport="web"/);
-    assert.ok(!text.includes(id));
-    assert.ok(!text.includes('metrics-secret-path'));
+  it('has no /metrics without a token', async () => {
+    for (const method of ['GET', 'POST']) {
+      const res = await fetch(`${relay.base}/metrics`, { method });
+      assert.equal(res.status, 404, method);
+      assert.ok(!(await res.text()).includes('relay_'), method);
+    }
+  });
+
+  it('serves Prometheus metrics to the token only, with no subscription id or endpoint in them', async () => {
+    const own = await startRelay({ env: { METRICS_TOKEN: METRICS_TOKEN } });
+    try {
+      const { id } = await registerWeb('/metrics-secret-path', own);
+      await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
+      for (const headers of [{}, { authorization: 'Bearer wrong' }, { authorization: `Bearer ${METRICS_TOKEN}x` }, { authorization: METRICS_TOKEN }]) {
+        const denied = await fetch(`${own.base}/metrics`, { headers });
+        assert.equal(denied.status, 401, JSON.stringify(headers));
+        assert.equal(denied.headers.get('www-authenticate'), 'Bearer realm="metrics"');
+        assert.ok(!(await denied.text()).includes('relay_'));
+      }
+      const res = await scrape(own);
+      const text = await res.text();
+      assert.equal(res.status, 200);
+      assert.match(text, /relay_pushes_forwarded_total\{[^}]*transport="web"/);
+      assert.ok(!text.includes(id));
+      assert.ok(!text.includes('metrics-secret-path'));
+    } finally {
+      await own.stop();
+    }
+  });
+
+  it('reads the token from METRICS_TOKEN_FILE', async () => {
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-token-')), 'token');
+    fs.writeFileSync(file, `${METRICS_TOKEN}\n`);
+    const own = await startRelay({ env: { METRICS_TOKEN_FILE: file } });
+    try {
+      assert.equal((await fetch(`${own.base}/metrics`)).status, 401);
+      assert.equal((await scrape(own)).status, 200);
+    } finally {
+      await own.stop();
+    }
   });
 });
 
@@ -821,7 +858,7 @@ describe('sending politely', () => {
   });
 
   it('stops calling a service that throttles many subscriptions at once', async () => {
-    const own = await startRelay({ env: { PUSH_HOST_THROTTLE_LIMIT: '3' } });
+    const own = await startRelay({ env: { PUSH_HOST_THROTTLE_LIMIT: '3', METRICS_TOKEN } });
     try {
       for (let i = 0; i < 3; i++) {
         const pathname = `/polite-host-${i}`;
@@ -833,7 +870,7 @@ describe('sending politely', () => {
       const res = await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e2']));
       assert.equal(res.status, 503);
       assert.equal(service.to('/polite-host-healthy').length, 0);
-      const metrics = await (await fetch(`${own.base}/metrics`)).text();
+      const metrics = await (await scrape(own)).text();
       assert.match(metrics, /relay_pushes_held_total\{reason="push-service-throttle",transport="web"\} 1/);
     } finally {
       await own.stop();
@@ -893,7 +930,6 @@ describe('wrong methods', () => {
       ['/api/push/jmap/abcdefgh1', 'GET', 'POST'],
       ['/api/push/vapid-public-key', 'POST', 'GET'],
       ['/api/health', 'POST', 'GET'],
-      ['/metrics', 'POST', 'GET'],
     ] as const) {
       const res = await getJson(relay.base, pathname, method);
       assert.equal(res.status, 405, `${method} ${pathname}`);
@@ -904,7 +940,7 @@ describe('wrong methods', () => {
 
 describe('ids that are names of object internals', () => {
   it('answers like any other unknown id and keeps running', async () => {
-    const own = await startRelay();
+    const own = await startRelay({ env: { METRICS_TOKEN } });
     try {
       for (const id of ['__proto__', 'constructor', 'prototype', 'hasOwnProperty', 'toString']) {
         const verification = await postJson(own.base, `/api/push/jmap/${id}`, pushVerification('x'));
@@ -920,7 +956,7 @@ describe('ids that are names of object internals', () => {
       }
       assert.equal(own.exited(), false);
       assert.equal((await getJson(own.base, '/api/health')).status, 200);
-      assert.equal((await fetch(`${own.base}/metrics`)).status, 200);
+      assert.equal((await scrape(own)).status, 200);
     } finally {
       await own.stop();
     }
@@ -929,11 +965,11 @@ describe('ids that are names of object internals', () => {
   it('keeps a record with such a name from an old store out of the object prototype', async () => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-seed-'));
     fs.writeFileSync(path.join(dataDir, 'subscriptions.json'), '{"records":{"__proto__":{"kind":"fcm","fcmToken":"x","verificationCode":"polluted","createdAt":1,"lastPushAt":null}}}');
-    const own = await startRelay({ dataDir });
+    const own = await startRelay({ dataDir, env: { METRICS_TOKEN } });
     try {
       assert.equal((await getJson(own.base, '/api/health')).status, 200);
       assert.equal((await getJson(own.base, `/api/push/verify/${newId()}`)).status, 404);
-      assert.equal((await fetch(`${own.base}/metrics`)).status, 200);
+      assert.equal((await scrape(own)).status, 200);
     } finally {
       await own.stop();
     }

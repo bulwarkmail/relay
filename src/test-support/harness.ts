@@ -195,6 +195,9 @@ export async function startRelay(options: { env?: Record<string, string>; dataDi
         NODE_EXTRA_CA_CERTS: CERT_FILE,
         // The fake push service lives on localhost.
         PUSH_ALLOW_PRIVATE_ENDPOINTS: 'localhost',
+        // Metrics stay off unless a test turns them on.
+        METRICS_TOKEN: '',
+        METRICS_TOKEN_FILE: '',
         ...vapid,
         ...options.env,
       },

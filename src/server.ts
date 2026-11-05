@@ -38,6 +38,8 @@ import type {
 } from './types.js';
 import {
   registry,
+  metricsAuthorized,
+  metricsToken,
   httpRequestsTotal,
   httpDurationSeconds,
   subscriptionsRegistered,
@@ -602,7 +604,9 @@ function normalizeRoute(method: string, path: string): string {
 }
 
 function allowedMethod(path: string): string | null {
-  if (['/api/health', '/metrics', '/api/push/vapid-public-key'].includes(path)) return 'GET';
+  // With metrics off, /metrics answers 404 to every method, like any unknown path.
+  if (path === '/metrics') return metricsToken() ? 'GET' : null;
+  if (['/api/health', '/api/push/vapid-public-key'].includes(path)) return 'GET';
   if (['/api/push/register', '/api/push/register/web', '/api/push/register/unifiedpush', '/api/push/register/apns'].includes(path)) return 'POST';
   if (/^\/api\/push\/register\/[^/]+$/.test(path)) return 'DELETE';
   if (/^\/api\/push\/(verify|active)\/[^/]+$/.test(path)) return 'GET';
@@ -664,6 +668,12 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
   try {
     if (method === 'GET' && path === '/metrics') {
+      const token = metricsToken();
+      if (!token) return sendJson(res, 404, { error: 'Not found' });
+      if (!metricsAuthorized(req.headers.authorization, token)) {
+        res.setHeader('www-authenticate', 'Bearer realm="metrics"');
+        return sendJson(res, 401, { error: 'Unauthorized' });
+      }
       await refreshActiveGauge();
       const body = await registry.metrics();
       res.writeHead(200, {

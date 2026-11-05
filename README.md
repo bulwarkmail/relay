@@ -35,7 +35,7 @@ label a client registered with, and timing.
 | `POST` | `/api/push/jmap/:id` | JMAP server posts `PushVerification`, `StateChange` or `EmailPush` (draft-ietf-jmap-emailpush) here, and the relay dispatches to the transport of the stored record. For `EmailPush` only the message ids are forwarded, never any other property the server included |
 | `GET` | `/api/push/vapid-public-key` | Returns the relay's VAPID public key so browsers can subscribe |
 | `GET` | `/api/health` | Liveness probe |
-| `GET` | `/metrics` | Prometheus metrics. Keep it off the public side of your proxy |
+| `GET` | `/metrics` | Prometheus metrics, off by default. With `METRICS_TOKEN` set it wants `Authorization: Bearer <token>` and answers `401` without it; unset, it answers `404` |
 
 Every register route answers `503` when the relay has no credentials for that
 transport (except UnifiedPush, which needs none), `400` to a body it can't use,
@@ -150,6 +150,8 @@ docker compose up -d
 | `PUSH_SUBSCRIPTION_BURST` | `10` | Pushes one Web Push or UnifiedPush subscription may get at once |
 | `PUSH_SUBSCRIPTION_REFILL_MS` | `20000` | Time until one more is allowed |
 | `PUSH_HOST_THROTTLE_LIMIT` | `20` | Devices getting a `429` from one host within a minute before the whole host is left alone |
+| `METRICS_TOKEN` | unset | Turns on `/metrics`. Prometheus sends it as a bearer token (`authorization: { credentials: <token> }` in the scrape config) |
+| `METRICS_TOKEN_FILE` | unset | Path to a file holding the token instead, read on every scrape |
 | `FCM_ORIGIN`, `APNS_ORIGIN` | the real services | Point every push at another server, for tests |
 
 ## License

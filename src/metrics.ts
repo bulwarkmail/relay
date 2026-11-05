@@ -5,6 +5,31 @@ import {
   Histogram,
   collectDefaultMetrics,
 } from 'prom-client';
+import { timingSafeEqual } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+
+// /metrics is off unless METRICS_TOKEN (or METRICS_TOKEN_FILE) is set, and
+// then wants `Authorization: Bearer <token>`. Read on every scrape, so a new
+// token in the file works without a restart.
+export function metricsToken(): string | null {
+  const direct = process.env.METRICS_TOKEN?.trim();
+  if (direct) return direct;
+  const file = process.env.METRICS_TOKEN_FILE?.trim();
+  if (!file) return null;
+  try {
+    return readFileSync(file, 'utf8').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+export function metricsAuthorized(authorization: string | undefined, token: string): boolean {
+  const header = authorization ?? '';
+  if (!header.startsWith('Bearer ')) return false;
+  const given = Buffer.from(header.slice('Bearer '.length).trim());
+  const expected = Buffer.from(token);
+  return given.length === expected.length && timingSafeEqual(given, expected);
+}
 
 export const registry = new Registry();
 collectDefaultMetrics({ register: registry, prefix: 'relay_' });
