@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# The jobs build and run the checked-out code; a compromised step must not
+# hold a token that can write to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Typecheck and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          # Same as the Dockerfile.
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Run tests
+        run: npm test
+
+  docker:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build
+        run: docker build -t bulwark-relay:ci .
+
+      - name: Image starts and answers /api/health
+        run: |
+          docker run -d --name relay -p 3003:3003 bulwark-relay:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3003/api/health; then
+              echo
+              code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3003/metrics)
+              test "$code" = 404 || { echo "/metrics answered $code without METRICS_TOKEN"; exit 1; }
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs relay
+          exit 1
