@@ -60,6 +60,9 @@ const PORT = Number(process.env.PORT ?? 3003);
 const HOST = process.env.HOST ?? '0.0.0.0';
 const MAX_BODY_BYTES = 64 * 1024;
 const OVERSIZE_GRACE_MS = 2000;
+// A push within this long of the last one doesn't move lastPushAt: nothing that
+// reads it (/active, the expiry) cares about a minute.
+const LAST_PUSH_RESOLUTION_MS = 60 * 1000;
 const REPO_URL = 'https://github.com/bulwarkmail/relay';
 
 // How long after registration we still report a subscription as "active" even
@@ -214,7 +217,6 @@ async function handleRegister(
   };
   await subscriptionStore.put(subscriptionId, record);
   subscriptionsRegistered.inc({ transport: 'fcm' });
-  await refreshActiveGauge();
   return sendJson(res, 200, { ok: true });
 }
 
@@ -261,7 +263,6 @@ async function handleRegisterApns(
   };
   await subscriptionStore.put(subscriptionId, record);
   subscriptionsRegistered.inc({ transport: 'apns' });
-  await refreshActiveGauge();
   return sendJson(res, 200, { ok: true });
 }
 
@@ -309,7 +310,6 @@ async function handleRegisterWeb(
   };
   await subscriptionStore.put(subscriptionId, record);
   subscriptionsRegistered.inc({ transport: 'web' });
-  await refreshActiveGauge();
   return sendJson(res, 200, { ok: true });
 }
 
@@ -361,7 +361,6 @@ async function handleRegisterUnifiedPush(
   };
   await subscriptionStore.put(subscriptionId, record);
   subscriptionsRegistered.inc({ transport: 'up' });
-  await refreshActiveGauge();
   return sendJson(res, 200, { ok: true });
 }
 
@@ -381,7 +380,6 @@ async function handleUnregister(
     reason: 'client',
     transport: existing?.kind ?? 'unknown',
   });
-  await refreshActiveGauge();
   return sendJson(res, 200, { ok: true });
 }
 
@@ -462,9 +460,12 @@ async function handleJmap(
       return sendJson(res, 400, { error: 'Invalid verification code' });
     }
     pushesReceived.inc({ type: 'PushVerification' });
-    await subscriptionStore.updateIfCurrent(id, record, (current) => {
-      current.verificationCode = code;
-    });
+    // The same code again changes nothing, so nothing is written.
+    if (record.verificationCode !== code) {
+      await subscriptionStore.updateIfCurrent(id, record, (current) => {
+        current.verificationCode = code;
+      });
+    }
     return sendJson(res, 200, { ok: true });
   }
 
@@ -525,8 +526,7 @@ async function handleJmap(
         subscriptionsUnregistered.inc({ reason, transport: record.kind });
         forwardPolicy.remove(id);
       }
-      await refreshActiveGauge();
-    } else if (result.ok) {
+    } else if (result.ok && Date.now() - (record.lastPushAt ?? 0) >= LAST_PUSH_RESOLUTION_MS) {
       // Only what really went out: /active and the 90 days go by this.
       await subscriptionStore.updateIfCurrent(id, record, (current) => {
         current.lastPushAt = Date.now();
@@ -591,9 +591,8 @@ async function dispatch(
   return result;
 }
 
-// Refresh the active-subscriptions gauge by counting per-transport. Called
-// after every register/unregister and on every /metrics scrape so the gauge
-// stays consistent with the on-disk state.
+// Refresh the active-subscriptions gauge by counting per-transport, on every
+// /metrics scrape: the count walks every record, which no other request does.
 async function refreshActiveGauge(): Promise<void> {
   const counts = await subscriptionStore.sizeByKind();
   subscriptionsActive.set({ transport: 'fcm' }, counts.fcm);
@@ -812,9 +811,13 @@ subscriptionStore.load().then(
   },
 );
 
+// The journal goes into the snapshot on the way out, so the next start, or an
+// older relay that only reads subscriptions.json, finds every record there.
 const shutdown = (signal: string) => {
   logger.info('relay: shutting down', { signal });
-  server.close(() => process.exit(0));
+  server.close(() => {
+    subscriptionStore.close().finally(() => process.exit(0));
+  });
   setTimeout(() => process.exit(1), 5000).unref();
 };
 process.on('SIGTERM', () => shutdown('SIGTERM'));

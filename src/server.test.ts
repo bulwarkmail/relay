@@ -7,6 +7,7 @@ import { after, before, describe, it } from 'node:test';
 import { hostThrottleKey } from './forward-policy.js';
 import {
   apnsKeyPem,
+  blockStoreWrites,
   emailPush,
   floodSent,
   getJson,
@@ -15,11 +16,13 @@ import {
   postJson,
   pushVerification,
   rawRequest,
+  seedStore,
   serviceAccount,
   startFakeApns,
   startFakePushService,
   startRelay,
   stateChange,
+  storedRecords,
   testVapid,
   type FakeApns,
   type FakePushService,
@@ -39,10 +42,6 @@ after(async () => {
   await relay.stop();
   await service.close();
 });
-
-function storedRecords(dataDir: string): Record<string, any> {
-  return JSON.parse(fs.readFileSync(path.join(dataDir, 'subscriptions.json'), 'utf8')).records;
-}
 
 const METRICS_TOKEN = 'scrape-secret-0123456789';
 
@@ -374,11 +373,7 @@ describe('GET /api/push/active/:id', () => {
 describe('a quiet subscription', () => {
   const DAY = 24 * 60 * 60 * 1000;
 
-  function seed(records: Record<string, unknown>): string {
-    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-seed-'));
-    fs.writeFileSync(path.join(dataDir, 'subscriptions.json'), JSON.stringify({ records }));
-    return dataDir;
-  }
+  const seed = (records: Record<string, unknown>) => seedStore(records);
 
   function webRecord(fields: Record<string, unknown>) {
     return {
@@ -707,15 +702,12 @@ describe('endpoints the relay must not call', () => {
     const web = newId();
     const up = newId();
     const plain = newId();
-    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-seed-'));
     const base = { verificationCode: null, createdAt: Date.now(), lastPushAt: null };
-    fs.writeFileSync(path.join(dataDir, 'subscriptions.json'), JSON.stringify({
-      records: {
-        [web]: { ...base, kind: 'web', webPush: { endpoint: service.url('/ssrf-web'), keys: makeDevice().keys } },
-        [up]: { ...base, kind: 'up', endpoint: service.url('/ssrf-up'), keys: makeDevice().keys },
-        [plain]: { ...base, kind: 'up', endpoint: service.url('/ssrf-plain'), keys: null },
-      },
-    }));
+    const dataDir = seedStore({
+      [web]: { ...base, kind: 'web', webPush: { endpoint: service.url('/ssrf-web'), keys: makeDevice().keys } },
+      [up]: { ...base, kind: 'up', endpoint: service.url('/ssrf-up'), keys: makeDevice().keys },
+      [plain]: { ...base, kind: 'up', endpoint: service.url('/ssrf-plain'), keys: null },
+    });
     const own = await startRelay({ dataDir, env: { PUSH_ALLOW_PRIVATE_ENDPOINTS: '' } });
     try {
       for (const id of [web, up, plain]) {
@@ -963,8 +955,7 @@ describe('ids that are names of object internals', () => {
   });
 
   it('keeps a record with such a name from an old store out of the object prototype', async () => {
-    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-seed-'));
-    fs.writeFileSync(path.join(dataDir, 'subscriptions.json'), '{"records":{"__proto__":{"kind":"fcm","fcmToken":"x","verificationCode":"polluted","createdAt":1,"lastPushAt":null}}}');
+    const dataDir = seedStore('{"records":{"__proto__":{"kind":"fcm","fcmToken":"x","verificationCode":"polluted","createdAt":1,"lastPushAt":null}}}');
     const own = await startRelay({ dataDir, env: { METRICS_TOKEN } });
     try {
       assert.equal((await getJson(own.base, '/api/health')).status, 200);
@@ -1160,10 +1151,9 @@ describe('a verification arriving during a registration', () => {
 describe('after a forward', () => {
   it('only a push that went out counts for liveness', async () => {
     const id = newId();
-    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-seed-'));
-    fs.writeFileSync(path.join(dataDir, 'subscriptions.json'), JSON.stringify({
-      records: { [id]: { kind: 'web', webPush: { endpoint: service.url('/counted'), keys: makeDevice().keys }, verificationCode: null, createdAt: Date.now() - 3600_000, lastPushAt: null } },
-    }));
+    const dataDir = seedStore({
+      [id]: { kind: 'web', webPush: { endpoint: service.url('/counted'), keys: makeDevice().keys }, verificationCode: null, createdAt: Date.now() - 3600_000, lastPushAt: null },
+    });
     const own = await startRelay({ dataDir });
     try {
       service.answer('/counted', { status: 403 });
@@ -1182,7 +1172,7 @@ describe('after a forward', () => {
     try {
       const { id } = await registerWeb('/disk-full', own);
       // Nothing can be written from here on.
-      fs.mkdirSync(path.join(own.dataDir, 'subscriptions.json.tmp'));
+      blockStoreWrites(own.dataDir);
       const res = await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
       assert.equal(res.status, 200);
       assert.deepEqual(res.body, { ok: true });
@@ -1214,25 +1204,37 @@ describe('anything else', () => {
 });
 
 describe('the store on disk', () => {
+  // The snapshot; changes since go to a journal next to it.
   const FILE = 'subscriptions.json';
 
+  // Registers, then stops and starts again over the same directory: by then the
+  // relay has written a snapshot of everything, on its way out or, where a stop
+  // kills the process (Windows), at the next start. Exactly one either way.
+  async function snapshotAfter(dataDir: string | undefined, register: (own: RunningRelay) => Promise<void>): Promise<string> {
+    const own = await startRelay(dataDir ? { dataDir } : {});
+    await register(own);
+    const again = await own.restart();
+    await again.stop();
+    return own.dataDir;
+  }
+
   it('keeps a corrupt file aside and comes back from the previous version', async () => {
-    const own = await startRelay();
-    const { id: first } = await registerWeb('/store-1', own);
-    const { id: second } = await registerWeb('/store-2', own);
-    await own.stop();
-    const file = path.join(own.dataDir, FILE);
+    let first = '';
+    let second = '';
+    const dataDir = await snapshotAfter(undefined, async (own) => { first = (await registerWeb('/store-1', own)).id; });
+    await snapshotAfter(dataDir, async (own) => { second = (await registerWeb('/store-2', own)).id; });
+    const file = path.join(dataDir, FILE);
     const intact = fs.readFileSync(file);
     assert.ok(fs.existsSync(`${file}.bak`), 'a previous version is kept');
     fs.writeFileSync(file, intact.subarray(0, intact.length - 20));
-    const again = await startRelay({ dataDir: own.dataDir });
+    const again = await startRelay({ dataDir });
     try {
       assert.equal((await getJson(again.base, `/api/push/verify/${first}`)).status, 200);
-      const aside = fs.readdirSync(own.dataDir).filter((name) => name.includes('corrupt'));
+      const aside = fs.readdirSync(dataDir).filter((name) => name.includes('corrupt'));
       assert.equal(aside.length, 1);
-      assert.equal(fs.readFileSync(path.join(own.dataDir, aside[0])).length, intact.length - 20);
+      assert.equal(fs.readFileSync(path.join(dataDir, aside[0])).length, intact.length - 20);
       assert.match(again.logs(), /"level":"error".*subscriptions/);
-      // The newest write was only in the broken file; everything else is back.
+      // The newest snapshot was the broken file; everything else is back.
       assert.equal((await getJson(again.base, `/api/push/verify/${second}`)).status, 404);
     } finally {
       await again.stop();
@@ -1240,32 +1242,34 @@ describe('the store on disk', () => {
   });
 
   it('never replaces a corrupt file when there is nothing to come back from', async () => {
-    const own = await startRelay();
-    const { id } = await registerWeb('/store-3', own);
-    await own.stop();
-    const file = path.join(own.dataDir, FILE);
+    let id = '';
+    const dataDir = await snapshotAfter(undefined, async (own) => { id = (await registerWeb('/store-3', own)).id; });
+    const file = path.join(dataDir, FILE);
     fs.rmSync(`${file}.bak`, { force: true });
     fs.writeFileSync(file, '{"records":{"oops');
-    const again = await startRelay({ dataDir: own.dataDir });
+    const again = await startRelay({ dataDir });
     try {
       assert.equal((await getJson(again.base, `/api/push/verify/${id}`)).status, 404);
       await registerWeb('/store-4', again);
-      const aside = fs.readdirSync(own.dataDir).filter((name) => name.includes('corrupt'));
-      assert.equal(fs.readFileSync(path.join(own.dataDir, aside[0]), 'utf8'), '{"records":{"oops');
+      const aside = fs.readdirSync(dataDir).filter((name) => name.includes('corrupt'));
+      assert.equal(fs.readFileSync(path.join(dataDir, aside[0]), 'utf8'), '{"records":{"oops');
     } finally {
       await again.stop();
     }
   });
 
-  it('starts from the previous version when the crash came between the two renames', async () => {
-    const own = await startRelay();
-    const { id } = await registerWeb('/store-5', own);
-    await registerWeb('/store-6', own);
-    await own.stop();
-    fs.rmSync(path.join(own.dataDir, FILE));
-    const again = await startRelay({ dataDir: own.dataDir });
+  it('starts from the previous version and the journal when the crash came between the two renames', async () => {
+    let id = '';
+    const dataDir = await snapshotAfter(undefined, async (own) => { id = (await registerWeb('/store-5', own)).id; });
+    const own = await startRelay({ dataDir });
+    const { id: later } = await registerWeb('/store-6', own);
+    await own.stop('SIGKILL');
+    // The snapshot went to the previous version's place, the new one never came.
+    fs.renameSync(path.join(dataDir, FILE), path.join(dataDir, `${FILE}.bak`));
+    const again = await startRelay({ dataDir });
     try {
       assert.equal((await getJson(again.base, `/api/push/verify/${id}`)).status, 200);
+      assert.equal((await getJson(again.base, `/api/push/verify/${later}`)).status, 200);
     } finally {
       await again.stop();
     }
@@ -1293,18 +1297,19 @@ describe('the store on disk', () => {
 
 describe('starting up', () => {
   it('refuses to run on a store it cannot read, and leaves it alone', async () => {
-    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-seed-'));
-    // A read error other than "not there": a directory in the file's place.
-    fs.mkdirSync(path.join(dataDir, 'subscriptions.json'));
-    fs.writeFileSync(path.join(dataDir, 'subscriptions.json', 'still-here'), 'x');
-    await assert.rejects(startRelay({ dataDir }), /relay exited during start/);
-    assert.ok(fs.existsSync(path.join(dataDir, 'subscriptions.json', 'still-here')));
+    // A read error other than "not there": a directory in the snapshot's or the journal's place.
+    for (const name of ['subscriptions.json', 'subscriptions.journal']) {
+      const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-seed-'));
+      fs.mkdirSync(path.join(dataDir, name));
+      fs.writeFileSync(path.join(dataDir, name, 'still-here'), 'x');
+      await assert.rejects(startRelay({ dataDir }), /relay exited during start/, name);
+      assert.ok(fs.existsSync(path.join(dataDir, name, 'still-here')), name);
+    }
   });
 
   it('has the store loaded before it takes any request', async () => {
     const seeded = newId();
-    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-seed-'));
-    fs.writeFileSync(path.join(dataDir, 'subscriptions.json'), JSON.stringify({ records: { [seeded]: { kind: 'web', webPush: { endpoint: service.url('/seeded'), keys: makeDevice().keys }, verificationCode: null, createdAt: Date.now(), lastPushAt: null } } }));
+    const dataDir = seedStore({ [seeded]: { kind: 'web', webPush: { endpoint: service.url('/seeded'), keys: makeDevice().keys }, verificationCode: null, createdAt: Date.now(), lastPushAt: null } });
     const own = await startRelay({ dataDir, skipHealthCheck: true });
     try {
       const ids = Array.from({ length: 40 }, () => newId());

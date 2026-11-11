@@ -263,9 +263,57 @@ export function newId(): string {
   return crypto.randomBytes(16).toString('hex');
 }
 
-/** The records a relay keeps in this data directory, as it would load them. */
+// Where the store keeps its files. Tests go through the helpers below instead.
+const SNAPSHOT = 'subscriptions.json';
+const JOURNAL = 'subscriptions.journal';
+
+/** The records a relay keeps in this data directory, as it would load them: the snapshot, then the journal. */
 export function storedRecords(dataDir: string): Record<string, any> {
-  return JSON.parse(fs.readFileSync(path.join(dataDir, 'subscriptions.json'), 'utf8')).records;
+  const records: Record<string, any> = {};
+  for (const name of [SNAPSHOT, `${SNAPSHOT}.bak`]) {
+    const file = path.join(dataDir, name);
+    if (!fs.existsSync(file)) continue;
+    Object.assign(records, JSON.parse(fs.readFileSync(file, 'utf8')).records);
+    break;
+  }
+  const journal = path.join(dataDir, JOURNAL);
+  const lines = fs.existsSync(journal) ? fs.readFileSync(journal, 'utf8').split('\n') : [];
+  for (const line of lines) {
+    if (!line) continue;
+    let entry: { id: string; record: unknown };
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (entry.record === null) delete records[entry.id];
+    else records[entry.id] = entry.record;
+  }
+  return records;
+}
+
+/**
+ * Writes a store in the format of the relay before the journal: one
+ * subscriptions.json, which every relay since reads. Records as an object, or
+ * the file's text as is. Returns the data directory, a new one unless given.
+ */
+export function seedStore(records: Record<string, unknown> | string, dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-seed-'))): string {
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(path.join(dataDir, SNAPSHOT), typeof records === 'string' ? records : JSON.stringify({ records }));
+  return dataDir;
+}
+
+/**
+ * From now on no write of the relay's store reaches the disk: a directory sits
+ * where each of its files would be written. What it wrote since its last
+ * snapshot is gone from the disk.
+ */
+export function blockStoreWrites(dataDir: string): void {
+  for (const name of [JOURNAL, `${SNAPSHOT}.tmp`]) {
+    const file = path.join(dataDir, name);
+    fs.rmSync(file, { force: true });
+    fs.mkdirSync(file, { recursive: true });
+  }
 }
 
 export async function postJson(base: string, pathname: string, body: unknown): Promise<{ status: number; body: any; headers: Headers }> {
