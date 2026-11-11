@@ -35,6 +35,8 @@ import {
   type FakePushService,
 } from './test-support/harness.js';
 
+const DEFAULT_MAX_SUBSCRIPTIONS = 50_000;
+const DAY = 24 * 60 * 60 * 1000;
 const METRICS_TOKEN = 'scrape-secret-0123456789';
 
 let service: FakePushService;
@@ -98,6 +100,96 @@ function seedLegacyStore(count: number): string {
   }
   return seedStore(records);
 }
+
+describe('how many records the store takes', () => {
+  it('refuses a new id at the limit with 507, and keeps serving the records it has', async () => {
+    const relay = await startRelay({ env: { PUSH_MAX_SUBSCRIPTIONS: '5', PUSH_REGISTER_BURST: '1000' } });
+    try {
+      const ids: string[] = [];
+      for (let i = 0; i < 5; i++) {
+        const id = newId();
+        ids.push(id);
+        assert.equal((await register(relay, id, '/limits')).status, 200);
+      }
+      const refused = newId();
+      assert.equal((await register(relay, refused, '/limits')).status, 507, 'a sixth record at a limit of five');
+      assert.equal(await known(relay, refused), false, 'the refused record is not in the store');
+      for (const id of ids) assert.equal(await known(relay, id), true);
+      // A device that is already there checks in on every page load: that still works.
+      assert.equal((await register(relay, ids[0], '/limits-again')).status, 200);
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${ids[1]}`, emailPush('a', ['e1']))).status, 200);
+      // A place that comes free can be taken.
+      assert.equal((await getJson(relay.base, `/api/push/register/${ids[2]}`, 'DELETE')).status, 200);
+      assert.equal((await register(relay, refused, '/limits')).status, 200);
+      // And the limit survives a restart.
+      const again = await relay.restart();
+      try {
+        assert.equal((await register(again, newId(), '/limits')).status, 507);
+        assert.equal(await known(again, ids[0]), true);
+      } finally {
+        await again.stop();
+      }
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('has the default limit when none is configured, and starts on a store written by the relay before it', async () => {
+    const full = seedLegacyStore(DEFAULT_MAX_SUBSCRIPTIONS);
+    const almost = seedLegacyStore(DEFAULT_MAX_SUBSCRIPTIONS - 1);
+    const relayFull = await startRelay({ dataDir: full, env: { PUSH_REGISTER_BURST: '1000' } });
+    const relayAlmost = await startRelay({ dataDir: almost, env: { PUSH_REGISTER_BURST: '1000' } });
+    try {
+      assert.equal(await known(relayFull, 'seed000000000000'), true, 'the records of the old store are there');
+      assert.equal((await register(relayFull, newId(), '/limits')).status, 507, `a relay holding ${DEFAULT_MAX_SUBSCRIPTIONS} records took one more`);
+      assert.equal((await register(relayFull, 'seed000000000001', '/limits')).status, 200, 'a record that exists registers again');
+      assert.equal((await register(relayAlmost, newId(), '/limits')).status, 200, 'one place was left');
+      assert.equal((await register(relayAlmost, newId(), '/limits')).status, 507);
+    } finally {
+      await relayFull.stop('SIGKILL');
+      await relayAlmost.stop('SIGKILL');
+      fs.rmSync(full, { recursive: true, force: true });
+      fs.rmSync(almost, { recursive: true, force: true });
+    }
+  });
+
+  it('counts an id registered over and over as one record', async () => {
+    const relay = await startRelay({ env: { PUSH_MAX_SUBSCRIPTIONS: '3', PUSH_REGISTER_BURST: '1000' } });
+    try {
+      const again = newId();
+      for (let i = 0; i < 10; i++) assert.equal((await register(relay, again, `/same-${i}`)).status, 200);
+      assert.equal((await register(relay, newId(), '/limits')).status, 200);
+      assert.equal((await register(relay, newId(), '/limits')).status, 200);
+      assert.equal((await register(relay, newId(), '/limits')).status, 507);
+      // At the limit the id that is there still moves to its new endpoint.
+      assert.equal((await register(relay, again, '/same-last')).status, 200);
+      assert.equal(storedRecords(relay.dataDir)[again].endpoint, service.url('/same-last'));
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('lets a record that never worked go after 7 days, and frees its place', async () => {
+    const now = Date.now();
+    const base = { kind: 'up', keys: null, verificationCode: null };
+    const ids = { unused: newId(), unusedRecent: newId(), pushed: newId(), collected: newId() };
+    const dataDir = seedStore({
+      [ids.unused]: { ...base, endpoint: service.url('/unused'), createdAt: now - 10 * DAY, lastRegisteredAt: now - 8 * DAY, lastPushAt: null },
+      [ids.unusedRecent]: { ...base, endpoint: service.url('/unused-recent'), createdAt: now - 10 * DAY, lastRegisteredAt: now - 6 * DAY, lastPushAt: null },
+      [ids.pushed]: { ...base, endpoint: service.url('/pushed'), createdAt: now - 60 * DAY, lastPushAt: now - 30 * DAY },
+      [ids.collected]: { ...base, endpoint: service.url('/collected'), verificationCode: 'c', createdAt: now - 60 * DAY, lastRegisteredAt: now - 30 * DAY, codeCollectedAt: now - 60 * DAY, lastPushAt: null },
+    });
+    const relay = await startRelay({ dataDir, env: { PUSH_MAX_SUBSCRIPTIONS: '4', PUSH_REGISTER_BURST: '1000' } });
+    try {
+      assert.equal(await known(relay, ids.unused), false, 'never delivered, no code collected, quiet for 8 days');
+      for (const id of [ids.unusedRecent, ids.pushed, ids.collected]) assert.equal(await known(relay, id), true);
+      assert.equal((await register(relay, newId(), '/limits')).status, 200, 'its place is free');
+      assert.equal((await register(relay, newId(), '/limits')).status, 507);
+    } finally {
+      await relay.stop();
+    }
+  });
+});
 
 describe('what one registration may put into the store', () => {
   it('refuses an endpoint or keys padded with characters no client sends', async () => {

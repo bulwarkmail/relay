@@ -161,6 +161,29 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
   res.end(payload);
 }
 
+// Records the store takes. An id that is there can always register again; a new
+// one past the limit is refused until records expire or are deleted.
+const DEFAULT_MAX_SUBSCRIPTIONS = 50_000;
+
+function maxSubscriptions(): number {
+  const value = Number(process.env.PUSH_MAX_SUBSCRIPTIONS);
+  return Number.isFinite(value) && value >= 1 ? Math.floor(value) : DEFAULT_MAX_SUBSCRIPTIONS;
+}
+
+let fullLoggedAt = 0;
+
+/** Stores a registration, or answers 507 when the store is full. Says whether it stored. */
+async function store(res: http.ServerResponse, id: string, record: SubscriptionRecord): Promise<boolean> {
+  const limit = maxSubscriptions();
+  if (await subscriptionStore.put(id, record, limit)) return true;
+  if (Date.now() - fullLoggedAt > 60_000) {
+    fullLoggedAt = Date.now();
+    logger.warn('relay: the store is full, new devices are refused', { limit });
+  }
+  sendJson(res, 507, { error: 'Relay is full' });
+  return false;
+}
+
 // What a new registration keeps from the record it replaces.
 function carriedOver(id: string, existing: SubscriptionRecord | null) {
   const now = Date.now();
@@ -215,7 +238,7 @@ async function handleRegister(
     ...carriedOver(subscriptionId, existing),
     accountLabel: label,
   };
-  await subscriptionStore.put(subscriptionId, record);
+  if (!(await store(res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'fcm' });
   return sendJson(res, 200, { ok: true });
 }
@@ -261,7 +284,7 @@ async function handleRegisterApns(
     ...carriedOver(subscriptionId, existing),
     accountLabel: label,
   };
-  await subscriptionStore.put(subscriptionId, record);
+  if (!(await store(res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'apns' });
   return sendJson(res, 200, { ok: true });
 }
@@ -308,7 +331,7 @@ async function handleRegisterWeb(
     ...carriedOver(subscriptionId, existing),
     accountLabel: label,
   };
-  await subscriptionStore.put(subscriptionId, record);
+  if (!(await store(res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'web' });
   return sendJson(res, 200, { ok: true });
 }
@@ -359,7 +382,7 @@ async function handleRegisterUnifiedPush(
     ...carriedOver(subscriptionId, existing),
     accountLabel: label,
   };
-  await subscriptionStore.put(subscriptionId, record);
+  if (!(await store(res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'up' });
   return sendJson(res, 200, { ok: true });
 }

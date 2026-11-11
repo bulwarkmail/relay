@@ -4,10 +4,17 @@ import { logger } from './logger.js';
 import { storeWriteFailures } from './metrics.js';
 import type { SubscriptionRecord } from './types.js';
 
+const DAY_MS = 24 * 60 * 60 * 1000;
 // Aligned with the JMAP PushSubscription expires the mobile client requests
 // (90 days). A push or a registration refreshes the record, so this only
 // matters for devices that have gone away for good.
-const TTL_MS = 90 * 24 * 60 * 60 * 1000;
+const TTL_MS = 90 * DAY_MS;
+// A record that never delivered a push and whose code no client ever picked up
+// has never worked. A real device registers again on every page load and app
+// start, so it is back long before this.
+const UNUSED_TTL_MS = 7 * DAY_MS;
+// Expired records leave memory and the disk this often, not only at a start.
+const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 
 // The journal is folded into a new snapshot once it is larger than the snapshot,
 // and not before it holds this much: a change costs one append, and the snapshot
@@ -71,6 +78,7 @@ class SubscriptionStore {
     // Starts the next journal from what is on disk now. Should that fail, the
     // journal stays, and the next start reads it again.
     if (journal) await this.serial(() => this.fold()).catch(() => undefined);
+    setInterval(() => void this.sweep().catch(() => undefined), SWEEP_INTERVAL_MS).unref();
   }
 
   // Null when the file is missing or unusable. An unusable file is moved aside,
@@ -150,12 +158,18 @@ class SubscriptionStore {
     return record;
   }
 
-  /** Stores a record. Rejects when it can't be written, and then keeps the one before. */
-  async put(id: string, record: SubscriptionRecord): Promise<void> {
+  /**
+   * Stores a record. False, and nothing stored, when the id is new and the store
+   * already holds `limit` records: an id that is there can always be replaced.
+   * Rejects when it can't be written, and then keeps the one before.
+   */
+  async put(id: string, record: SubscriptionRecord, limit = Infinity): Promise<boolean> {
     await this.ensureLoaded();
-    await this.serial(async () => {
+    return this.serial(async () => {
+      if (!this.records.has(id) && this.records.size >= limit) return false;
       await this.append(id, record);
       this.records.set(id, record);
+      return true;
     });
   }
 
@@ -233,15 +247,29 @@ class SubscriptionStore {
     }).catch(() => undefined);
   }
 
-  private isExpired(record: SubscriptionRecord): boolean {
-    const age = Date.now() - Math.max(record.lastPushAt ?? 0, record.lastRegisteredAt ?? 0, record.createdAt);
-    return age > TTL_MS;
+  private isExpired(record: SubscriptionRecord, now = Date.now()): boolean {
+    const age = now - Math.max(record.lastPushAt ?? 0, record.lastRegisteredAt ?? 0, record.createdAt);
+    const used = record.lastPushAt != null || record.codeCollectedAt != null;
+    return age > (used ? TTL_MS : UNUSED_TTL_MS);
   }
 
   private evictExpired(): void {
     for (const [id, record] of this.records) {
       if (this.isExpired(record)) this.records.delete(id);
     }
+  }
+
+  /** Writes a snapshot without the expired records, then forgets them. */
+  async sweep(now = Date.now()): Promise<number> {
+    await this.ensureLoaded();
+    return this.serial(async () => {
+      const expired = new Set<string>();
+      for (const [id, record] of this.records) if (this.isExpired(record, now)) expired.add(id);
+      if (expired.size === 0) return 0;
+      await this.fold(expired);
+      for (const id of expired) this.records.delete(id);
+      return expired.size;
+    });
   }
 
   // Records written before the FCM/Web Push split only had `fcmToken`. Stamp
@@ -287,9 +315,10 @@ class SubscriptionStore {
     }
   }
 
-  // A new snapshot with every record, written aside and renamed into place; the
-  // one it replaces stays as the previous version. Only then does the journal go.
-  private async fold(): Promise<void> {
+  // A new snapshot with every record but the ones left out, written aside and
+  // renamed into place; the one it replaces stays as the previous version. Only
+  // then does the journal go.
+  private async fold(leaveOut?: Set<string>): Promise<void> {
     const target = subscriptionsPath();
     const tmp = `${target}.tmp`;
     let bytes = 0;
@@ -301,6 +330,7 @@ class SubscriptionStore {
         let chunk = '{"records":{';
         let count = 0;
         for (const [id, record] of this.records) {
+          if (leaveOut?.has(id)) continue;
           chunk += `${count === 0 ? '' : ','}${JSON.stringify(id)}:${JSON.stringify(record)}`;
           count++;
           if (count % SNAPSHOT_BATCH === 0) {

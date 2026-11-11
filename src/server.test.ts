@@ -434,7 +434,8 @@ describe('a quiet subscription', () => {
   it('notes each registration without moving createdAt', async () => {
     const id = newId();
     const createdAt = Date.now() - 80 * DAY;
-    const own = await startRelay({ dataDir: seed({ [id]: webRecord({ createdAt }) }) });
+    // Its client checked in yesterday: a record that never delivered goes after 7 quiet days.
+    const own = await startRelay({ dataDir: seed({ [id]: webRecord({ createdAt, lastRegisteredAt: Date.now() - DAY }) }) });
     try {
       await postJson(own.base, '/api/push/register/web', {
         subscriptionId: id,
