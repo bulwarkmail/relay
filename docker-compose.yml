@@ -4,6 +4,9 @@ services:
     image: bulwark-relay:local
     container_name: bulwark-relay
     restart: unless-stopped
+    # A stop waits for a push still on its way, then folds the journal into
+    # subscriptions.json (README, "Going back to an older image").
+    stop_grace_period: 30s
     ports:
       - 127.0.0.1:3003:3003
     # Writable: the data volume and /tmp, nothing else.

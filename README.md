@@ -118,14 +118,20 @@ and app start. Expired records go at every start and within the hour while the
 relay runs.
 
 The store is a snapshot, `subscriptions.json` in `PUSH_DATA_DIR`, and a journal
-next to it, `subscriptions.journal`, which takes one line per change, on disk
-before the change is answered. A request that changes nothing (the same
+next to it, `subscriptions.journal`, which takes one numbered line per change, on
+disk before the change is answered. A request that changes nothing (the same
 verification code again, a push within a minute of the last) writes nothing. Once
 the journal is larger than the snapshot (and at least 1 MB), and when the relay
-stops, the journal is folded into a new snapshot. That one is written atomically,
-with the previous version kept as `subscriptions.json.bak`. A change that can't be
-written is answered `500`, is not kept, and counts in
-`relay_store_write_failures_total`. A snapshot that isn't valid is kept as
+stops, the journal is folded into a new snapshot that records the number of the
+last change it holds. That one is written atomically, with the previous version
+kept as `subscriptions.json.bak`. A crash at any point of a fold loses no change
+that was answered: a start replays the journal's changes past the snapshot's
+number, and a journal that doesn't continue the snapshot (one left from before an
+older relay wrote `subscriptions.json`) is kept as
+`subscriptions.journal.stale-<time>` with a warning, not replayed. A change that
+can't be written is answered `500`, is not kept, and counts in
+`relay_store_write_failures_total`; a snapshot that can't be written is tried again
+a minute later, while the journal keeps taking changes. A snapshot that isn't valid is kept as
 `subscriptions.json.corrupt-<time>` and logged as an error, and the relay starts
 from the previous version. A file that can't be read at all (permissions, a bad
 mount) stops the relay at startup with an error, so it can't overwrite the store.
@@ -231,6 +237,19 @@ It joins the external `bulwark` network, through which Prometheus scrapes
 the reverse proxy and its limits; requests from there come from a private address
 and get no limit per client address (see [Limits](#limits)). Keep only trusted
 containers on it.
+
+### Going back to an older image
+
+An older relay reads `subscriptions.json` and ignores `subscriptions.journal`, so
+stop this one cleanly first: `docker compose stop` sends SIGTERM, the relay waits
+for a push still on its way (up to `PUSH_FORWARD_TIMEOUT_MS` and a second), folds
+the journal into `subscriptions.json` and removes it. The compose file gives it 30
+seconds for that. Then check that `data/subscriptions.journal` is gone before you
+start the older image. If it is still there (the stop was cut short, or the log
+says "stopped with changes left in subscriptions.journal"), start this version
+again and stop it again. Coming back to this version later is safe either way: a
+journal from before the older relay ran is set aside, not replayed over what the
+older relay wrote.
 
 ## Environment
 

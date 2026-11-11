@@ -1,4 +1,4 @@
-import { readFile, open, mkdir, rename, unlink, chmod, readdir, stat } from 'node:fs/promises';
+import { readFile, open, mkdir, rename, unlink, chmod, readdir, stat, truncate } from 'node:fs/promises';
 import path from 'node:path';
 import { logger } from './logger.js';
 import { storeWriteFailures } from './metrics.js';
@@ -20,6 +20,9 @@ const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 // and not before it holds this much: a change costs one append, and the snapshot
 // is written once per as many bytes of changes as it holds itself.
 const MIN_FOLD_BYTES = 1024 * 1024;
+// After a snapshot that could not be written, the next try waits this long, so
+// a full disk doesn't cost a snapshot's worth of writing on every change.
+const FOLD_RETRY_MS = 60 * 1000;
 // Records per write while a snapshot goes to disk, so no string holds the whole store.
 const SNAPSHOT_BATCH = 500;
 
@@ -33,6 +36,8 @@ function getPushDir(): string {
   return process.env.PUSH_DATA_DIR || path.join(process.cwd(), 'data');
 }
 
+// {"seq":<last change it holds>,"records":{...}}. An older relay reads the
+// records and ignores the number; one it writes has none, which counts as 0.
 function subscriptionsPath(): string {
   return path.join(getPushDir(), 'subscriptions.json');
 }
@@ -41,9 +46,10 @@ function previousVersionPath(): string {
   return `${subscriptionsPath()}.bak`;
 }
 
-// Every change since the snapshot, one JSON line each: {"id":..,"record":{..}}, or
-// "record":null for a delete. Each line starts with its newline, so an append cut
-// short by a crash stays a line of its own, which the next load skips.
+// The changes since a snapshot: a first line {"from":<the snapshot's seq>}, then
+// one line per change, {"seq":n,"id":..,"record":{..}}, or "record":null for a
+// delete, numbered on from there. Each line starts with its newline, so an
+// append cut short by a crash stays a line of its own, which the next load skips.
 function journalPath(): string {
   return path.join(getPushDir(), 'subscriptions.journal');
 }
@@ -52,8 +58,26 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : 'Unknown error';
 }
 
+const isSeq = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+
+// After a rename or a new file the directory itself goes to disk too, or a power
+// cut could lose the file. Windows can't sync a directory; nothing to do there.
+async function syncDirectory(): Promise<void> {
+  if (!POSIX) return;
+  const handle = await open(getPushDir(), 'r').catch(() => null);
+  if (!handle) return;
+  await handle.sync().catch(() => undefined);
+  await handle.close().catch(() => undefined);
+}
+
 interface SubscriptionsFile {
+  seq?: unknown;
   records: Record<string, SubscriptionRecord>;
+}
+
+interface Snapshot {
+  records: Record<string, SubscriptionRecord>;
+  seq: number;
 }
 
 class SubscriptionStore {
@@ -64,6 +88,13 @@ class SubscriptionStore {
   private queue: Promise<unknown> = Promise.resolve();
   private snapshotBytes = 0;
   private journalBytes = 0;
+  // The number of the last change made. Every change up to it is on disk, in
+  // the snapshot or in the journal.
+  private seq = 0;
+  // What the snapshot on disk holds, up to which change.
+  private snapshotSeq = 0;
+  private foldRetryAt = 0;
+  private closed = false;
 
   /** Once, whoever asks. Rejects when a store exists that can't be read: see readSnapshot. */
   load(): Promise<void> {
@@ -73,11 +104,12 @@ class SubscriptionStore {
 
   private async readFromDisk(): Promise<void> {
     await this.makePrivate();
-    const records =
+    const snapshot =
       (await this.readSnapshot(subscriptionsPath())) ?? (await this.readSnapshot(previousVersionPath()));
-    for (const [id, record] of Object.entries(records ?? {})) {
+    for (const [id, record] of Object.entries(snapshot?.records ?? {})) {
       if (id !== '__proto__') this.records.set(id, record);
     }
+    this.seq = this.snapshotSeq = snapshot?.seq ?? 0;
     const journal = await this.readJournal();
     this.migrateLegacyRecords();
     this.evictExpired();
@@ -91,7 +123,7 @@ class SubscriptionStore {
   // Null when the file is missing or unusable. An unusable file is moved aside,
   // not left for the next write to replace: it may be every device's only
   // record, and one register call would otherwise wipe it.
-  private async readSnapshot(file: string): Promise<Record<string, SubscriptionRecord> | null> {
+  private async readSnapshot(file: string): Promise<Snapshot | null> {
     let raw: string;
     try {
       raw = await readFile(file, 'utf-8');
@@ -108,7 +140,7 @@ class SubscriptionStore {
         throw new Error('no records in the file');
       }
       this.snapshotBytes = Buffer.byteLength(raw);
-      return parsed.records;
+      return { records: parsed.records, seq: isSeq(parsed.seq) ? parsed.seq : 0 };
     } catch (error) {
       const aside = `${file}.corrupt-${Date.now()}`;
       await rename(file, aside).catch(() => undefined);
@@ -147,7 +179,14 @@ class SubscriptionStore {
     }
   }
 
-  /** Applies the changes since the snapshot. Says whether there was a journal. */
+  /**
+   * Applies the changes since the snapshot. Says whether there was a journal to
+   * fold. Changes the snapshot already holds are skipped, so a crash between a
+   * snapshot's rename and the journal's removal applies nothing twice. A journal
+   * started on a later snapshot than the one loaded (an older relay wrote the
+   * snapshot since, or only the previous version could be read) is set aside
+   * unread: its changes don't follow from what is in memory.
+   */
   private async readJournal(): Promise<boolean> {
     let raw: string;
     try {
@@ -157,21 +196,49 @@ class SubscriptionStore {
       logger.error('store: failed to read the journal', { error: message(error) });
       throw error;
     }
+    let from: number | null = null;
     let skipped = 0;
+    const changes: Array<{ seq: number; id: string; record: SubscriptionRecord | null }> = [];
     for (const line of raw.split('\n')) {
       if (!line) continue;
       try {
-        const entry = JSON.parse(line) as { id?: unknown; record?: unknown };
-        if (typeof entry.id !== 'string' || entry.id === '__proto__') throw new Error('no id');
-        if (entry.record === null) this.records.delete(entry.id);
-        else if (entry.record && typeof entry.record === 'object') this.records.set(entry.id, entry.record as SubscriptionRecord);
-        else throw new Error('no record');
+        const entry = JSON.parse(line) as { from?: unknown; seq?: unknown; id?: unknown; record?: unknown };
+        if (from === null && isSeq(entry.from)) {
+          from = entry.from;
+          continue;
+        }
+        if (!isSeq(entry.seq) || typeof entry.id !== 'string' || entry.id === '__proto__') throw new Error('no change');
+        if (entry.record !== null && (!entry.record || typeof entry.record !== 'object')) throw new Error('no record');
+        changes.push({ seq: entry.seq, id: entry.id, record: entry.record as SubscriptionRecord | null });
       } catch {
         // A crash in the middle of an append, which was never answered.
         skipped++;
       }
     }
     if (skipped > 0) logger.warn('store: skipped journal lines that could not be read', { count: skipped });
+    if (changes.length === 0 && from === null) {
+      // Empty: an append that failed before its first byte stuck.
+      this.journalBytes = 0;
+      return false;
+    }
+    if (from === null || from > this.snapshotSeq) {
+      const aside = `${journalPath()}.stale-${Date.now()}`;
+      await rename(journalPath(), aside);
+      if (POSIX) await chmod(aside, PRIVATE_FILE).catch(() => undefined);
+      logger.warn('store: the journal does not continue the snapshot, set aside unread', {
+        snapshotSeq: this.snapshotSeq,
+        journalFrom: from,
+        aside: path.basename(aside),
+      });
+      this.journalBytes = 0;
+      return false;
+    }
+    for (const change of changes) {
+      if (change.seq <= this.seq) continue;
+      if (change.record === null) this.records.delete(change.id);
+      else this.records.set(change.id, change.record);
+      this.seq = change.seq;
+    }
     this.journalBytes = Buffer.byteLength(raw);
     return true;
   }
@@ -202,6 +269,7 @@ class SubscriptionStore {
       if (!this.records.has(id) && this.records.size >= limit) return false;
       await this.append(id, record);
       this.records.set(id, record);
+      await this.foldIfDue();
       return true;
     });
   }
@@ -212,6 +280,7 @@ class SubscriptionStore {
       if (!this.records.has(id)) return;
       await this.append(id, null);
       this.records.delete(id);
+      await this.foldIfDue();
     });
   }
 
@@ -233,6 +302,7 @@ class SubscriptionStore {
       change(next);
       await this.append(id, next);
       Object.assign(expected, next);
+      await this.foldIfDue();
     });
   }
 
@@ -248,6 +318,7 @@ class SubscriptionStore {
       if (this.records.get(id) !== expected) return false;
       await this.append(id, null);
       this.records.delete(id);
+      await this.foldIfDue();
       return true;
     });
   }
@@ -272,12 +343,18 @@ class SubscriptionStore {
     return { fcm, apns, web, up };
   }
 
-  /** Folds the journal into the snapshot, so the next start reads one file. */
-  async close(): Promise<void> {
-    if (!this.loaded) return;
-    await this.serial(async () => {
+  /**
+   * Folds the journal into the snapshot, after every change already on its way,
+   * and takes no change after that: an older relay reads subscriptions.json only.
+   * Says whether the journal is gone.
+   */
+  async close(): Promise<boolean> {
+    if (!this.loaded) return true;
+    return this.serial(async () => {
+      this.closed = true;
       if (this.journalBytes > 0) await this.fold();
-    }).catch(() => undefined);
+      return true;
+    }).catch(() => false);
   }
 
   private isExpired(record: SubscriptionRecord, now = Date.now()): boolean {
@@ -322,10 +399,14 @@ class SubscriptionStore {
     return run;
   }
 
-  // One line, on disk before the caller hears back. Its cost doesn't depend on
-  // how many records there are.
+  // One line, on disk before the caller hears back, with the next number. Its
+  // cost doesn't depend on how many records there are. A new journal starts with
+  // the snapshot it continues.
   private async append(id: string, record: SubscriptionRecord | null): Promise<void> {
-    const line = `\n${JSON.stringify({ id, record })}`;
+    if (this.closed) throw new Error('the store is closed');
+    const seq = this.seq + 1;
+    const header = this.journalBytes === 0 ? `\n${JSON.stringify({ from: this.snapshotSeq })}` : '';
+    const line = `${header}\n${JSON.stringify({ seq, id, record })}`;
     try {
       await mkdir(getPushDir(), { recursive: true, mode: PRIVATE_DIR });
       const handle = await open(journalPath(), 'a', PRIVATE_FILE);
@@ -335,22 +416,34 @@ class SubscriptionStore {
       } finally {
         await handle.close();
       }
+      if (header) await syncDirectory();
     } catch (error) {
       storeWriteFailures.inc();
       logger.error('store: could not write a change', { error: message(error) });
+      // Nothing of a change that was refused may stay behind. Should that fail
+      // too, its number is used up, so a whole line of it can't pass for the next.
+      await truncate(journalPath(), this.journalBytes).catch(() => {
+        this.seq = seq;
+      });
       throw error;
     }
+    this.seq = seq;
     this.journalBytes += Buffer.byteLength(line);
-    if (this.journalBytes > Math.max(this.snapshotBytes, MIN_FOLD_BYTES)) {
-      // The change is safe in the journal; a snapshot that fails is tried again
-      // with the next change.
-      await this.fold().catch(() => undefined);
-    }
   }
 
-  // A new snapshot with every record but the ones left out, written aside and
-  // renamed into place; the one it replaces stays as the previous version. Only
-  // then does the journal go.
+  // After the change is in memory: the snapshot written now holds it. The
+  // change is on disk in the journal already, so a snapshot that fails costs
+  // nothing but a later try.
+  private async foldIfDue(): Promise<void> {
+    if (this.journalBytes <= Math.max(this.snapshotBytes, MIN_FOLD_BYTES) || Date.now() < this.foldRetryAt) return;
+    await this.fold().catch(() => {
+      this.foldRetryAt = Date.now() + FOLD_RETRY_MS;
+    });
+  }
+
+  // A new snapshot with every record in memory but the ones left out, numbered
+  // with the last change, written aside and renamed into place; the one it
+  // replaces stays as the previous version. Only then does the journal go.
   private async fold(leaveOut?: Set<string>): Promise<void> {
     const target = subscriptionsPath();
     const tmp = `${target}.tmp`;
@@ -362,7 +455,7 @@ class SubscriptionStore {
       try {
         // A leftover from a crash keeps the mode it had.
         if (POSIX) await handle.chmod(PRIVATE_FILE);
-        let chunk = '{"records":{';
+        let chunk = `{"seq":${this.seq},"records":{`;
         let count = 0;
         for (const [id, record] of this.records) {
           if (leaveOut?.has(id)) continue;
@@ -381,14 +474,17 @@ class SubscriptionStore {
       } finally {
         await handle.close();
       }
-      // A crash between these two leaves only the previous version, which load
-      // reads, and the journal, which holds what the new snapshot added to it.
+      // A crash between these two leaves the previous version, which load reads,
+      // and the journal that continues it.
       await rename(target, previousVersionPath()).catch((error: NodeJS.ErrnoException) => {
         if (error.code !== 'ENOENT') throw error;
       });
       await rename(tmp, target);
-      // A crash before this replays the journal onto the snapshot that already
-      // has it, which changes nothing: every line is a whole record or a delete.
+      await syncDirectory();
+      this.snapshotSeq = this.seq;
+      this.snapshotBytes = bytes;
+      // A crash before this leaves a journal whose changes the snapshot holds
+      // already: load skips them by their numbers.
       await unlink(journalPath()).catch((error: NodeJS.ErrnoException) => {
         if (error.code !== 'ENOENT') throw error;
       });
@@ -397,7 +493,6 @@ class SubscriptionStore {
       logger.error('store: could not write a snapshot', { error: message(error) });
       throw error;
     }
-    this.snapshotBytes = bytes;
     this.journalBytes = 0;
   }
 }

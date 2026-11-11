@@ -269,27 +269,42 @@ export function newId(): string {
 const SNAPSHOT = 'subscriptions.json';
 const JOURNAL = 'subscriptions.journal';
 
-/** The records a relay keeps in this data directory, as it would load them: the snapshot, then the journal. */
+/**
+ * The records a relay keeps in this data directory, as it would load them: the
+ * snapshot, then the journal's changes past the snapshot's number, when the
+ * journal continues that snapshot.
+ */
 export function storedRecords(dataDir: string): Record<string, any> {
   const records: Record<string, any> = {};
+  let seq = 0;
   for (const name of [SNAPSHOT, `${SNAPSHOT}.bak`]) {
     const file = path.join(dataDir, name);
     if (!fs.existsSync(file)) continue;
-    Object.assign(records, JSON.parse(fs.readFileSync(file, 'utf8')).records);
+    const snapshot = JSON.parse(fs.readFileSync(file, 'utf8'));
+    Object.assign(records, snapshot.records);
+    seq = Number.isSafeInteger(snapshot.seq) ? snapshot.seq : 0;
     break;
   }
   const journal = path.join(dataDir, JOURNAL);
   const lines = fs.existsSync(journal) ? fs.readFileSync(journal, 'utf8').split('\n') : [];
+  let from: number | null = null;
+  const changes: Array<{ seq: number; id: string; record: unknown }> = [];
   for (const line of lines) {
     if (!line) continue;
-    let entry: { id: string; record: unknown };
     try {
-      entry = JSON.parse(line);
+      const entry = JSON.parse(line);
+      if (from === null && Number.isSafeInteger(entry.from)) from = entry.from;
+      else if (Number.isSafeInteger(entry.seq) && typeof entry.id === 'string') changes.push(entry);
     } catch {
-      continue;
+      // A torn line.
     }
-    if (entry.record === null) delete records[entry.id];
-    else records[entry.id] = entry.record;
+  }
+  if (from === null || from > seq) return records;
+  for (const change of changes) {
+    if (change.seq <= seq) continue;
+    if (change.record === null) delete records[change.id];
+    else records[change.id] = change.record;
+    seq = change.seq;
   }
   return records;
 }

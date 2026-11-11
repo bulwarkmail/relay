@@ -12,6 +12,7 @@ import { takeRegistration } from './client-limit.js';
 import {
   classifyForward,
   failureReason,
+  forwardTimeoutMs,
   isTemporaryFailure,
   logRef,
   pushServiceHost,
@@ -846,14 +847,23 @@ subscriptionStore.load().then(
   },
 );
 
-// The journal goes into the snapshot on the way out, so the next start, or an
-// older relay that only reads subscriptions.json, finds every record there.
+// Every change is on disk before it is answered; a stop doesn't change that. On
+// the way out the journal goes into the snapshot, after the last change, so an
+// older relay, which reads subscriptions.json only, finds every record there.
+// A push still on its way gets its full deadline first.
+let stopping = false;
+const stop = (code: number) => {
+  if (stopping) return;
+  stopping = true;
+  void subscriptionStore.close().then((folded) => {
+    if (!folded) logger.warn('relay: stopped with changes left in subscriptions.journal, which an older relay does not read');
+    process.exit(code);
+  });
+};
 const shutdown = (signal: string) => {
   logger.info('relay: shutting down', { signal });
-  server.close(() => {
-    subscriptionStore.close().finally(() => process.exit(0));
-  });
-  setTimeout(() => process.exit(1), 5000).unref();
+  server.close(() => stop(0));
+  setTimeout(() => stop(1), forwardTimeoutMs() + 1000).unref();
 };
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));

@@ -1,0 +1,315 @@
+// The change that makes the journal outgrow its limit is on disk like any other:
+// the store folds the journal into a new snapshot while that change is being
+// made, and the snapshot has to hold it. So is every other answered change,
+// wherever a crash cuts a fold short, and a journal that doesn't continue the
+// snapshot next to it is not replayed over it.
+//
+// The journal is folded once it is larger than the snapshot and larger than 1 MiB.
+// The first cases fill a fresh store's journal to just under 1 MiB and then make
+// one more change, which is the one that triggers the fold.
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { after, before, describe, it } from 'node:test';
+import {
+  getJson,
+  makeDevice,
+  newId,
+  postJson,
+  pushVerification,
+  startFakePushService,
+  startRelay,
+  stateChange,
+  storedRecords,
+  type FakePushService,
+  type RunningRelay,
+} from './test-support/harness.js';
+
+const FOLD_AT = 1024 * 1024;
+const METRICS_TOKEN = 'scrape-secret-0123456789';
+// The store's files, which the crash cases put together by hand.
+const SNAPSHOT = 'subscriptions.json';
+const JOURNAL = 'subscriptions.journal';
+
+let service: FakePushService;
+const keys = makeDevice().keys;
+
+before(async () => {
+  service = await startFakePushService();
+});
+
+after(async () => {
+  await service.close();
+});
+
+const journalSize = (dataDir: string) => {
+  try {
+    return fs.statSync(path.join(dataDir, 'subscriptions.journal')).size;
+  } catch {
+    return 0;
+  }
+};
+
+/** Waits for the snapshot a fold writes. A store may fold a moment after it answers. */
+async function folded(dataDir: string): Promise<boolean> {
+  for (let i = 0; i < 100; i++) {
+    if (fs.existsSync(path.join(dataDir, 'subscriptions.json'))) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+}
+
+const register = (relay: RunningRelay, id: string, pathname: string) =>
+  postJson(relay.base, '/api/push/register/unifiedpush', { subscriptionId: id, endpoint: service.url(pathname), keys });
+
+/** Fills the journal so that it ends `room` bytes under the size at which it is folded. */
+async function fillJournal(relay: RunningRelay, room: number): Promise<void> {
+  // What a line holds besides its path, measured on the line before the next: a
+  // line may also hold a number that grows, and the first one more than that.
+  let overhead = 0;
+  // A line of this many bytes.
+  const line = async (bytes: number) => {
+    const before = journalSize(relay.dataDir);
+    const pathLength = Math.max(1, bytes - overhead);
+    assert.equal((await register(relay, newId(), `/fill/${'x'.repeat(pathLength)}`)).status, 200);
+    overhead = journalSize(relay.dataDir) - before - pathLength;
+  };
+  await line(1);
+  await line(1);
+  const left = () => FOLD_AT - room - journalSize(relay.dataDir);
+  while (left() >= 2 * (overhead + 1500)) await line(overhead + 1499);
+  // The last two are cut to fit.
+  await line(Math.floor(left() / 2));
+  await line(left());
+  assert.equal(journalSize(relay.dataDir), FOLD_AT - room, 'the journal is not where the test needs it');
+  assert.ok(!fs.existsSync(path.join(relay.dataDir, 'subscriptions.json')), 'the store folded before the change under test');
+}
+
+describe('the change that makes the store fold its journal', () => {
+  it('is on disk when it is a registration, and there after a restart', async () => {
+    const relay = await startRelay();
+    try {
+      await fillJournal(relay, 20);
+      const id = newId();
+      assert.equal((await register(relay, id, '/the-one-that-folds')).status, 200);
+      assert.ok(await folded(relay.dataDir), 'this registration did not make the store fold');
+      assert.ok(storedRecords(relay.dataDir)[id], 'a registration answered 200 is in neither the snapshot nor the journal');
+      await relay.stop('SIGKILL');
+      const again = await startRelay({ dataDir: relay.dataDir });
+      try {
+        assert.equal((await getJson(again.base, `/api/push/active/${id}`)).status, 200, 'a registration answered 200 was gone after a restart');
+      } finally {
+        await again.stop();
+      }
+    } finally {
+      await relay.stop('SIGKILL');
+    }
+  });
+
+  it('moves a device to its new endpoint on disk too', async () => {
+    const relay = await startRelay();
+    try {
+      const id = newId();
+      assert.equal((await register(relay, id, '/old-endpoint')).status, 200);
+      await fillJournal(relay, 20);
+      assert.equal((await register(relay, id, '/new-endpoint')).status, 200);
+      assert.ok(await folded(relay.dataDir), 'this registration did not make the store fold');
+      assert.equal(storedRecords(relay.dataDir)[id].endpoint, service.url('/new-endpoint'), 'the disk still has the endpoint from before');
+    } finally {
+      await relay.stop('SIGKILL');
+    }
+  });
+
+  it('stays deleted when it is a delete', async () => {
+    const relay = await startRelay();
+    try {
+      const id = newId();
+      assert.equal((await register(relay, id, '/to-delete')).status, 200);
+      await fillJournal(relay, 20);
+      assert.equal((await getJson(relay.base, `/api/push/register/${id}`, 'DELETE')).status, 200);
+      assert.ok(await folded(relay.dataDir), 'this delete did not make the store fold');
+      assert.equal(storedRecords(relay.dataDir)[id], undefined, 'a record deleted with 200 is still on disk');
+      await relay.stop('SIGKILL');
+      const again = await startRelay({ dataDir: relay.dataDir });
+      try {
+        assert.equal((await getJson(again.base, `/api/push/active/${id}`)).status, 404, 'a deleted record was back after a restart');
+      } finally {
+        await again.stop();
+      }
+    } finally {
+      await relay.stop('SIGKILL');
+    }
+  });
+
+  it('keeps the verification code when it is one', async () => {
+    const relay = await startRelay();
+    try {
+      const id = newId();
+      assert.equal((await register(relay, id, '/code')).status, 200);
+      await fillJournal(relay, 20);
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${id}`, pushVerification('q7Hn2LmXc9PzT4vBw1RkYd8JsG5uAe0F'))).status, 200);
+      assert.ok(await folded(relay.dataDir), 'this code did not make the store fold');
+      assert.equal(storedRecords(relay.dataDir)[id].verificationCode, 'q7Hn2LmXc9PzT4vBw1RkYd8JsG5uAe0F', 'the code is not on disk');
+      await relay.stop('SIGKILL');
+      const again = await startRelay({ dataDir: relay.dataDir });
+      try {
+        assert.deepEqual((await getJson(again.base, `/api/push/verify/${id}`)).body, { verificationCode: 'q7Hn2LmXc9PzT4vBw1RkYd8JsG5uAe0F' });
+      } finally {
+        await again.stop();
+      }
+    } finally {
+      await relay.stop('SIGKILL');
+    }
+  });
+});
+
+const plain = (relay: RunningRelay, id: string, pathname: string) =>
+  postJson(relay.base, '/api/push/register/unifiedpush', { subscriptionId: id, endpoint: service.url(pathname) });
+
+const read = (dataDir: string, name: string) => fs.readFileSync(path.join(dataDir, name), 'utf8');
+
+function storeWith(files: Record<string, string>): string {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-crash-'));
+  for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dataDir, name), text);
+  return dataDir;
+}
+
+describe('a fold cut short by a crash', () => {
+  // The files of one fold, as a relay writes them: the snapshot before, the
+  // journal with three changes since (a device moved to a new endpoint, one
+  // deleted, one new), and the snapshot the fold makes of them. Each case is the
+  // set of files a kill leaves at one moment of the fold.
+  const moved = newId();
+  const deleted = newId();
+  const added = newId();
+  let snapshotBefore = '';
+  let journal = '';
+  let snapshotAfter = '';
+
+  before(async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-crash-'));
+    let relay = await startRelay({ dataDir });
+    assert.equal((await plain(relay, moved, '/crash-old')).status, 200);
+    assert.equal((await plain(relay, deleted, '/crash-deleted')).status, 200);
+    await relay.stop('SIGKILL');
+    // A start that finds a journal folds it: this is the snapshot before.
+    relay = await startRelay({ dataDir });
+    await relay.stop('SIGKILL');
+    snapshotBefore = read(dataDir, SNAPSHOT);
+    relay = await startRelay({ dataDir });
+    assert.equal((await plain(relay, moved, '/crash-new')).status, 200);
+    assert.equal((await getJson(relay.base, `/api/push/register/${deleted}`, 'DELETE')).status, 200);
+    assert.equal((await plain(relay, added, '/crash-added')).status, 200);
+    await relay.stop('SIGKILL');
+    assert.equal(read(dataDir, SNAPSHOT), snapshotBefore, 'the store folded before the crash cases');
+    journal = read(dataDir, JOURNAL);
+    // What the fold of that journal writes.
+    const folded = storeWith({ [SNAPSHOT]: snapshotBefore, [JOURNAL]: journal });
+    relay = await startRelay({ dataDir: folded });
+    await relay.stop('SIGKILL');
+    snapshotAfter = read(folded, SNAPSHOT);
+    assert.notEqual(snapshotAfter, snapshotBefore);
+  });
+
+  async function assertEveryChange(dataDir: string) {
+    const relay = await startRelay({ dataDir });
+    try {
+      const atNew = service.to('/crash-new').length;
+      const atOld = service.to('/crash-old').length;
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${moved}`, stateChange({ a: { EmailDelivery: 's1' } }))).status, 200);
+      assert.equal(service.to('/crash-new').length, atNew + 1, 'the device is not at its new endpoint');
+      assert.equal(service.to('/crash-old').length, atOld, 'the push went to the endpoint the device left');
+      assert.equal((await getJson(relay.base, `/api/push/active/${deleted}`)).status, 404, 'a deleted record is back');
+      assert.equal((await getJson(relay.base, `/api/push/active/${added}`)).status, 200, 'a new record is gone');
+      assert.ok(!fs.readdirSync(dataDir).some((name) => name.includes('stale')), 'a journal of this snapshot was set aside');
+    } finally {
+      await relay.stop('SIGKILL');
+    }
+  }
+
+  it('keeps every change when killed after the journal took the last one, before the fold', async () => {
+    await assertEveryChange(storeWith({ [SNAPSHOT]: snapshotBefore, [JOURNAL]: journal }));
+  });
+
+  it('keeps every change when killed after the new snapshot was written, before its rename', async () => {
+    await assertEveryChange(storeWith({ [SNAPSHOT]: snapshotBefore, [JOURNAL]: journal, [`${SNAPSHOT}.tmp`]: snapshotAfter }));
+  });
+
+  it('keeps every change when killed after the old snapshot became the previous version', async () => {
+    await assertEveryChange(storeWith({ [`${SNAPSHOT}.bak`]: snapshotBefore, [`${SNAPSHOT}.tmp`]: snapshotAfter, [JOURNAL]: journal }));
+  });
+
+  it('applies nothing twice when killed after the rename, before the journal went', async () => {
+    await assertEveryChange(storeWith({ [SNAPSHOT]: snapshotAfter, [`${SNAPSHOT}.bak`]: snapshotBefore, [JOURNAL]: journal }));
+  });
+
+  it('sets aside a journal left from before an older relay wrote the snapshot, instead of replaying it', async () => {
+    // Back to an older relay after a crash: it reads subscriptions.json only, keeps
+    // the record the journal deleted, never hears of the new one, and moves the
+    // device on once more. Then up again to this relay, with the old journal still there.
+    const records = JSON.parse(snapshotBefore).records;
+    records[moved] = { ...records[moved], endpoint: service.url('/crash-newer') };
+    const dataDir = storeWith({ [SNAPSHOT]: JSON.stringify({ records }, null, 2), [JOURNAL]: journal });
+    const relay = await startRelay({ dataDir });
+    try {
+      const atNewer = service.to('/crash-newer').length;
+      const atNew = service.to('/crash-new').length;
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${moved}`, stateChange({ a: { EmailDelivery: 's1' } }))).status, 200);
+      assert.equal(service.to('/crash-newer').length, atNewer + 1, 'the device was moved back to an endpoint it had left');
+      assert.equal(service.to('/crash-new').length, atNew);
+      assert.equal((await getJson(relay.base, `/api/push/active/${deleted}`)).status, 200, 'what the older relay kept is gone');
+      assert.equal((await getJson(relay.base, `/api/push/active/${added}`)).status, 404);
+      assert.equal(fs.readdirSync(dataDir).filter((name) => name.startsWith(`${JOURNAL}.stale-`)).length, 1, 'the journal was not set aside');
+      assert.equal(relay.logs().split('does not continue the snapshot').length - 1, 1);
+    } finally {
+      await relay.stop('SIGKILL');
+    }
+  });
+});
+
+describe('a snapshot that cannot be written', () => {
+  it('is tried again a minute later, not with every change, and costs no change', async () => {
+    const relay = await startRelay({ env: { METRICS_TOKEN } });
+    const ids: string[] = [];
+    try {
+      await fillJournal(relay, 20);
+      // The journal takes changes as before; only the snapshot can't be written.
+      fs.mkdirSync(path.join(relay.dataDir, `${SNAPSHOT}.tmp`));
+      for (let i = 0; i < 5; i++) {
+        const id = newId();
+        ids.push(id);
+        assert.equal((await register(relay, id, `/past-the-fold-${i}`)).status, 200);
+      }
+      const metrics = await (await fetch(`${relay.base}/metrics`, { headers: { authorization: `Bearer ${METRICS_TOKEN}` } })).text();
+      assert.match(metrics, /^relay_store_write_failures_total 1$/m);
+    } finally {
+      await relay.stop('SIGKILL');
+    }
+    const again = await startRelay({ dataDir: relay.dataDir });
+    try {
+      for (const id of ids) assert.equal((await getJson(again.base, `/api/push/active/${id}`)).status, 200);
+    } finally {
+      await again.stop('SIGKILL');
+    }
+  });
+});
+
+// A stop is a kill on Windows, so this runs where the relay gets SIGTERM: Linux, as in the container.
+describe('a stop while a push is on its way', { skip: process.platform === 'win32' && 'a stop kills the process on Windows' }, () => {
+  it('folds the journal into subscriptions.json before the process ends', async () => {
+    service.answer('/stop-slow', { status: 201, delayMs: 6500 });
+    const relay = await startRelay({ env: { PUSH_FORWARD_TIMEOUT_MS: '7000' } });
+    const id = newId();
+    const other = newId();
+    assert.equal((await plain(relay, id, '/stop-slow')).status, 200);
+    assert.equal((await plain(relay, other, '/stop-other')).status, 200);
+    const push = postJson(relay.base, `/api/push/jmap/${id}`, stateChange({ a: { EmailDelivery: 's1' } })).catch(() => null);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await relay.stop();
+    await push;
+    assert.ok(!fs.existsSync(path.join(relay.dataDir, JOURNAL)), 'the stop left changes in the journal');
+    const records = JSON.parse(read(relay.dataDir, SNAPSHOT)).records;
+    assert.ok(records[id] && records[other], 'subscriptions.json misses a record');
+  });
+});
