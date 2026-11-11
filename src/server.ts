@@ -185,10 +185,10 @@ async function store(res: http.ServerResponse, id: string, record: SubscriptionR
   return false;
 }
 
-// What a new registration keeps from the record it replaces.
-function carriedOver(id: string, existing: SubscriptionRecord | null) {
+// What a new registration keeps from the record it replaces. A backoff the push
+// service asked for stays with the endpoint: see forward-policy.ts.
+function carriedOver(existing: SubscriptionRecord | null) {
   const now = Date.now();
-  forwardPolicy.forget(id);
   return {
     createdAt: existing?.createdAt ?? now,
     lastPushAt: existing?.lastPushAt ?? null,
@@ -236,7 +236,7 @@ async function handleRegister(
     // every fresh subscription, so dropping the old code is safe - the warm
     // path (existing JMAP sub still alive) skips polling entirely.
     verificationCode: null,
-    ...carriedOver(subscriptionId, existing),
+    ...carriedOver(existing),
     accountLabel: label,
   };
   if (!(await store(res, subscriptionId, record))) return;
@@ -282,7 +282,7 @@ async function handleRegisterApns(
     environment,
     // See handleRegister for why we always reset this.
     verificationCode: null,
-    ...carriedOver(subscriptionId, existing),
+    ...carriedOver(existing),
     accountLabel: label,
   };
   if (!(await store(res, subscriptionId, record))) return;
@@ -329,7 +329,7 @@ async function handleRegisterWeb(
     webPush,
     // See handleRegister for why we always reset this.
     verificationCode: null,
-    ...carriedOver(subscriptionId, existing),
+    ...carriedOver(existing),
     accountLabel: label,
   };
   if (!(await store(res, subscriptionId, record))) return;
@@ -380,7 +380,7 @@ async function handleRegisterUnifiedPush(
     keys: webPushKeys,
     // See handleRegister for why we always reset this.
     verificationCode: null,
-    ...carriedOver(subscriptionId, existing),
+    ...carriedOver(existing),
     accountLabel: label,
   };
   if (!(await store(res, subscriptionId, record))) return;
@@ -522,7 +522,7 @@ async function handleJmap(
       return sendJson(res, 500, { error: 'Internal server error' });
     }
     // A record replaced meanwhile points at another endpoint, which this says nothing about.
-    if (await subscriptionStore.isCurrent(id, record)) forwardPolicy.note(id, record, result);
+    if (await subscriptionStore.isCurrent(id, record)) forwardPolicy.note(record, result);
     const outcome = classifyForward(result);
     pushesForwarded.inc({
       result: outcome,

@@ -20,6 +20,7 @@ import { after, before, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
   CERT_FILE,
+  apnsKeyPem,
   blockStoreWrites,
   emailPush,
   getJson,
@@ -28,6 +29,8 @@ import {
   postJson,
   pushVerification,
   seedStore,
+  serviceAccount,
+  startFakeApns,
   startFakePushService,
   startRelay,
   storedRecords,
@@ -536,6 +539,139 @@ describe('a store that keeps what it answered', () => {
       assert.deepEqual(JSON.parse(device.decrypt(service.to('/legacy-web')[0].body)).emailIds, ['e1']);
     } finally {
       await relay.stop();
+    }
+  });
+});
+
+describe('one endpoint written many ways', () => {
+  const web = (relay: { base: string }, id: string, pathname: string) =>
+    postJson(relay.base, '/api/push/register/web', { subscriptionId: id, subscription: { endpoint: service.url(pathname), keys: makeDevice().keys } });
+
+  it('counts as one device when its push service says 429, so it cannot put the service on hold for everyone', async () => {
+    const relay = await startRelay({ env: { PUSH_REGISTER_BURST: '1000' } });
+    try {
+      const victim = newId();
+      const device = makeDevice();
+      assert.equal((await postJson(relay.base, '/api/push/register/web', { subscriptionId: victim, subscription: { endpoint: service.url('/honest-device'), keys: device.keys } })).status, 200);
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${victim}`, emailPush('a', ['e1']))).status, 200);
+      service.answer('/throttled', { status: 429 });
+      for (let i = 0; i < 20; i++) {
+        const id = newId();
+        assert.equal((await postJson(relay.base, '/api/push/register/web', { subscriptionId: id, subscription: { endpoint: service.url(`/throttled#${i}`), keys: makeDevice().keys } })).status, 200);
+        await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', [`x${i}`]));
+      }
+      const push = await postJson(relay.base, `/api/push/jmap/${victim}`, emailPush('a', ['e2']));
+      assert.equal(push.status, 200, `the honest device's push was held: ${JSON.stringify(push.body)}`);
+      assert.equal(service.to('/honest-device').length, 2);
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('does not count twenty endpoints that never delivered toward holding their host', async () => {
+    const relay = await startRelay();
+    try {
+      const victim = newId();
+      assert.equal((await web(relay, victim, '/honest-query')).status, 200);
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${victim}`, emailPush('a', ['e1']))).status, 200);
+      for (let i = 0; i < 20; i++) {
+        // Twenty different URLs: the query is part of what the service sees.
+        service.answer(`/throttled-query?n=${i}`, { status: 429 });
+        const id = newId();
+        assert.equal((await web(relay, id, `/throttled-query?n=${i}`)).status, 200);
+        assert.equal((await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', [`x${i}`]))).status, 503);
+      }
+      assert.equal(service.requests.filter((r) => r.path.startsWith('/throttled-query')).length, 20);
+      const push = await postJson(relay.base, `/api/push/jmap/${victim}`, emailPush('a', ['e2']));
+      assert.equal(push.status, 200, `the honest device's push was held: ${JSON.stringify(push.body)}`);
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('takes an endpoint that delivered before, written with twenty fragments, for one device', async () => {
+    const relay = await startRelay();
+    try {
+      const victim = newId();
+      assert.equal((await web(relay, victim, '/honest-fragment')).status, 200);
+      const ids: string[] = [];
+      for (let i = 0; i < 20; i++) {
+        const id = newId();
+        ids.push(id);
+        assert.equal((await web(relay, id, `/fragments#${i}`)).status, 200);
+        assert.equal((await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e0']))).status, 200);
+      }
+      service.answer('/fragments', { status: 429 });
+      for (const id of ids) assert.equal((await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']))).status, 503);
+      // The service said 429 once; the other nineteen waited for the same endpoint.
+      assert.equal(service.to('/fragments').length, 21);
+      const push = await postJson(relay.base, `/api/push/jmap/${victim}`, emailPush('a', ['e2']));
+      assert.equal(push.status, 200, `the honest device's push was held: ${JSON.stringify(push.body)}`);
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('keeps a backoff the endpoint earned when its id registers again', async () => {
+    const relay = await startRelay();
+    try {
+      const id = newId();
+      service.answer('/backoff-kept', { status: 429, headers: { 'retry-after': '120' } });
+      assert.equal((await web(relay, id, '/backoff-kept')).status, 200);
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']))).status, 503);
+      service.answer('/backoff-kept', { status: 201 });
+      for (const pathname of ['/backoff-kept', '/backoff-kept#again']) {
+        assert.equal((await web(relay, id, pathname)).status, 200);
+        const held = await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e2']));
+        assert.equal(held.status, 503, pathname);
+        assert.deepEqual(held.body, { ok: false, held: 'push-service-backoff' });
+      }
+      assert.equal(service.to('/backoff-kept').length, 1, 'a registration of the same endpoint ended the backoff');
+      // Another id on the same endpoint waits too: the service throttled the endpoint.
+      const other = newId();
+      assert.equal((await web(relay, other, '/backoff-kept')).status, 200);
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${other}`, emailPush('a', ['e3']))).status, 503);
+      // A new endpoint starts afresh.
+      assert.equal((await web(relay, id, '/backoff-fresh')).status, 200);
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e4']))).status, 200);
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('holds back a burst to one native app as it does to a browser', async () => {
+    const apns = await startFakeApns();
+    const json = { 'content-type': 'application/json' };
+    service.answer('/oauth/burst-token', { status: 200, headers: json, body: JSON.stringify({ access_token: 'fake-access-token', expires_in: 3600 }) });
+    const send = '/v1/projects/burst-project/messages:send';
+    service.answer(send, { status: 200, headers: json, body: '{"name":"x"}' });
+    const relay = await startRelay({
+      env: {
+        PUSH_SUBSCRIPTION_BURST: '3',
+        PUSH_SUBSCRIPTION_REFILL_MS: '60000',
+        APNS_KEY: apnsKeyPem(),
+        APNS_KEY_ID: 'KEYID12345',
+        APNS_TEAM_ID: 'TEAM123456',
+        APNS_ORIGIN: apns.origin,
+        FCM_ORIGIN: service.url('').replace(/\/$/, ''),
+        FCM_SERVICE_ACCOUNT_JSON: JSON.stringify(serviceAccount('burst-project', service.url('/oauth/burst-token'))),
+      },
+    });
+    try {
+      const apnsId = newId();
+      const fcmId = newId();
+      assert.equal((await postJson(relay.base, '/api/push/register/apns', { subscriptionId: apnsId, deviceToken: 'ef'.repeat(32), environment: 'production' })).status, 200);
+      assert.equal((await postJson(relay.base, '/api/push/register', { subscriptionId: fcmId, fcmToken: 'b'.repeat(100) })).status, 200);
+      for (const id of [apnsId, fcmId]) {
+        const statuses: number[] = [];
+        for (let i = 0; i < 5; i++) statuses.push((await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', [`e${i}`]))).status);
+        assert.deepEqual(statuses, [200, 200, 200, 429, 429], id === apnsId ? 'APNs' : 'FCM');
+      }
+      assert.equal(apns.requests.length, 3);
+      assert.equal(service.to(send).length, 3);
+    } finally {
+      await relay.stop();
+      await apns.close();
     }
   });
 });

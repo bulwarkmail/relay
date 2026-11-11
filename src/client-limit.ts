@@ -145,10 +145,6 @@ export class TokenBuckets {
   delete(key: string): void {
     this.buckets.delete(key);
   }
-
-  get size(): number {
-    return this.buckets.size;
-  }
 }
 
 const registrations = new TokenBuckets(

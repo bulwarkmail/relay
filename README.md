@@ -39,7 +39,9 @@ label a client registered with, and timing.
 
 Every register route answers `503` when the relay has no credentials for that
 transport (except UnifiedPush, which needs none), `400` to a body it can't use,
-`413` to one over 64 KB. A wrong method on a known path answers `405`.
+`413` to one over 64 KB, `429` past the limit per client address and `507` when
+the store is full (see [Limits](#limits)). A wrong method on a known path answers
+`405`.
 
 Anyone holding a `subscriptionId` can replace or delete its record, read its
 verification code and post to it, so it has to be long and random. Bulwark
@@ -67,16 +69,19 @@ default, merging whatever arrived meanwhile into one push.
 - **Topic.** Web Push pings for new mail in one account carry an RFC 8030 `Topic`,
   so a device that was offline gets the last one, not all of them. `EmailPush` pushes
   don't, since each names other messages. UnifiedPush gets no Topic.
-- **Burst limit.** Web Push and UnifiedPush subscriptions get 10 pushes at once and
-  one more every 20 seconds. Past that the relay answers `429` without calling the
-  service, and the mail server's next attempt carries everything that piled up.
+- **Burst limit.** Every subscription gets 10 pushes at once and one more every 20
+  seconds, whatever the transport. Past that the relay answers `429` without calling
+  the service, and the mail server's next attempt carries everything that piled up.
 - **Backoff.** After a `429`, or any answer with `Retry-After`, the relay leaves that
-  subscription alone for as long as the service says (60 seconds without a header,
-  an hour at most). Stalwart gives up after about two minutes, so a longer wait costs
-  the alerts in between: the service asked for it, and each one is in the log. After
-  `429`s for 20 different devices on one host within a minute it leaves the whole
-  host alone, for two minutes at most. Browsers and native apps count separately. Held
-  pushes count in `relay_pushes_held_total`.
+  endpoint (or FCM or APNs token) alone for as long as the service says (60 seconds
+  without a header, an hour at most), for every subscription on it. Registering the
+  same endpoint again doesn't end it; a new endpoint starts afresh. Stalwart gives up
+  after about two minutes, so a longer wait costs the alerts in between: the service
+  asked for it, and each one is in the log. After `429`s for 20 different devices on
+  one host within a minute it leaves the whole host alone, for two minutes at most.
+  Only devices that have delivered a push before count, an endpoint counts once
+  whatever fragment it is written with, and browsers and native apps count
+  separately. Held pushes count in `relay_pushes_held_total`.
 
 ## Which endpoints it calls
 
@@ -95,18 +100,100 @@ a UnifiedPush endpoint (Android app without Google Play services), the
 verification code, an optional free-form `accountLabel` (max 120 chars), and
 timestamps. No server URL, no mail content.
 
+Nothing else a client sends is kept. The endpoint is stored as the URL parser
+writes it and is refused (`400`) with a control character, tab or newline anywhere
+in it. The keys are base64 or base64url of exactly 65 and 16 bytes, with no other
+character. The label is printable text, the verification code 1 to 512 printable
+ASCII characters.
+
 The `accountLabel` is what the client sends, and Bulwark clients send the sign-in
 name. It is stored here and copied into every push: encrypted to the device for Web
 Push and UnifiedPush with keys, but readable to Google and Apple in FCM and APNs
 payloads, and to the distributor on a UnifiedPush endpoint without keys.
 
-Subscriptions with no push and no registration for 90 days are evicted.
+Subscriptions with no push and no registration for 90 days are evicted. One that
+never delivered a push and whose verification code no client picked up goes after
+7 days without a registration; a real device registers again on every page load
+and app start. Expired records go at every start and within the hour while the
+relay runs.
 
-The store is `subscriptions.json` in `PUSH_DATA_DIR`, written atomically, with the
-previous version as `subscriptions.json.bak`. A file that isn't valid is kept as
+The store is a snapshot, `subscriptions.json` in `PUSH_DATA_DIR`, and a journal
+next to it, `subscriptions.journal`, which takes one line per change, on disk
+before the change is answered. A request that changes nothing (the same
+verification code again, a push within a minute of the last) writes nothing. Once
+the journal is larger than the snapshot (and at least 1 MB), and when the relay
+stops, the journal is folded into a new snapshot. That one is written atomically,
+with the previous version kept as `subscriptions.json.bak`. A change that can't be
+written is answered `500`, is not kept, and counts in
+`relay_store_write_failures_total`. A snapshot that isn't valid is kept as
 `subscriptions.json.corrupt-<time>` and logged as an error, and the relay starts
 from the previous version. A file that can't be read at all (permissions, a bad
 mount) stops the relay at startup with an error, so it can't overwrite the store.
+A relay that starts on the `subscriptions.json` of an older relay takes every
+record from it.
+
+## Limits
+
+Registration needs no credential, so the relay bounds how many records it keeps
+and how fast one client address may add them. The defaults are far above what
+Bulwark clients send: a browser registers once per account and page load, an app
+once per account and start.
+
+| Var | Default | What happens at the limit |
+| --- | --- | --- |
+| `PUSH_MAX_SUBSCRIPTIONS` | `50000` | Records the store takes. A new `subscriptionId` past it gets `507 {"error":"Relay is full"}` and nothing is stored. An id that is there can always register again, be pushed to, polled and deleted. A warning is logged at most once a minute |
+| `PUSH_REGISTER_BURST` | `60` | Registrations one client address may make at once, on the four register routes together. Past it: `429` with `Retry-After` in seconds, and nothing is stored or changed |
+| `PUSH_REGISTER_REFILL_MS` | `2000` | Time until that address may make one more |
+| `TRUST_PROXY` | `0` | Number of proxies in front of the relay, see below |
+
+Which address a registration counts for:
+
+- With `TRUST_PROXY=0` the client address is the socket's.
+- With `TRUST_PROXY=1` it is the last entry of `X-Forwarded-For`, the one the proxy
+  appended; whatever the client wrote in front of it is ignored. With `2` it is the
+  second from the end, and so on. A request without the header counts by its socket.
+- A port after the address is ignored, and an IPv6 client counts by its /64. An entry
+  that is no address at all counts for one budget shared by all such entries.
+- When the address is a loopback or private one (the proxy's, with `TRUST_PROXY=0`
+  behind a proxy) the relay can't tell its clients apart, and one budget for all of
+  them would refuse real devices. Then only `PUSH_MAX_SUBSCRIPTIONS` applies, and the
+  relay logs once, as a warning, that `TRUST_PROXY` should be set.
+
+What the clients do with the answers: the webmail reports "Relay register failed:
+429" (or `507`) and tries again on the next page load, or when an open tab comes to
+the front 15 minutes later or more. The app reports "The push relay rejected the
+registration" and tries again at its next start. Neither retries at once, and a
+device that is registered already keeps getting its pushes. The mail server sees
+no change.
+
+## Behind a reverse proxy
+
+`docker-compose.yml` publishes the port on `127.0.0.1` for a proxy on the same
+host. Have the proxy send the client address and set `TRUST_PROXY=1`, and limit the
+register routes there as well, as the first line of defence. For nginx:
+
+```nginx
+# http block: per client address, 30 a minute, bursts of 60, like the relay's own limit
+limit_req_zone $binary_remote_addr zone=relay_register:10m rate=30r/m;
+
+server {
+    # ...
+    location /api/push/register {
+        limit_req zone=relay_register burst=60 nodelay;
+        # 429 like the relay: the iOS app reads a 503 as "this relay has no APNs"
+        limit_req_status 429;
+        proxy_pass http://127.0.0.1:3003;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+    location / {
+        proxy_pass http://127.0.0.1:3003;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+```
+
+The prefix also covers `DELETE /api/push/register/:id`, which a client sends once
+on logout.
 
 ## What it logs
 
@@ -137,7 +224,7 @@ docker compose up -d
 | --- | --- | --- |
 | `PORT` | `3003` | HTTP listen port |
 | `HOST` | `0.0.0.0` | |
-| `PUSH_DATA_DIR` | `./data` | Where `subscriptions.json` and the FCM key live |
+| `PUSH_DATA_DIR` | `./data` | Where the store (`subscriptions.json` and its journal) and the FCM key live |
 | `FCM_SERVICE_ACCOUNT_JSON` | unset | Either the full JSON inline or an absolute path; falls back to `$PUSH_DATA_DIR/fcm-service-account.json` |
 | `VAPID_PUBLIC_KEY` | unset | Base64url-encoded P-256 public key for Web Push. Generate with `npx web-push generate-vapid-keys` |
 | `VAPID_PRIVATE_KEY` | unset | Matching private key. Web Push is disabled if either VAPID var is missing |
@@ -147,9 +234,13 @@ docker compose up -d
 | `APNS_TOPIC` | `org.bulwarkmail.mobile` | Bundle id of the app |
 | `PUSH_ALLOW_PRIVATE_ENDPOINTS` | unset | Comma-separated hosts that may be called even though they aren't public, such as your own ntfy |
 | `PUSH_FORWARD_TIMEOUT_MS` | `8000` | How long one attempt at a push service may take, start to finish. Keep it below the mail server's own timeout (Stalwart: 10 s), or the same push goes out twice |
-| `PUSH_SUBSCRIPTION_BURST` | `10` | Pushes one Web Push or UnifiedPush subscription may get at once |
+| `PUSH_SUBSCRIPTION_BURST` | `10` | Pushes one subscription may get at once, any transport. Past it the mail server gets `429` |
 | `PUSH_SUBSCRIPTION_REFILL_MS` | `20000` | Time until one more is allowed |
-| `PUSH_HOST_THROTTLE_LIMIT` | `20` | Devices getting a `429` from one host within a minute before the whole host is left alone |
+| `PUSH_HOST_THROTTLE_LIMIT` | `20` | Devices that delivered before getting a `429` from one host within a minute before the whole host is left alone |
+| `PUSH_MAX_SUBSCRIPTIONS` | `50000` | Records the store takes; a new device past it gets `507`. See [Limits](#limits) |
+| `PUSH_REGISTER_BURST` | `60` | Registrations one client address may make at once; past it `429` with `Retry-After` |
+| `PUSH_REGISTER_REFILL_MS` | `2000` | Time until that address may make one more |
+| `TRUST_PROXY` | `0` | Proxies in front of the relay. With `1` the client address is the last entry of `X-Forwarded-For` |
 | `METRICS_TOKEN` | unset | Turns on `/metrics`. Prometheus sends it as a bearer token (`authorization: { credentials: <token> }` in the scrape config) |
 | `METRICS_TOKEN_FILE` | unset | Path to a file holding the token instead, read on every scrape |
 | `FCM_ORIGIN`, `APNS_ORIGIN` | the real services | Point every push at another server, for tests |

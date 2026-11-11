@@ -14,6 +14,16 @@ services:
       - NODE_ENV=production
       - PORT=3003
       - PUSH_DATA_DIR=/app/data
+      # Limits, defaults shown (README, "Limits"). Set them here or in .env.
+      # Records kept; a new device past it gets 507 "Relay is full".
+      # - PUSH_MAX_SUBSCRIPTIONS=50000
+      # Registrations per client address at once, then one per refill; past it 429 with Retry-After.
+      # - PUSH_REGISTER_BURST=60
+      # - PUSH_REGISTER_REFILL_MS=2000
+      # The port is published for a proxy on this host. Once it sends X-Forwarded-For,
+      # set this to 1; until then every client has the proxy's address and only
+      # PUSH_MAX_SUBSCRIPTIONS applies.
+      # - TRUST_PROXY=1
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:3003/api/health"]
       interval: 30s

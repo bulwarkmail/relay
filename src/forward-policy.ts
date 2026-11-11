@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { TokenBuckets } from './client-limit.js';
 import { pushServiceHost, type SendResult } from './forward-result.js';
 import type { EmailPush, StateChange, SubscriptionRecord } from './types.js';
 
@@ -70,17 +71,12 @@ const HOST_WINDOW_MS = 60_000;
 // However long one answer asks for: this stops every subscription on the service,
 // and the mail server gives up on a held push after two minutes.
 const MAX_HOST_HOLD_SECONDS = 120;
-const MAX_TRACKED_HOSTS = 1000;
-const MAX_TRACKED_SUBSCRIPTIONS = 100_000;
+// What has run out goes this often; nothing that is still running.
+const PRUNE_INTERVAL_MS = 60_000;
 
 export interface Hold {
   reason: 'rate-limit' | 'push-service-backoff' | 'push-service-throttle';
   retryAfterSeconds: number;
-}
-
-interface Bucket {
-  tokens: number;
-  updatedAt: number;
 }
 
 // The same host name can serve browsers and native apps (fcm.googleapis.com), under
@@ -89,11 +85,14 @@ export function hostThrottleKey(record: SubscriptionRecord, host: string): strin
   return `${record.kind}:${host}`;
 }
 
-// Who a 429 counts for: subscriptions on one endpoint are one device.
+// What a push service throttles: the endpoint, or the token. Subscriptions on one
+// are one device, and a fragment is no part of it (it never reaches the service).
 function deviceOf(record: SubscriptionRecord): string {
-  if (record.kind === 'web') return record.webPush.endpoint;
-  if (record.kind === 'up') return record.endpoint;
-  return record.kind === 'fcm' ? record.fcmToken : record.deviceToken;
+  if (record.kind === 'fcm') return `fcm:${record.fcmToken}`;
+  if (record.kind === 'apns') return `apns:${record.deviceToken}`;
+  const endpoint = record.kind === 'web' ? record.webPush.endpoint : record.endpoint;
+  const fragment = endpoint.indexOf('#');
+  return fragment === -1 ? endpoint : endpoint.slice(0, fragment);
 }
 
 export function parseRetryAfter(value: unknown, now = Date.now()): number | undefined {
@@ -105,86 +104,68 @@ export function parseRetryAfter(value: unknown, now = Date.now()): number | unde
 }
 
 class ForwardPolicy {
-  private buckets = new Map<string, Bucket>();
+  // Pushes per subscription id, for every transport.
+  private buckets = new TokenBuckets(
+    () => positiveEnv('PUSH_SUBSCRIPTION_BURST', 10),
+    () => positiveEnv('PUSH_SUBSCRIPTION_REFILL_MS', 20_000),
+  );
+  // By device: every id on an endpoint waits, and a new registration of the same
+  // endpoint doesn't end what the service asked for.
   private backoffs = new Map<string, number>();
   private hostThrottles = new Map<string, { devices: Set<string>; windowStart: number; until: number }>();
 
   /** Whether this push should stay here for now. Takes a token when it goes out. */
   hold(id: string, record: SubscriptionRecord, now = Date.now()): Hold | null {
-    const until = this.backoffs.get(id);
-    if (until !== undefined) {
-      if (until > now) {
-        return { reason: 'push-service-backoff', retryAfterSeconds: Math.ceil((until - now) / 1000) };
-      }
-      this.backoffs.delete(id);
+    const until = this.backoffs.get(deviceOf(record));
+    if (until !== undefined && until > now) {
+      return { reason: 'push-service-backoff', retryAfterSeconds: Math.ceil((until - now) / 1000) };
     }
     const host = this.hostThrottles.get(hostThrottleKey(record, pushServiceHost(record)));
     if (host && host.until > now) {
       return { reason: 'push-service-throttle', retryAfterSeconds: Math.ceil((host.until - now) / 1000) };
     }
-    // FCM and APNs have their own quotas and the native apps' silent sync to think
-    // about; these two are what production saw throttled.
-    if (record.kind !== 'web' && record.kind !== 'up') return null;
-    return this.takeToken(id, now);
-  }
-
-  private takeToken(id: string, now: number): Hold | null {
-    const burst = positiveEnv('PUSH_SUBSCRIPTION_BURST', 10);
-    const refillMs = positiveEnv('PUSH_SUBSCRIPTION_REFILL_MS', 20_000);
-    const bucket = this.buckets.get(id) ?? { tokens: burst, updatedAt: now };
-    const tokens = Math.min(burst, bucket.tokens + (now - bucket.updatedAt) / refillMs);
-    if (tokens < 1) {
-      this.buckets.set(id, { tokens, updatedAt: now });
-      return { reason: 'rate-limit', retryAfterSeconds: Math.ceil(((1 - tokens) * refillMs) / 1000) };
-    }
-    this.buckets.set(id, { tokens: tokens - 1, updatedAt: now });
-    return null;
+    const wait = this.buckets.take(id, now);
+    return wait === null ? null : { reason: 'rate-limit', retryAfterSeconds: wait };
   }
 
   /** Learns from the service's answer. */
-  note(id: string, record: SubscriptionRecord, result: SendResult, now = Date.now()): void {
+  note(record: SubscriptionRecord, result: SendResult, now = Date.now()): void {
     const throttled = result.status === 429;
     if (!throttled && result.retryAfterSeconds === undefined) return;
     const seconds = Math.min(result.retryAfterSeconds ?? DEFAULT_BACKOFF_SECONDS, MAX_BACKOFF_SECONDS);
-    this.backoffs.set(id, now + seconds * 1000);
-    if (!throttled) return;
+    const device = deviceOf(record);
+    this.backoffs.set(device, now + seconds * 1000);
+    // A record that never got a push through says nothing about the service's
+    // quota for everybody else, and anyone can make one.
+    if (!throttled || record.lastPushAt == null) return;
     const name = hostThrottleKey(record, pushServiceHost(record));
     const host = this.hostThrottles.get(name);
     const current = host && now - host.windowStart < HOST_WINDOW_MS
       ? host
       : { devices: new Set<string>(), windowStart: now, until: host?.until ?? 0 };
     const limit = positiveEnv('PUSH_HOST_THROTTLE_LIMIT', 20);
-    if (current.devices.size < limit) current.devices.add(deviceOf(record));
+    if (current.devices.size < limit) current.devices.add(device);
     if (current.devices.size >= limit) {
       current.until = now + Math.min(seconds, MAX_HOST_HOLD_SECONDS) * 1000;
     }
     this.hostThrottles.set(name, current);
-    this.prune(now);
   }
 
-  // Hosts are the caller's choice, and records go away without this hearing of it.
-  private prune(now: number): void {
-    if (this.hostThrottles.size > MAX_TRACKED_HOSTS) {
-      for (const [name, host] of this.hostThrottles) {
-        if (now - host.windowStart >= HOST_WINDOW_MS && host.until <= now) this.hostThrottles.delete(name);
-      }
+  // Hosts and endpoints are the caller's choice, and records go away without
+  // this hearing of it. Only what has run out goes.
+  prune(now = Date.now()): void {
+    for (const [name, host] of this.hostThrottles) {
+      if (now - host.windowStart >= HOST_WINDOW_MS && host.until <= now) this.hostThrottles.delete(name);
     }
-    if (this.backoffs.size > MAX_TRACKED_SUBSCRIPTIONS) {
-      for (const [id, until] of this.backoffs) if (until <= now) this.backoffs.delete(id);
-    }
-    if (this.buckets.size > MAX_TRACKED_SUBSCRIPTIONS) this.buckets.clear();
-  }
-
-  /** The record is gone or points somewhere new: what the old endpoint earned doesn't apply. */
-  forget(id: string): void {
-    this.backoffs.delete(id);
+    for (const [device, until] of this.backoffs) if (until <= now) this.backoffs.delete(device);
+    this.buckets.prune(now);
   }
 
   /** The record is gone for good. */
   remove(id: string): void {
-    this.backoffs.delete(id);
     this.buckets.delete(id);
   }
 }
 
 export const forwardPolicy = new ForwardPolicy();
+setInterval(() => forwardPolicy.prune(), PRUNE_INTERVAL_MS).unref();

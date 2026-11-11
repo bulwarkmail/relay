@@ -838,13 +838,20 @@ describe('sending politely', () => {
       // Others on that service are not affected by one subscription's 429.
       const { id: other } = await registerWeb('/polite-other', own);
       assert.equal((await postJson(own.base, `/api/push/jmap/${other}`, emailPush('a', ['e3']))).status, 200);
-      // A fresh registration is a fresh endpoint.
+      // Registering the same endpoint again doesn't end what the service asked for.
       service.answer('/polite-429', { status: 201 });
       await postJson(own.base, '/api/push/register/web', {
         subscriptionId: id,
         subscription: { endpoint: service.url('/polite-429'), keys: makeDevice().keys },
       });
-      assert.equal((await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e4']))).status, 200);
+      assert.equal((await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e4']))).status, 503);
+      assert.equal(service.to('/polite-429').length, 1, 'the push after the registration stayed here');
+      // A fresh endpoint is a fresh start.
+      await postJson(own.base, '/api/push/register/web', {
+        subscriptionId: id,
+        subscription: { endpoint: service.url('/polite-429-fresh'), keys: makeDevice().keys },
+      });
+      assert.equal((await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e5']))).status, 200);
     } finally {
       await own.stop();
     }
@@ -855,8 +862,10 @@ describe('sending politely', () => {
     try {
       for (let i = 0; i < 3; i++) {
         const pathname = `/polite-host-${i}`;
-        service.answer(pathname, { status: 429 });
         const { id } = await registerWeb(pathname, own);
+        // Devices that got a push through before: only their 429s speak for the service.
+        assert.equal((await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e0']))).status, 200);
+        service.answer(pathname, { status: 429 });
         assert.equal((await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']))).status, 503);
       }
       const { id } = await registerWeb('/polite-host-healthy', own);
@@ -1064,8 +1073,10 @@ describe('how far a throttle reaches', () => {
     try {
       for (let i = 0; i < 2; i++) {
         const pathname = `/reach-long-${i}`;
-        service.answer(pathname, { status: 429, headers: { 'retry-after': '3600' } });
         const { id } = await registerWeb(pathname, own);
+        // Devices that got a push through before: only their 429s speak for the service.
+        await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e0']));
+        service.answer(pathname, { status: 429, headers: { 'retry-after': '3600' } });
         await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
       }
       const { id } = await registerWeb('/reach-other', own);
