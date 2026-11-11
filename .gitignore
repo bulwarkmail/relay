@@ -3,4 +3,7 @@ dist
 .env
 .env.*
 *.log
-service-account*.json
+# The store and the keys: the README puts them all in data/.
+data/
+*.p8
+*service-account*.json
