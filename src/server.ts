@@ -164,20 +164,42 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
 }
 
 // Records the store takes. An id that is there can always register again; a new
-// one past the limit is refused until records expire or are deleted.
+// one past the limit takes the place of a record that may give way (see store.ts)
+// or is refused.
 const DEFAULT_MAX_SUBSCRIPTIONS = 50_000;
+// Records one client address may hold, where the relay can tell addresses apart:
+// far more than a household or an office has devices and accounts, far fewer than
+// the store takes.
+const DEFAULT_MAX_SUBSCRIPTIONS_PER_ADDRESS = 1_000;
 
-function maxSubscriptions(): number {
-  const value = Number(process.env.PUSH_MAX_SUBSCRIPTIONS);
-  return Number.isFinite(value) && value >= 1 ? Math.floor(value) : DEFAULT_MAX_SUBSCRIPTIONS;
+function countEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
 }
 
 let fullLoggedAt = 0;
+let addressFullLoggedAt = 0;
 
-/** Stores a registration, or answers 507 when the store is full. Says whether it stored. */
+/** Stores a registration, or answers 507 when there is no room for it. Says whether it stored. */
 async function store(req: http.IncomingMessage, res: http.ServerResponse, id: string, record: SubscriptionRecord): Promise<boolean> {
-  const limit = maxSubscriptions();
-  if (await subscriptionStore.put(id, record, { limit, address: clientKey(req) })) return true;
+  const limit = countEnv('PUSH_MAX_SUBSCRIPTIONS', DEFAULT_MAX_SUBSCRIPTIONS);
+  const perAddress = countEnv('PUSH_MAX_SUBSCRIPTIONS_PER_ADDRESS', DEFAULT_MAX_SUBSCRIPTIONS_PER_ADDRESS);
+  const result = await subscriptionStore.put(id, record, { limit, address: clientKey(req), perAddress });
+  if (result.stored) {
+    if (result.evicted) {
+      subscriptionsUnregistered.inc({ reason: 'evicted', transport: result.evicted.record.kind });
+      forwardPolicy.remove(result.evicted.id);
+    }
+    return true;
+  }
+  if (result.reason === 'address-full') {
+    if (Date.now() - addressFullLoggedAt > 60_000) {
+      addressFullLoggedAt = Date.now();
+      logger.warn('relay: a client address holds as many records as it may, its new devices are refused', { perAddress });
+    }
+    sendJson(res, 507, { error: 'Too many devices registered from this address' });
+    return false;
+  }
   if (Date.now() - fullLoggedAt > 60_000) {
     fullLoggedAt = Date.now();
     logger.warn('relay: the store is full, new devices are refused', { limit });

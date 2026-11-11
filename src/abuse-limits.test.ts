@@ -187,7 +187,127 @@ describe('how many records the store takes', () => {
       assert.equal(await known(relay, ids.unused), false, 'never delivered, no code collected, quiet for 8 days');
       for (const id of [ids.unusedRecent, ids.pushed, ids.collected]) assert.equal(await known(relay, id), true);
       assert.equal((await register(relay, newId(), '/limits')).status, 200, 'its place is free');
-      assert.equal((await register(relay, newId(), '/limits')).status, 507);
+      // The store is full now. The next device takes the place of the record that
+      // never delivered and was registered longest ago.
+      assert.equal((await register(relay, newId(), '/limits')).status, 200);
+      assert.equal(await known(relay, ids.collected), false);
+    } finally {
+      await relay.stop();
+    }
+  });
+});
+
+describe('who gives way when the store is full', () => {
+  const base = { kind: 'up', keys: null, verificationCode: null };
+
+  it('drops records that never delivered, registered longest ago first, and never one in its first minutes', async () => {
+    const now = Date.now();
+    const ids = { worked: newId(), older: newId(), old: newId() };
+    const dataDir = seedStore({
+      [ids.worked]: { ...base, endpoint: service.url('/give-worked'), createdAt: now - 60 * DAY, lastPushAt: now - DAY },
+      [ids.old]: { ...base, endpoint: service.url('/give-old'), createdAt: now - 2 * DAY, lastRegisteredAt: now - 60 * 60 * 1000, lastPushAt: null },
+      [ids.older]: { ...base, endpoint: service.url('/give-older'), createdAt: now - 2 * DAY, lastRegisteredAt: now - 2 * 60 * 60 * 1000, lastPushAt: null },
+    });
+    const relay = await startRelay({ dataDir, env: { PUSH_MAX_SUBSCRIPTIONS: '3', METRICS_TOKEN } });
+    try {
+      const first = newId();
+      assert.equal((await register(relay, first, '/give-new')).status, 200, 'a new device was refused while records that never worked were there');
+      assert.equal(await known(relay, ids.older), false);
+      assert.equal(await known(relay, ids.old), true);
+      assert.equal((await register(relay, newId(), '/give-new')).status, 200);
+      assert.equal(await known(relay, ids.old), false);
+      // Left: a record that delivered yesterday and two devices registered just now.
+      const refused = await postJson(relay.base, '/api/push/register/unifiedpush', { subscriptionId: newId(), endpoint: service.url('/give-new') });
+      assert.equal(refused.status, 507);
+      assert.deepEqual(refused.body, { error: 'Relay is full' });
+      assert.equal(await known(relay, ids.worked), true);
+      assert.equal(await known(relay, first), true);
+      const metrics = await (await fetch(`${relay.base}/metrics`, { headers: { authorization: `Bearer ${METRICS_TOKEN}` } })).text();
+      assert.match(metrics, /^relay_subscriptions_unregistered_total\{reason="evicted",transport="up"\} 2$/m);
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('then drops the record whose last push is the oldest, but none that delivered in the last 30 days', async () => {
+    const now = Date.now();
+    const ids = { recent: newId(), longAgo: newId(), lessLongAgo: newId() };
+    const dataDir = seedStore({
+      [ids.recent]: { ...base, endpoint: service.url('/give-recent'), createdAt: now - 90 * DAY, lastPushAt: now - 29 * DAY },
+      [ids.longAgo]: { ...base, endpoint: service.url('/give-long-ago'), createdAt: now - 90 * DAY, lastPushAt: now - 40 * DAY },
+      [ids.lessLongAgo]: { ...base, endpoint: service.url('/give-less-long-ago'), createdAt: now - 90 * DAY, lastPushAt: now - 35 * DAY, lastRegisteredAt: now - DAY },
+    });
+    const relay = await startRelay({ dataDir, env: { PUSH_MAX_SUBSCRIPTIONS: '3' } });
+    try {
+      assert.equal((await register(relay, newId(), '/give-new')).status, 200);
+      assert.equal(await known(relay, ids.longAgo), false);
+      // A registration since doesn't move a record forward: only a push does.
+      assert.equal((await register(relay, newId(), '/give-new')).status, 200);
+      assert.equal(await known(relay, ids.lessLongAgo), false);
+      assert.equal((await register(relay, newId(), '/give-new')).status, 507);
+      assert.equal(await known(relay, ids.recent), true);
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('moves a record that delivers to the back of the line', async () => {
+    const now = Date.now();
+    const ids = { quiet: newId(), pushedNow: newId() };
+    const dataDir = seedStore({
+      [ids.pushedNow]: { ...base, endpoint: service.url('/give-pushed-now'), createdAt: now - 90 * DAY, lastPushAt: now - 50 * DAY },
+      [ids.quiet]: { ...base, endpoint: service.url('/give-quiet'), createdAt: now - 90 * DAY, lastPushAt: now - 45 * DAY },
+    });
+    const relay = await startRelay({ dataDir, env: { PUSH_MAX_SUBSCRIPTIONS: '2' } });
+    try {
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${ids.pushedNow}`, emailPush('a', ['e1']))).status, 200);
+      assert.equal((await register(relay, newId(), '/give-new')).status, 200);
+      assert.equal(await known(relay, ids.quiet), false);
+      assert.equal(await known(relay, ids.pushedNow), true);
+    } finally {
+      await relay.stop();
+    }
+  });
+});
+
+describe('how many records one address may hold', () => {
+  it('refuses a new device from an address that holds its share, and nobody else', async () => {
+    const relay = await startRelay({ env: { TRUST_PROXY: '1', PUSH_MAX_SUBSCRIPTIONS_PER_ADDRESS: '3' } });
+    try {
+      const ids: string[] = [];
+      for (let i = 0; i < 3; i++) {
+        const id = newId();
+        ids.push(id);
+        assert.equal((await register(relay, id, '/address', '198.51.100.70')).status, 200);
+      }
+      const refused = await fetch(`${relay.base}/api/push/register/unifiedpush`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-forwarded-for': '198.51.100.70' },
+        body: JSON.stringify({ subscriptionId: newId(), endpoint: service.url('/address') }),
+      });
+      assert.equal(refused.status, 507);
+      assert.deepEqual(await refused.json(), { error: 'Too many devices registered from this address' });
+      // Its own devices register again, and other addresses are not touched.
+      assert.equal((await register(relay, ids[0], '/address-again', '198.51.100.70')).status, 200);
+      assert.equal((await register(relay, newId(), '/address', '198.51.100.71')).status, 200);
+      // A device that registers from elsewhere now counts there, and frees a place.
+      assert.equal((await register(relay, ids[1], '/address-moved', '198.51.100.72')).status, 200);
+      assert.equal((await register(relay, newId(), '/address', '198.51.100.70')).status, 200);
+      // A delete frees one too.
+      assert.equal((await getJson(relay.base, `/api/push/register/${ids[2]}`, 'DELETE')).status, 200);
+      assert.equal((await register(relay, newId(), '/address', '198.51.100.70')).status, 200);
+      assert.equal((await register(relay, newId(), '/address', '198.51.100.70')).status, 507);
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('has no share per address where the relay sits behind a proxy it was not told about', async () => {
+    const relay = await startRelay({ env: { PUSH_MAX_SUBSCRIPTIONS_PER_ADDRESS: '3' } });
+    try {
+      const statuses: number[] = [];
+      for (let i = 0; i < 6; i++) statuses.push((await register(relay, newId(), '/address-proxy')).status);
+      assert.deepEqual(statuses, Array(6).fill(200));
     } finally {
       await relay.stop();
     }

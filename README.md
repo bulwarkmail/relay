@@ -159,10 +159,25 @@ once per account and start.
 
 | Var | Default | What happens at the limit |
 | --- | --- | --- |
-| `PUSH_MAX_SUBSCRIPTIONS` | `50000` | Records the store takes. A new `subscriptionId` past it gets `507 {"error":"Relay is full"}` and nothing is stored. An id that is there can always register again, be pushed to, polled and deleted. A warning is logged at most once a minute |
+| `PUSH_MAX_SUBSCRIPTIONS` | `50000` | Records the store takes. A new `subscriptionId` past it takes the place of a record that gives way (below); when none may, it gets `507 {"error":"Relay is full"}` and nothing is stored. An id that is there can always register again, be pushed to, polled and deleted. A warning is logged at most once a minute |
+| `PUSH_MAX_SUBSCRIPTIONS_PER_ADDRESS` | `1000` | Records registered from one client address. A new `subscriptionId` from an address that holds as many gets `507 {"error":"Too many devices registered from this address"}`; its existing devices register again as before. Off where the relay can't tell addresses apart (below) |
 | `PUSH_REGISTER_BURST` | `60` | Registrations one client address may make at once, on the four register routes together. Past it: `429` with `Retry-After` in seconds, and nothing is stored or changed |
 | `PUSH_REGISTER_REFILL_MS` | `2000` | Time until that address may make one more |
 | `TRUST_PROXY` | `0` | Number of proxies in front of the relay, see below |
+
+Who gives way when the store is full: first a record that never delivered a push,
+the one registered longest ago, then the record whose last delivered push is the
+oldest. Never one registered in the last 10 minutes (a device in the middle of its
+setup) and never one that delivered a push in the last 30 days. A dropped device
+gets its record back the next time its client registers (every page load, every app
+start), and counts in `relay_subscriptions_unregistered_total{reason="evicted"}`. A
+push counts as delivered when the endpoint answered 2xx; the relay can't tell a
+real push service from an endpoint the registering client runs itself, so the
+limit per address is what bounds records kept alive that way.
+
+Which address records count for is the address of their last registration since
+the relay started; it is kept in memory only, never in the store, so after a
+restart a record counts for no address until its client registers again.
 
 Which address a registration counts for:
 
@@ -174,8 +189,9 @@ Which address a registration counts for:
   that is no address at all counts for one budget shared by all such entries.
 - When the address is a loopback or private one (the proxy's, with `TRUST_PROXY=0`
   behind a proxy) the relay can't tell its clients apart, and one budget for all of
-  them would refuse real devices. Then only `PUSH_MAX_SUBSCRIPTIONS` applies, and the
-  relay logs once, as a warning, that `TRUST_PROXY` should be set.
+  them would refuse real devices. Then neither the rate nor the count per address
+  applies, only `PUSH_MAX_SUBSCRIPTIONS`, and the relay logs once, as a warning,
+  that `TRUST_PROXY` should be set.
 
 What the clients do with the answers: the webmail reports "Relay register failed:
 429" (or `507`) and tries again on the next page load, or when an open tab comes to
@@ -279,7 +295,8 @@ older relay wrote.
 | `PUSH_SUBSCRIPTION_BURST` | `10` | Pushes one subscription may get at once, any transport. Past it the mail server gets `429` |
 | `PUSH_SUBSCRIPTION_REFILL_MS` | `20000` | Time until one more is allowed |
 | `PUSH_HOST_THROTTLE_LIMIT` | `20` | Devices that delivered before getting a `429` from one host within a minute before the whole host is left alone |
-| `PUSH_MAX_SUBSCRIPTIONS` | `50000` | Records the store takes; a new device past it gets `507`. See [Limits](#limits) |
+| `PUSH_MAX_SUBSCRIPTIONS` | `50000` | Records the store takes; a new device past it takes the place of one that never delivered, or gets `507`. See [Limits](#limits) |
+| `PUSH_MAX_SUBSCRIPTIONS_PER_ADDRESS` | `1000` | Records one client address may hold; a new device past it gets `507`. Off where addresses can't be told apart |
 | `PUSH_REGISTER_BURST` | `60` | Registrations one client address may make at once; past it `429` with `Retry-After` |
 | `PUSH_REGISTER_REFILL_MS` | `2000` | Time until that address may make one more |
 | `TRUST_PROXY` | `0` | Proxies in front of the relay. With `1` the client address is the last entry of `X-Forwarded-For` |

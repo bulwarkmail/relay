@@ -15,6 +15,13 @@ const TTL_MS = 90 * DAY_MS;
 const UNUSED_TTL_MS = 7 * DAY_MS;
 // Expired records leave memory and the disk this often, not only at a start.
 const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+// When the store is full a new device takes the place of a record that never
+// delivered a push (the one registered longest ago first), then of the record
+// whose last push is the oldest. Never of one registered in the last 10 minutes,
+// which may be a device in the middle of its setup, and never of one that
+// delivered a push in the last 30 days.
+const SETUP_GRACE_MS = 10 * 60 * 1000;
+const RECENTLY_WORKED_MS = 30 * DAY_MS;
 
 // The journal is folded into a new snapshot once it is larger than the snapshot,
 // and not before it holds this much: a change costs one append, and the snapshot
@@ -80,6 +87,12 @@ interface Snapshot {
   seq: number;
 }
 
+export type PutResult =
+  | { stored: true; evicted?: { id: string; record: SubscriptionRecord } }
+  | { stored: false; reason: 'full' | 'address-full' };
+
+const registeredAt = (record: SubscriptionRecord) => Math.max(record.createdAt, record.lastRegisteredAt ?? 0);
+
 class SubscriptionStore {
   private records = new Map<string, SubscriptionRecord>();
   private loaded = false;
@@ -99,6 +112,13 @@ class SubscriptionStore {
   // runs. Never written to disk: after a start a record has none until its
   // client registers again, which it does on every page load and app start.
   private origins = new Map<string, string>();
+  // Records per client address, from `origins`.
+  private perAddress = new Map<string, number>();
+  // Who gives way first when the store is full. Records that never delivered a
+  // push, in the order they were last registered, and records that did, in the
+  // order of their last push. Maps keep the order they were set in.
+  private neverDelivered = new Map<string, true>();
+  private delivered = new Map<string, true>();
 
   /** Once, whoever asks. Rejects when a store exists that can't be read: see readSnapshot. */
   load(): Promise<void> {
@@ -117,6 +137,9 @@ class SubscriptionStore {
     const journal = await this.readJournal();
     this.migrateLegacyRecords();
     this.evictExpired();
+    const byAge = [...this.records].sort(([, a], [, b]) =>
+      (a.lastPushAt ?? registeredAt(a)) - (b.lastPushAt ?? registeredAt(b)));
+    for (const [id, record] of byAge) this.order(id, record, true);
     this.loaded = true;
     // Starts the next journal from what is on disk now. Should that fail, the
     // journal stays, and the next start reads it again.
@@ -264,20 +287,39 @@ class SubscriptionStore {
 
   /**
    * Stores a record, registered from `address` (null when the relay can't tell).
-   * False, and nothing stored, when the id is new and the store already holds
-   * `limit` records: an id that is there can always be replaced. Rejects when it
+   * An id that is there can always be replaced. A new id is refused when its
+   * address already has `perAddress` records, and when the store holds `limit`
+   * records and none of them may give way (see SETUP_GRACE_MS); otherwise the
+   * one that gives way is deleted first and named in the result. Rejects when it
    * can't be written, and then keeps the one before.
    */
-  async put(id: string, record: SubscriptionRecord, options: { limit?: number; address?: string | null } = {}): Promise<boolean> {
+  async put(
+    id: string,
+    record: SubscriptionRecord,
+    options: { limit?: number; address?: string | null; perAddress?: number } = {},
+  ): Promise<PutResult> {
     await this.ensureLoaded();
-    return this.serial(async () => {
-      if (!this.records.has(id) && this.records.size >= (options.limit ?? Infinity)) return false;
+    return this.serial(async (): Promise<PutResult> => {
+      const address = options.address ?? null;
+      let evicted: { id: string; record: SubscriptionRecord } | undefined;
+      if (!this.records.has(id)) {
+        if (address && (this.perAddress.get(address) ?? 0) >= (options.perAddress ?? Infinity)) {
+          return { stored: false, reason: 'address-full' };
+        }
+        if (this.records.size >= (options.limit ?? Infinity)) {
+          const victim = this.givesWay(Date.now());
+          if (victim === null) return { stored: false, reason: 'full' };
+          evicted = { id: victim, record: this.records.get(victim)! };
+          await this.append(victim, null);
+          this.forget(victim);
+        }
+      }
       await this.append(id, record);
       this.records.set(id, record);
-      if (options.address) this.origins.set(id, options.address);
-      else this.origins.delete(id);
+      this.order(id, record, false);
+      this.setOrigin(id, address);
       await this.foldIfDue();
-      return true;
+      return evicted ? { stored: true, evicted } : { stored: true };
     });
   }
 
@@ -291,8 +333,7 @@ class SubscriptionStore {
     await this.serial(async () => {
       if (!this.records.has(id)) return;
       await this.append(id, null);
-      this.records.delete(id);
-      this.origins.delete(id);
+      this.forget(id);
       await this.foldIfDue();
     });
   }
@@ -314,7 +355,9 @@ class SubscriptionStore {
       const next = { ...expected };
       change(next);
       await this.append(id, next);
+      const pushed = next.lastPushAt !== expected.lastPushAt;
       Object.assign(expected, next);
+      if (pushed) this.order(id, expected, true);
       await this.foldIfDue();
     });
   }
@@ -330,8 +373,7 @@ class SubscriptionStore {
     return this.serial(async () => {
       if (this.records.get(id) !== expected) return false;
       await this.append(id, null);
-      this.records.delete(id);
-      this.origins.delete(id);
+      this.forget(id);
       await this.foldIfDue();
       return true;
     });
@@ -391,12 +433,63 @@ class SubscriptionStore {
       for (const [id, record] of this.records) if (this.isExpired(record, now)) expired.add(id);
       if (expired.size === 0) return 0;
       await this.fold(expired);
-      for (const id of expired) {
-        this.records.delete(id);
-        this.origins.delete(id);
-      }
+      for (const id of expired) this.forget(id);
       return expired.size;
     });
+  }
+
+  // A record's place in the order of who gives way first. A registration puts
+  // one that never delivered at the end; one that delivered moves only when it
+  // delivers again (`moved`), so its place says how long ago that was.
+  private order(id: string, record: SubscriptionRecord, moved: boolean): void {
+    if (record.lastPushAt == null) {
+      this.delivered.delete(id);
+      this.neverDelivered.delete(id);
+      this.neverDelivered.set(id, true);
+    } else {
+      this.neverDelivered.delete(id);
+      if (moved) this.delivered.delete(id);
+      this.delivered.set(id, true);
+    }
+  }
+
+  private setOrigin(id: string, address: string | null): void {
+    const before = this.origins.get(id) ?? null;
+    if (before === address) return;
+    if (before) {
+      const count = (this.perAddress.get(before) ?? 1) - 1;
+      if (count > 0) this.perAddress.set(before, count);
+      else this.perAddress.delete(before);
+    }
+    if (address) {
+      this.origins.set(id, address);
+      this.perAddress.set(address, (this.perAddress.get(address) ?? 0) + 1);
+    } else {
+      this.origins.delete(id);
+    }
+  }
+
+  private forget(id: string): void {
+    this.records.delete(id);
+    this.neverDelivered.delete(id);
+    this.delivered.delete(id);
+    this.setOrigin(id, null);
+  }
+
+  // The record a new device takes the place of in a full store, or null: see
+  // SETUP_GRACE_MS. The first of each order is the only candidate there.
+  private givesWay(now: number): string | null {
+    const first = this.neverDelivered.keys().next();
+    if (!first.done) {
+      const record = this.records.get(first.value);
+      if (record && now - registeredAt(record) > SETUP_GRACE_MS) return first.value;
+    }
+    const oldest = this.delivered.keys().next();
+    if (!oldest.done) {
+      const record = this.records.get(oldest.value);
+      if (record?.lastPushAt != null && now - record.lastPushAt > RECENTLY_WORKED_MS) return oldest.value;
+    }
+    return null;
   }
 
   // Records written before the FCM/Web Push split only had `fcmToken`. Stamp
