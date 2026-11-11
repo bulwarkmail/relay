@@ -6,6 +6,14 @@ services:
     restart: unless-stopped
     ports:
       - 127.0.0.1:3003:3003
+    # Writable: the data volume and /tmp, nothing else.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     volumes:
       - ./data:/app/data
     env_file:
@@ -30,6 +38,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+    # bulwark: the network Prometheus scrapes /metrics through (README, "Run in Docker").
     networks:
       - default
       - bulwark

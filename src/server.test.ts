@@ -62,13 +62,19 @@ async function registerWeb(pathname: string, target: RunningRelay = relay, label
 }
 
 describe('GET /api/health and /metrics', () => {
-  it('reports the number of subscriptions', async () => {
-    const before = (await getJson(relay.base, '/api/health')).body.subscriptions;
-    await registerWeb('/health');
-    const res = await getJson(relay.base, '/api/health');
-    assert.equal(res.status, 200);
-    assert.equal(res.body.ok, true);
-    assert.equal(res.body.subscriptions, before + 1);
+  it('reports the number of subscriptions to the metrics token, and only that the relay is up to anyone', async () => {
+    const own = await startRelay({ env: { METRICS_TOKEN } });
+    try {
+      const count = async () => Number(/^relay_subscriptions_active\{transport="web"\} (\d+)$/m.exec(await (await scrape(own)).text())?.[1]);
+      const before = await count();
+      await registerWeb('/health', own);
+      assert.equal(await count(), before + 1);
+      const res = await getJson(own.base, '/api/health');
+      assert.equal(res.status, 200);
+      assert.deepEqual(res.body, { ok: true });
+    } finally {
+      await own.stop();
+    }
   });
 
   it('has no /metrics without a token', async () => {
@@ -1300,7 +1306,8 @@ describe('the store on disk', () => {
     try {
       const records = storedRecords(own.dataDir);
       assert.ok(ids.every((id) => id in records));
-      assert.equal((await getJson(again.base, '/api/health')).body.subscriptions, 60);
+      assert.equal(Object.keys(records).length, 60);
+      for (const id of ids) assert.equal((await getJson(again.base, `/api/push/active/${id}`)).status, 200);
     } finally {
       await again.stop();
     }
@@ -1331,7 +1338,9 @@ describe('starting up', () => {
         subscription: { endpoint: service.url('/first-load'), keys: device.keys },
       })));
       assert.ok(answers.every((res) => res.status === 200));
-      assert.equal((await getJson(own.base, '/api/health')).body.subscriptions, 41);
+      // The seeded record is still there, next to the forty new ones.
+      assert.equal((await getJson(own.base, `/api/push/active/${seeded}`)).status, 200);
+      assert.equal(Object.keys(storedRecords(own.dataDir)).length, 41);
     } finally {
       await own.stop();
     }

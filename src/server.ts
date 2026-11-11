@@ -724,9 +724,9 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       return;
     }
 
+    // Up or not, nothing more: how many records there are is in /metrics.
     if (method === 'GET' && path === '/api/health') {
-      const count = await subscriptionStore.size();
-      return sendJson(res, 200, { ok: true, subscriptions: count });
+      return sendJson(res, 200, { ok: true });
     }
 
     if (method === 'GET' && (path === '/' || path === '/index.html')) {

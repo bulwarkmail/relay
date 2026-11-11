@@ -34,7 +34,7 @@ label a client registered with, and timing.
 | `GET` | `/api/push/active/:id` | Liveness probe. `{ active: true }` once the subscription has forwarded a push or its client picked up the verification code, and for 10 minutes after registering. `404` if unknown. Clients use it to reap dead leftover subscriptions without touching live ones |
 | `POST` | `/api/push/jmap/:id` | JMAP server posts `PushVerification`, `StateChange` or `EmailPush` (draft-ietf-jmap-emailpush) here, and the relay dispatches to the transport of the stored record. For `EmailPush` only the message ids are forwarded, never any other property the server included |
 | `GET` | `/api/push/vapid-public-key` | Returns the relay's VAPID public key so browsers can subscribe |
-| `GET` | `/api/health` | Liveness probe |
+| `GET` | `/api/health` | Liveness probe. Answers `{ ok: true }` and nothing else; how many records there are is in `/metrics` |
 | `GET` | `/metrics` | Prometheus metrics, off by default. With `METRICS_TOKEN` set it wants `Authorization: Bearer <token>` and answers `401` without it; unset, it answers `404` |
 
 Every register route answers `503` when the relay has no credentials for that
@@ -217,6 +217,17 @@ mkdir -p data
 cp path/to/fcm-service-account.json data/
 docker compose up -d
 ```
+
+The container runs read-only, without capabilities and with `no-new-privileges`:
+the relay can write the data volume and `/tmp`, nothing else, and its own code
+belongs to root. The data directory on the host has to be writable for the
+container's `relay` user.
+
+It joins the external `bulwark` network, through which Prometheus scrapes
+`/metrics`. Every container on that network reaches port 3003 directly, without
+the reverse proxy and its limits; requests from there come from a private address
+and get no limit per client address (see [Limits](#limits)). Keep only trusted
+containers on it.
 
 ## Environment
 
