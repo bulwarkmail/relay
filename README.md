@@ -110,10 +110,13 @@ verification code, an optional free-form `accountLabel` (max 120 chars), and
 timestamps. No server URL, no mail content.
 
 Nothing else a client sends is kept. The endpoint is stored as the URL parser
-writes it and is refused (`400`) with a control character, tab or newline anywhere
-in it. The keys are base64 or base64url of exactly 65 and 16 bytes, with no other
-character. The label is printable text, the verification code 1 to 512 printable
-ASCII characters.
+writes it, up to 2,048 characters, and is refused (`400`) with a control
+character, tab or newline anywhere in it. The keys are base64 or base64url of
+exactly 65 and 16 bytes, with no other character. An FCM token is 64 to 1,024
+characters (Firebase hands out about 160), an APNs token 64 to 200 hex digits. The
+label is printable text, the verification code 1 to 512 printable ASCII
+characters. A record takes at most 4 KB as JSON, a registration at most 3 KB of it;
+real ones take a few hundred bytes.
 
 The `accountLabel` is what the client sends, and Bulwark clients send the sign-in
 name. It is stored here and copied into every push: encrypted to the device for Web
@@ -178,6 +181,15 @@ limit per address is what bounds records kept alive that way.
 Which address records count for is the address of their last registration since
 the relay started; it is kept in memory only, never in the store, so after a
 restart a record counts for no address until its client registers again.
+
+How large the store can get: 50,000 records of the largest kind the relay takes
+(every field at its limit) are 189 MB on disk, and a start reads them with a peak
+of 190 MB of heap, since the snapshot is read a line at a time (measured with Node
+22 on Linux; the relay starts on such a store with `--max-old-space-size=256`). Real
+records are a few hundred bytes, so a full store of real devices is a tenth of
+that. Give the container memory for the store and Node besides; a
+`subscriptions.json` written by an older relay is read whole once, which takes
+about four times its size.
 
 Which address a registration counts for:
 

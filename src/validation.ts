@@ -9,11 +9,13 @@ export function isValidSubscriptionId(id: unknown): id is string {
   return typeof id === 'string' && /^[A-Za-z0-9_-]{8,128}$/.test(id) && !RESERVED_IDS.has(id);
 }
 
+// FCM registration tokens are an instance id, a colon and about 140 more
+// characters, some 160 in all; this leaves six times that.
 export function isValidFcmToken(value: unknown): value is string {
   return (
     typeof value === 'string' &&
     value.length >= 64 &&
-    value.length <= 4096 &&
+    value.length <= 1024 &&
     /^[A-Za-z0-9:_-]+$/.test(value)
   );
 }

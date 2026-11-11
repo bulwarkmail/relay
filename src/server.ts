@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { URL } from 'node:url';
 import { logger } from './logger.js';
-import { subscriptionStore } from './store.js';
+import { MAX_REGISTRATION_BYTES, recordBytes, subscriptionStore } from './store.js';
 import { isFcmConfigured, sendFcmPush } from './fcm.js';
 import { getApnsConfig, sendApnsPush } from './apns.js';
 import { getVapidPublicKey, sendWebPush } from './webpush.js';
@@ -182,6 +182,12 @@ let addressFullLoggedAt = 0;
 
 /** Stores a registration, or answers 507 when there is no room for it. Says whether it stored. */
 async function store(req: http.IncomingMessage, res: http.ServerResponse, id: string, record: SubscriptionRecord): Promise<boolean> {
+  // Every field has a limit of its own, which keeps a registration under this;
+  // the store holds no record larger than MAX_RECORD_BYTES whatever comes in.
+  if (recordBytes(record) > MAX_REGISTRATION_BYTES) {
+    sendJson(res, 400, { error: 'Registration too large' });
+    return false;
+  }
   const limit = countEnv('PUSH_MAX_SUBSCRIPTIONS', DEFAULT_MAX_SUBSCRIPTIONS);
   const perAddress = countEnv('PUSH_MAX_SUBSCRIPTIONS_PER_ADDRESS', DEFAULT_MAX_SUBSCRIPTIONS_PER_ADDRESS);
   const result = await subscriptionStore.put(id, record, { limit, address: clientKey(req), perAddress });

@@ -1,5 +1,7 @@
+import { createReadStream } from 'node:fs';
 import { readFile, open, mkdir, rename, unlink, chmod, readdir, stat, truncate } from 'node:fs/promises';
 import path from 'node:path';
+import { createInterface } from 'node:readline';
 import { logger } from './logger.js';
 import { storeWriteFailures } from './metrics.js';
 import type { SubscriptionRecord } from './types.js';
@@ -32,6 +34,13 @@ const MIN_FOLD_BYTES = 1024 * 1024;
 const FOLD_RETRY_MS = 60 * 1000;
 // Records per write while a snapshot goes to disk, so no string holds the whole store.
 const SNAPSHOT_BATCH = 500;
+// The most one record may take, as JSON. A registration with every field at its
+// limit takes under 3 KB (an endpoint of 2,048 characters is most of it), and a
+// verification code at its limit up to 1 KB more. Real ones take a few hundred
+// bytes. With the record limit this bounds the store: see the README, "Limits".
+export const MAX_RECORD_BYTES = 4096;
+// What a registration may take, so that a verification code still fits.
+export const MAX_REGISTRATION_BYTES = 3072;
 
 // The store holds every device's endpoint, keys and token: the relay's own user
 // alone may read it. File modes mean nothing on Windows.
@@ -43,8 +52,9 @@ function getPushDir(): string {
   return process.env.PUSH_DATA_DIR || path.join(process.cwd(), 'data');
 }
 
-// {"seq":<last change it holds>,"records":{...}}. An older relay reads the
-// records and ignores the number; one it writes has none, which counts as 0.
+// {"seq":<last change it holds>,"records":{...}}, one record per line, so that
+// a start reads it a line at a time. An older relay reads the records and ignores
+// the number; one it writes has none, which counts as 0, and is read whole.
 function subscriptionsPath(): string {
   return path.join(getPushDir(), 'subscriptions.json');
 }
@@ -66,6 +76,29 @@ function message(error: unknown): string {
 }
 
 const isSeq = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+
+/** Bytes of a record as the store writes it. */
+export function recordBytes(record: SubscriptionRecord): number {
+  return Buffer.byteLength(JSON.stringify(record));
+}
+
+const isReadError = (error: unknown) => typeof (error as NodeJS.ErrnoException | null)?.code === 'string';
+
+/** The lines of a file, one at a time. A file that can't be read throws; a missing one says null. */
+async function fileLines(file: string): Promise<{ lines: AsyncIterable<string>; size: number; close(): void } | null> {
+  let size: number;
+  try {
+    const info = await stat(file);
+    if (!info.isFile()) throw Object.assign(new Error(`${path.basename(file)} is not a file`), { code: 'EISDIR' });
+    size = info.size;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  const input = createReadStream(file, 'utf-8');
+  const lines = createInterface({ input, crlfDelay: Infinity });
+  return { lines, size, close: () => { lines.close(); input.destroy(); } };
+}
 
 // After a rename or a new file the directory itself goes to disk too, or a power
 // cut could lose the file. Windows can't sync a directory; nothing to do there.
@@ -149,26 +182,19 @@ class SubscriptionStore {
 
   // Null when the file is missing or unusable. An unusable file is moved aside,
   // not left for the next write to replace: it may be every device's only
-  // record, and one register call would otherwise wipe it.
+  // record, and one register call would otherwise wipe it. Unreadable, not
+  // missing (permissions, a bad mount): starting empty would replace every
+  // device's record with the next write, so this stops the start.
   private async readSnapshot(file: string): Promise<Snapshot | null> {
-    let raw: string;
     try {
-      raw = await readFile(file, 'utf-8');
+      const snapshot = (await this.readSnapshotLines(file)) ?? (await this.readSnapshotWhole(file));
+      if (snapshot) this.snapshotBytes = (await stat(file)).size;
+      return snapshot;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-      // Unreadable, not missing: permissions, a bad mount. Starting empty would
-      // replace every device's record with the next write, so this stops here.
-      logger.error('store: failed to read subscriptions', { file: path.basename(file), error: message(error) });
-      throw error;
-    }
-    try {
-      const parsed = JSON.parse(raw) as SubscriptionsFile;
-      if (!parsed || typeof parsed.records !== 'object' || parsed.records === null) {
-        throw new Error('no records in the file');
+      if (isReadError(error)) {
+        logger.error('store: failed to read subscriptions', { file: path.basename(file), error: message(error) });
+        throw error;
       }
-      this.snapshotBytes = Buffer.byteLength(raw);
-      return { records: parsed.records, seq: isSeq(parsed.seq) ? parsed.seq : 0 };
-    } catch (error) {
       const aside = `${file}.corrupt-${Date.now()}`;
       await rename(file, aside).catch(() => undefined);
       if (POSIX) await chmod(aside, PRIVATE_FILE).catch(() => undefined);
@@ -179,6 +205,54 @@ class SubscriptionStore {
       });
       return null;
     }
+  }
+
+  // A snapshot this relay wrote, a line at a time, so that loading needs no
+  // more memory than the records themselves. Null for a file in another form
+  // (an older relay's), which readSnapshotWhole reads.
+  private async readSnapshotLines(file: string): Promise<Snapshot | null | undefined> {
+    const reader = await fileLines(file);
+    if (!reader) return undefined;
+    const records: Record<string, SubscriptionRecord> = Object.create(null);
+    let seq: number | null = null;
+    let ended = false;
+    try {
+      for await (const line of reader.lines) {
+        if (seq === null) {
+          const head = /^\{"seq":(\d+),"records":\{$/.exec(line);
+          if (!head) return null;
+          seq = Number(head[1]);
+        } else if (ended) {
+          if (line) throw new SyntaxError('text after the end of the records');
+        } else if (line === '}}') {
+          ended = true;
+        } else {
+          const entry = JSON.parse(`{${line.startsWith(',') ? line.slice(1) : line}}`) as Record<string, SubscriptionRecord>;
+          for (const [id, record] of Object.entries(entry)) records[id] = record;
+        }
+      }
+    } finally {
+      reader.close();
+    }
+    if (seq === null) return null;
+    if (!ended) throw new SyntaxError('the records end early');
+    return { records, seq };
+  }
+
+  // A snapshot in any other form, read whole: what an older relay wrote.
+  private async readSnapshotWhole(file: string): Promise<Snapshot | null> {
+    let raw: string;
+    try {
+      raw = await readFile(file, 'utf-8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+    const parsed = JSON.parse(raw) as SubscriptionsFile;
+    if (!parsed || typeof parsed.records !== 'object' || parsed.records === null) {
+      throw new SyntaxError('no records in the file');
+    }
+    return { records: parsed.records, seq: isSeq(parsed.seq) ? parsed.seq : 0 };
   }
 
   // Creates the data directory for the relay's user alone, and narrows the
@@ -215,40 +289,60 @@ class SubscriptionStore {
    * unread: its changes don't follow from what is in memory.
    */
   private async readJournal(): Promise<boolean> {
-    let raw: string;
+    let reader: Awaited<ReturnType<typeof fileLines>>;
+    let from: number | null = null;
+    let skipped = 0;
+    let changes = 0;
+    let stale = false;
     try {
-      raw = await readFile(journalPath(), 'utf-8');
+      reader = await fileLines(journalPath());
+      if (!reader) return false;
+      try {
+        // A line at a time: the journal can be as large as the snapshot.
+        for await (const line of reader.lines) {
+          if (!line) continue;
+          let entry: { from?: unknown; seq?: unknown; id?: unknown; record?: unknown };
+          try {
+            entry = JSON.parse(line);
+            if (from === null && isSeq(entry.from)) {
+              from = entry.from;
+              if (from > this.snapshotSeq) {
+                stale = true;
+                break;
+              }
+              continue;
+            }
+            if (!isSeq(entry.seq) || typeof entry.id !== 'string' || entry.id === '__proto__') throw new Error('no change');
+            if (entry.record !== null && (!entry.record || typeof entry.record !== 'object')) throw new Error('no record');
+          } catch {
+            // A crash in the middle of an append, which was never answered.
+            skipped++;
+            continue;
+          }
+          if (from === null) {
+            stale = true;
+            break;
+          }
+          changes++;
+          if (entry.seq <= this.seq) continue;
+          if (entry.record === null) this.records.delete(entry.id);
+          else this.records.set(entry.id, entry.record as SubscriptionRecord);
+          this.seq = entry.seq;
+        }
+      } finally {
+        reader.close();
+      }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
       logger.error('store: failed to read the journal', { error: message(error) });
       throw error;
     }
-    let from: number | null = null;
-    let skipped = 0;
-    const changes: Array<{ seq: number; id: string; record: SubscriptionRecord | null }> = [];
-    for (const line of raw.split('\n')) {
-      if (!line) continue;
-      try {
-        const entry = JSON.parse(line) as { from?: unknown; seq?: unknown; id?: unknown; record?: unknown };
-        if (from === null && isSeq(entry.from)) {
-          from = entry.from;
-          continue;
-        }
-        if (!isSeq(entry.seq) || typeof entry.id !== 'string' || entry.id === '__proto__') throw new Error('no change');
-        if (entry.record !== null && (!entry.record || typeof entry.record !== 'object')) throw new Error('no record');
-        changes.push({ seq: entry.seq, id: entry.id, record: entry.record as SubscriptionRecord | null });
-      } catch {
-        // A crash in the middle of an append, which was never answered.
-        skipped++;
-      }
-    }
     if (skipped > 0) logger.warn('store: skipped journal lines that could not be read', { count: skipped });
-    if (changes.length === 0 && from === null) {
+    if (!stale && changes === 0 && from === null) {
       // Empty: an append that failed before its first byte stuck.
       this.journalBytes = 0;
       return false;
     }
-    if (from === null || from > this.snapshotSeq) {
+    if (stale) {
       const aside = `${journalPath()}.stale-${Date.now()}`;
       await rename(journalPath(), aside);
       if (POSIX) await chmod(aside, PRIVATE_FILE).catch(() => undefined);
@@ -260,13 +354,7 @@ class SubscriptionStore {
       this.journalBytes = 0;
       return false;
     }
-    for (const change of changes) {
-      if (change.seq <= this.seq) continue;
-      if (change.record === null) this.records.delete(change.id);
-      else this.records.set(change.id, change.record);
-      this.seq = change.seq;
-    }
-    this.journalBytes = Buffer.byteLength(raw);
+    this.journalBytes = reader.size;
     return true;
   }
 
@@ -514,6 +602,7 @@ class SubscriptionStore {
   // the snapshot it continues.
   private async append(id: string, record: SubscriptionRecord | null): Promise<void> {
     if (this.closed) throw new Error('the store is closed');
+    if (record && recordBytes(record) > MAX_RECORD_BYTES) throw new Error('the record is larger than a record may be');
     const seq = this.seq + 1;
     const header = this.journalBytes === 0 ? `\n${JSON.stringify({ from: this.snapshotSeq })}` : '';
     const line = `${header}\n${JSON.stringify({ seq, id, record })}`;
@@ -569,7 +658,7 @@ class SubscriptionStore {
         let count = 0;
         for (const [id, record] of this.records) {
           if (leaveOut?.has(id)) continue;
-          chunk += `${count === 0 ? '' : ','}${JSON.stringify(id)}:${JSON.stringify(record)}`;
+          chunk += `\n${count === 0 ? '' : ','}${JSON.stringify(id)}:${JSON.stringify(record)}`;
           count++;
           if (count % SNAPSHOT_BATCH === 0) {
             await handle.writeFile(chunk, 'utf-8');
@@ -577,7 +666,7 @@ class SubscriptionStore {
             chunk = '';
           }
         }
-        chunk += '}}';
+        chunk += '\n}}';
         await handle.writeFile(chunk, 'utf-8');
         bytes += Buffer.byteLength(chunk);
         await handle.sync();
