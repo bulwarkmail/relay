@@ -198,6 +198,8 @@ export async function startRelay(options: { env?: Record<string, string>; dataDi
         // Metrics stay off unless a test turns them on.
         METRICS_TOKEN: '',
         METRICS_TOKEN_FILE: '',
+        // No test meets the limit per client address unless it sets one.
+        PUSH_REGISTER_BURST: '1000',
         ...vapid,
         ...options.env,
       },

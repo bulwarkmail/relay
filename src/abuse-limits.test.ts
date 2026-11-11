@@ -191,6 +191,113 @@ describe('how many records the store takes', () => {
   });
 });
 
+describe('how fast one address may register', () => {
+  it('holds a burst from one client address back with 429 and Retry-After, and leaves other addresses alone', async () => {
+    const relay = await startRelay({ env: { TRUST_PROXY: '1', PUSH_REGISTER_BURST: '5', PUSH_REGISTER_REFILL_MS: '60000' } });
+    try {
+      const statuses: number[] = [];
+      const ids: string[] = [];
+      let retryAfter: string | null = null;
+      for (let i = 0; i < 8; i++) {
+        const id = newId();
+        ids.push(id);
+        const res = await register(relay, id, '/limits', '203.0.113.7');
+        statuses.push(res.status);
+        if (res.status === 429) retryAfter = res.retryAfter;
+      }
+      assert.deepEqual(statuses, [200, 200, 200, 200, 200, 429, 429, 429]);
+      assert.ok(Number(retryAfter) >= 1, `Retry-After was ${retryAfter}`);
+      assert.equal(await known(relay, ids[4]), true);
+      assert.equal(await known(relay, ids[5]), false, 'a registration answered 429 left a record');
+      // The proxy appends the address it saw. What the client wrote in front of it does not count.
+      for (const forged of ['198.51.100.1, 203.0.113.7', '10.0.0.1,203.0.113.7', 'unknown, 198.51.100.9 , 203.0.113.7']) {
+        assert.equal((await register(relay, newId(), '/limits', forged)).status, 429, `X-Forwarded-For "${forged}" got a budget of its own`);
+      }
+      // Somebody else, through the same proxy, at the same moment.
+      assert.equal((await register(relay, newId(), '/limits', '203.0.113.8')).status, 200);
+      assert.equal((await register(relay, newId(), '/limits', '198.51.100.1, 203.0.113.9')).status, 200);
+      // A device that is held back is not told its record is gone: an id that exists still answers.
+      assert.equal(await known(relay, ids[0]), true);
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('does not lump every client together when it sits behind a proxy it was not told about', async () => {
+    // No TRUST_PROXY, and the peer is 127.0.0.1: that is a proxy, or a local caller. All of the
+    // relay's users would share one budget, so there is no per-address limit here. The record
+    // limit still holds.
+    const relay = await startRelay({ env: { PUSH_REGISTER_BURST: '5', PUSH_REGISTER_REFILL_MS: '60000', PUSH_MAX_SUBSCRIPTIONS: '12' } });
+    try {
+      const statuses: number[] = [];
+      for (let i = 0; i < 12; i++) statuses.push((await register(relay, newId(), '/limits', i % 2 ? `203.0.113.${i}` : undefined)).status);
+      assert.deepEqual(statuses, Array(12).fill(200), 'real devices behind the proxy were refused');
+      assert.equal((await register(relay, newId(), '/limits')).status, 507);
+      // The operator hears about it once.
+      assert.equal(relay.logs().split('set TRUST_PROXY').length - 1, 1, relay.logs());
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('falls back to the socket when the proxy sent no X-Forwarded-For', async () => {
+    const relay = await startRelay({ env: { TRUST_PROXY: '1', PUSH_REGISTER_BURST: '2', PUSH_REGISTER_REFILL_MS: '60000' } });
+    try {
+      // The socket is 127.0.0.1, a proxy's address: no budget for all of its clients together.
+      const statuses: number[] = [];
+      for (let i = 0; i < 6; i++) statuses.push((await register(relay, newId(), '/limits')).status);
+      assert.deepEqual(statuses, Array(6).fill(200));
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('spends the budget on an id registered over and over, and leaves the record of a refused one as it was', async () => {
+    const relay = await startRelay({ env: { TRUST_PROXY: '1', PUSH_REGISTER_BURST: '2', PUSH_REGISTER_REFILL_MS: '60000' } });
+    try {
+      const id = newId();
+      assert.equal((await register(relay, id, '/kept', '198.51.100.20')).status, 200);
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${id}`, pushVerification('kept-code'))).status, 200);
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']))).status, 200);
+      const before = storedRecords(relay.dataDir)[id];
+      assert.ok(before.lastPushAt);
+      assert.equal((await register(relay, id, '/kept', '198.51.100.20')).status, 200);
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${id}`, pushVerification('kept-code'))).status, 200);
+      const settledBefore = storedRecords(relay.dataDir)[id];
+      const refused = await register(relay, id, '/moved', '198.51.100.20');
+      assert.equal(refused.status, 429, 'the third registration of one id was free');
+      assert.deepEqual(storedRecords(relay.dataDir)[id], settledBefore, 'a refused registration changed the record');
+      assert.equal(settledBefore.endpoint, service.url('/kept'));
+      assert.equal(settledBefore.lastPushAt, before.lastPushAt);
+      assert.deepEqual((await getJson(relay.base, `/api/push/verify/${id}`)).body, { verificationCode: 'kept-code' });
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('gives no address an unlimited budget, whatever the header looks like', async () => {
+    const relay = await startRelay({ env: { TRUST_PROXY: '1', PUSH_REGISTER_BURST: '2', PUSH_REGISTER_REFILL_MS: '60000' } });
+    try {
+      const run = async (headers: string[]) => {
+        const statuses: number[] = [];
+        for (const header of headers) statuses.push((await register(relay, newId(), '/limits', header)).status);
+        return statuses;
+      };
+      // One IPv6 client holds a /64: every address in it, and the same with brackets and a port, is one budget.
+      assert.deepEqual(await run(['2001:db8:1:2::5', '2001:db8:1:2:aaaa::6', '[2001:db8:1:2::7]:4711']), [200, 200, 429]);
+      assert.deepEqual(await run(['2001:db8:1:3::5']), [200], 'the next /64 is somebody else');
+      // A port behind the address is the same address.
+      assert.deepEqual(await run(['203.0.113.50', '203.0.113.50:4711', '203.0.113.50:4712']), [200, 200, 429]);
+      // An IPv4 address written as IPv6 is that address.
+      assert.deepEqual(await run(['::ffff:203.0.113.60', '203.0.113.60', '::ffff:203.0.113.60']), [200, 200, 429]);
+      // An entry that is no address at all: all of them share one budget.
+      assert.deepEqual(await run(['', 'garbage', 'unknown', ' , ']), [200, 200, 429, 429]);
+    } finally {
+      await relay.stop();
+    }
+  });
+});
+
 describe('what one registration may put into the store', () => {
   it('refuses an endpoint or keys padded with characters no client sends', async () => {
     const relay = await startRelay({ env: { PUSH_REGISTER_BURST: '1000' } });

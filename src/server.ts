@@ -8,6 +8,7 @@ import { getVapidPublicKey, sendWebPush } from './webpush.js';
 import { sendUnifiedPush } from './unifiedpush.js';
 import { isForwardableBody, toForwardPayload } from './payload.js';
 import { deliveryOptions, forwardPolicy, type DeliveryOptions } from './forward-policy.js';
+import { takeRegistration } from './client-limit.js';
 import {
   classifyForward,
   failureReason,
@@ -640,6 +641,8 @@ function normalizeRoute(method: string, path: string): string {
   return 'other';
 }
 
+const REGISTER_ROUTES = new Set(['/api/push/register', '/api/push/register/web', '/api/push/register/unifiedpush', '/api/push/register/apns']);
+
 function allowedMethod(path: string): string | null {
   // With metrics off, /metrics answers 404 to every method, like any unknown path.
   if (path === '/metrics') return metricsToken() ? 'GET' : null;
@@ -742,6 +745,15 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       });
       res.end(LANDING_HTML);
       return;
+    }
+
+    if (method === 'POST' && REGISTER_ROUTES.has(path)) {
+      // Before anything is read: a registration past the address's budget stores nothing.
+      const wait = takeRegistration(req);
+      if (wait !== null) {
+        res.setHeader('retry-after', String(wait));
+        return sendJson(res, 429, { error: 'Too many registrations, try again later' });
+      }
     }
 
     if (method === 'POST' && path === '/api/push/register') {
