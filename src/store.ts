@@ -1,4 +1,4 @@
-import { readFile, open, mkdir, rename, unlink } from 'node:fs/promises';
+import { readFile, open, mkdir, rename, unlink, chmod, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { logger } from './logger.js';
 import { storeWriteFailures } from './metrics.js';
@@ -22,6 +22,12 @@ const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 const MIN_FOLD_BYTES = 1024 * 1024;
 // Records per write while a snapshot goes to disk, so no string holds the whole store.
 const SNAPSHOT_BATCH = 500;
+
+// The store holds every device's endpoint, keys and token: the relay's own user
+// alone may read it. File modes mean nothing on Windows.
+const PRIVATE_DIR = 0o700;
+const PRIVATE_FILE = 0o600;
+const POSIX = process.platform !== 'win32';
 
 function getPushDir(): string {
   return process.env.PUSH_DATA_DIR || path.join(process.cwd(), 'data');
@@ -66,6 +72,7 @@ class SubscriptionStore {
   }
 
   private async readFromDisk(): Promise<void> {
+    await this.makePrivate();
     const records =
       (await this.readSnapshot(subscriptionsPath())) ?? (await this.readSnapshot(previousVersionPath()));
     for (const [id, record] of Object.entries(records ?? {})) {
@@ -105,12 +112,38 @@ class SubscriptionStore {
     } catch (error) {
       const aside = `${file}.corrupt-${Date.now()}`;
       await rename(file, aside).catch(() => undefined);
+      if (POSIX) await chmod(aside, PRIVATE_FILE).catch(() => undefined);
       logger.error('store: subscriptions file is corrupt, moved aside', {
         file: path.basename(file),
         aside: path.basename(aside),
         error: message(error),
       });
       return null;
+    }
+  }
+
+  // Creates the data directory for the relay's user alone, and narrows the
+  // directory and the store's files where an earlier relay or an operator left
+  // them readable by others. What can't be changed is logged, not fatal: the
+  // first write says whether the directory works at all.
+  private async makePrivate(): Promise<void> {
+    const dir = getPushDir();
+    try {
+      await mkdir(dir, { recursive: true, mode: PRIVATE_DIR });
+      if (!POSIX) return;
+      const mode = (await stat(dir)).mode & 0o777;
+      if (mode & 0o077) {
+        await chmod(dir, PRIVATE_DIR);
+        logger.warn('store: the data directory was open to other users, now only the relay user has access', { was: mode.toString(8) });
+      }
+      for (const name of await readdir(dir)) {
+        if (!name.startsWith('subscriptions.')) continue;
+        const file = path.join(dir, name);
+        const info = await stat(file);
+        if (info.isFile() && info.mode & 0o077) await chmod(file, PRIVATE_FILE);
+      }
+    } catch (error) {
+      logger.warn('store: could not make the data directory private', { error: message(error) });
     }
   }
 
@@ -294,8 +327,8 @@ class SubscriptionStore {
   private async append(id: string, record: SubscriptionRecord | null): Promise<void> {
     const line = `\n${JSON.stringify({ id, record })}`;
     try {
-      await mkdir(getPushDir(), { recursive: true });
-      const handle = await open(journalPath(), 'a');
+      await mkdir(getPushDir(), { recursive: true, mode: PRIVATE_DIR });
+      const handle = await open(journalPath(), 'a', PRIVATE_FILE);
       try {
         await handle.writeFile(line, 'utf-8');
         await handle.datasync();
@@ -323,10 +356,12 @@ class SubscriptionStore {
     const tmp = `${target}.tmp`;
     let bytes = 0;
     try {
-      await mkdir(getPushDir(), { recursive: true });
+      await mkdir(getPushDir(), { recursive: true, mode: PRIVATE_DIR });
       // On disk before the rename: a power cut must not leave a renamed, empty file.
-      const handle = await open(tmp, 'w');
+      const handle = await open(tmp, 'w', PRIVATE_FILE);
       try {
+        // A leftover from a crash keeps the mode it had.
+        if (POSIX) await handle.chmod(PRIVATE_FILE);
         let chunk = '{"records":{';
         let count = 0;
         for (const [id, record] of this.records) {

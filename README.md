@@ -130,7 +130,10 @@ written is answered `500`, is not kept, and counts in
 from the previous version. A file that can't be read at all (permissions, a bad
 mount) stops the relay at startup with an error, so it can't overwrite the store.
 A relay that starts on the `subscriptions.json` of an older relay takes every
-record from it.
+record from it. Only the relay's user may read the store: the data directory is
+mode 700 and the store's files 600, and a start narrows what it finds wider (the
+directory with a warning in the log). The FCM and APNs key files are yours to keep
+at 600.
 
 ## Limits
 

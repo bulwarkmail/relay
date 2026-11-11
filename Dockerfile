@@ -16,7 +16,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
 COPY --from=build /app/dist ./dist
 # The relay writes its data directory and nothing else: the code stays root's.
-RUN mkdir -p /app/data && chown relay:relay /app/data
+RUN mkdir -p /app/data && chown relay:relay /app/data && chmod 700 /app/data
 
 USER relay
 EXPOSE 3003
