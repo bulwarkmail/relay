@@ -419,6 +419,24 @@ describe('how fast one address may register', () => {
       await relay.stop();
     }
   });
+
+  it('does not lump every client together when the address the proxy saw is another proxy', async () => {
+    // TRUST_PROXY=1, and the nearest proxy appends the address of a proxy in front of it:
+    // a private or loopback one. Every client then has that address. The relay can't tell
+    // them apart, as with a private socket address, so there is no budget for all of them
+    // together, and the operator hears about it once.
+    for (const outer of ['10.0.0.5', '127.0.0.1', '192.168.1.1', '172.18.0.1', '::1', 'fd00::5']) {
+      const relay = await startRelay({ env: { TRUST_PROXY: '1', PUSH_REGISTER_BURST: '2', PUSH_REGISTER_REFILL_MS: '60000', PUSH_MAX_SUBSCRIPTIONS_PER_ADDRESS: '2' } });
+      try {
+        const statuses: number[] = [];
+        for (let i = 1; i <= 5; i++) statuses.push((await register(relay, newId(), '/two-proxies', `203.0.113.${i}, ${outer}`)).status);
+        assert.deepEqual(statuses, Array(5).fill(200), `five different clients behind ${outer} were held to one budget`);
+        assert.equal(relay.logs().split('set TRUST_PROXY').length - 1, 1, 'the operator was not told');
+      } finally {
+        await relay.stop();
+      }
+    }
+  });
 });
 
 describe('what one registration may put into the store', () => {

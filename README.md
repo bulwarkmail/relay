@@ -187,11 +187,15 @@ Which address a registration counts for:
   second from the end, and so on. A request without the header counts by its socket.
 - A port after the address is ignored, and an IPv6 client counts by its /64. An entry
   that is no address at all counts for one budget shared by all such entries.
-- When the address is a loopback or private one (the proxy's, with `TRUST_PROXY=0`
-  behind a proxy) the relay can't tell its clients apart, and one budget for all of
-  them would refuse real devices. Then neither the rate nor the count per address
-  applies, only `PUSH_MAX_SUBSCRIPTIONS`, and the relay logs once, as a warning,
-  that `TRUST_PROXY` should be set.
+- When the address is a loopback, private, shared (100.64/10) or link-local one
+  the relay can't tell its clients apart, and one budget for all of them would
+  refuse real devices. That is the proxy's own address with `TRUST_PROXY=0` behind a
+  proxy, and the entry the trusted proxy appended when yet another proxy stands in
+  front of it (then `TRUST_PROXY` is one too low). Then neither the rate nor the
+  count per address applies, only `PUSH_MAX_SUBSCRIPTIONS`, and the relay logs once,
+  as a warning, that `TRUST_PROXY` should be set. The proxy has to set or append
+  `X-Forwarded-For` itself; with `TRUST_PROXY=2` and more, each proxy must be the
+  only way to the next.
 
 What the clients do with the answers: the webmail reports "Relay register failed:
 429" (or `507`) and tries again on the next page load, or when an open tab comes to

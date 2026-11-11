@@ -83,22 +83,25 @@ function keyOf({ address, family }: Address): string {
   return `${ipv6Groups(address).slice(0, 4).map((group) => group.toString(16)).join(':')}::/64`;
 }
 
-/** The key an address counts under, or null when it is none. */
-export function addressKey(raw: string): string | null {
-  const parsed = parseAddress(raw);
-  return parsed ? keyOf(parsed) : null;
-}
-
 // Every entry of a header that names no address shares this one budget.
 const UNREADABLE = 'unreadable-forwarded-for';
 
-/** Whose budget a request spends: an address key, or null when the relay can't tell. */
+/**
+ * Whose budget a request spends: an address key, or null when the relay can't
+ * tell. A loopback or private address can't tell, whether it is the socket's or
+ * the entry a trusted proxy appended: that proxy then saw another proxy in front
+ * of it, or the host, and every client behind it has that address.
+ */
 export function clientKey(req: http.IncomingMessage, proxies = trustedProxies()): string | null {
   const header = req.headers['x-forwarded-for'];
   if (proxies > 0 && header !== undefined) {
     const entries = (Array.isArray(header) ? header.join(',') : header).split(',');
     // Fewer entries than proxies: a proxy added none, and none of these is the client's.
-    if (entries.length >= proxies) return addressKey(entries[entries.length - proxies]) ?? UNREADABLE;
+    if (entries.length >= proxies) {
+      const entry = parseAddress(entries[entries.length - proxies]);
+      if (!entry) return UNREADABLE;
+      return proxyNetworks.check(entry.address, entry.family) ? null : keyOf(entry);
+    }
   }
   const peer = parseAddress(req.socket.remoteAddress ?? '');
   if (!peer || proxyNetworks.check(peer.address, peer.family)) return null;
