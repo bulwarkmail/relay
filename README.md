@@ -70,18 +70,27 @@ default, merging whatever arrived meanwhile into one push.
   so a device that was offline gets the last one, not all of them. `EmailPush` pushes
   don't, since each names other messages. UnifiedPush gets no Topic.
 - **Burst limit.** Every subscription gets 10 pushes at once and one more every 20
-  seconds, whatever the transport. Past that the relay answers `429` without calling
-  the service, and the mail server's next attempt carries everything that piled up.
+  seconds, whatever the transport, and every endpoint (or FCM or APNs token) 30 at
+  once and one more every 2 seconds, however many subscriptions share it (one per
+  account in a browser or app). Past that the relay answers `429` without calling
+  the service (`held: "rate-limit"` or `"endpoint-rate-limit"`), and the mail
+  server's next attempt carries everything that piled up.
 - **Backoff.** After a `429`, or any answer with `Retry-After`, the relay leaves that
-  endpoint (or FCM or APNs token) alone for as long as the service says (60 seconds
-  without a header, an hour at most), for every subscription on it. Registering the
-  same endpoint again doesn't end it; a new endpoint starts afresh. Stalwart gives up
+  endpoint (or token) alone for as long as the service says (60 seconds without a
+  header, an hour at most), for every subscription on it. Registering the same
+  endpoint again doesn't end it; a new endpoint starts afresh. Stalwart gives up
   after about two minutes, so a longer wait costs the alerts in between: the service
-  asked for it, and each one is in the log. After `429`s for 20 different devices on
-  one host within a minute it leaves the whole host alone, for two minutes at most.
-  Only devices that have delivered a push before count, an endpoint counts once
-  whatever fragment it is written with, and browsers and native apps count
-  separately. Held pushes count in `relay_pushes_held_total`.
+  asked for it, and each one is in the log. At most 10,000 endpoints are remembered
+  in backoff; past that the oldest backoff is dropped.
+- **Host hold.** After `429`s for 20 different devices on one host within a minute,
+  registered from at least 5 different client addresses, the relay leaves the whole
+  host alone, for two minutes at most. Only devices that have delivered a push before
+  count, a device is its endpoint without query and fragment, and browsers and native
+  apps count separately. Where the relay can't tell client addresses apart (see
+  [Limits](#limits)), and for records registered before its last start, each device
+  counts as an address of its own. Endpoints that differ only in their query (WNS,
+  which Edge uses) count as one device per host and path, so they are held one by
+  one. Held pushes count in `relay_pushes_held_total`.
 
 ## Which endpoints it calls
 

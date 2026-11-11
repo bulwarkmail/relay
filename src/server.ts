@@ -8,7 +8,7 @@ import { getVapidPublicKey, sendWebPush } from './webpush.js';
 import { sendUnifiedPush } from './unifiedpush.js';
 import { isForwardableBody, toForwardPayload } from './payload.js';
 import { deliveryOptions, forwardPolicy, type DeliveryOptions } from './forward-policy.js';
-import { takeRegistration } from './client-limit.js';
+import { clientKey, takeRegistration } from './client-limit.js';
 import {
   classifyForward,
   failureReason,
@@ -175,9 +175,9 @@ function maxSubscriptions(): number {
 let fullLoggedAt = 0;
 
 /** Stores a registration, or answers 507 when the store is full. Says whether it stored. */
-async function store(res: http.ServerResponse, id: string, record: SubscriptionRecord): Promise<boolean> {
+async function store(req: http.IncomingMessage, res: http.ServerResponse, id: string, record: SubscriptionRecord): Promise<boolean> {
   const limit = maxSubscriptions();
-  if (await subscriptionStore.put(id, record, limit)) return true;
+  if (await subscriptionStore.put(id, record, { limit, address: clientKey(req) })) return true;
   if (Date.now() - fullLoggedAt > 60_000) {
     fullLoggedAt = Date.now();
     logger.warn('relay: the store is full, new devices are refused', { limit });
@@ -240,7 +240,7 @@ async function handleRegister(
     ...carriedOver(existing),
     accountLabel: label,
   };
-  if (!(await store(res, subscriptionId, record))) return;
+  if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'fcm' });
   return sendJson(res, 200, { ok: true });
 }
@@ -286,7 +286,7 @@ async function handleRegisterApns(
     ...carriedOver(existing),
     accountLabel: label,
   };
-  if (!(await store(res, subscriptionId, record))) return;
+  if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'apns' });
   return sendJson(res, 200, { ok: true });
 }
@@ -333,7 +333,7 @@ async function handleRegisterWeb(
     ...carriedOver(existing),
     accountLabel: label,
   };
-  if (!(await store(res, subscriptionId, record))) return;
+  if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'web' });
   return sendJson(res, 200, { ok: true });
 }
@@ -384,7 +384,7 @@ async function handleRegisterUnifiedPush(
     ...carriedOver(existing),
     accountLabel: label,
   };
-  if (!(await store(res, subscriptionId, record))) return;
+  if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'up' });
   return sendJson(res, 200, { ok: true });
 }
@@ -504,7 +504,9 @@ async function handleJmap(
       pushesHeld.inc({ reason: hold.reason, transport: record.kind });
       logger.info('relay: push held back', { subscription: logRef(id), transport: record.kind, ...hold });
       res.setHeader('retry-after', String(hold.retryAfterSeconds));
-      return sendJson(res, hold.reason === 'rate-limit' ? 429 : 503, { ok: false, held: hold.reason });
+      // The relay's own limits answer 429; holds the push service asked for, 503.
+      const ours = hold.reason === 'rate-limit' || hold.reason === 'endpoint-rate-limit';
+      return sendJson(res, ours ? 429 : 503, { ok: false, held: hold.reason });
     }
     let result: SendResult;
     try {
@@ -523,7 +525,7 @@ async function handleJmap(
       return sendJson(res, 500, { error: 'Internal server error' });
     }
     // A record replaced meanwhile points at another endpoint, which this says nothing about.
-    if (await subscriptionStore.isCurrent(id, record)) forwardPolicy.note(record, result);
+    if (await subscriptionStore.isCurrent(id, record)) forwardPolicy.note(record, result, subscriptionStore.addressOf(id));
     const outcome = classifyForward(result);
     pushesForwarded.inc({
       result: outcome,

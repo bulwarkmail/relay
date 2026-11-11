@@ -119,6 +119,15 @@ export class TokenBuckets {
     private readonly refillMs: () => number,
   ) {}
 
+  /** The seconds until there is a token, or null when there is one now. Takes none. */
+  wait(key: string, now = Date.now()): number | null {
+    const burst = this.burst();
+    const refillMs = this.refillMs();
+    const bucket = this.buckets.get(key);
+    const tokens = bucket ? Math.min(burst, bucket.tokens + (now - bucket.updatedAt) / refillMs) : burst;
+    return tokens < 1 ? Math.max(1, Math.ceil(((1 - tokens) * refillMs) / 1000)) : null;
+  }
+
   /** Takes a token. Null when there was one, otherwise the seconds until there is. */
   take(key: string, now = Date.now()): number | null {
     const burst = this.burst();

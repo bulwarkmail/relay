@@ -95,6 +95,10 @@ class SubscriptionStore {
   private snapshotSeq = 0;
   private foldRetryAt = 0;
   private closed = false;
+  // The client address each record was last registered from, while the relay
+  // runs. Never written to disk: after a start a record has none until its
+  // client registers again, which it does on every page load and app start.
+  private origins = new Map<string, string>();
 
   /** Once, whoever asks. Rejects when a store exists that can't be read: see readSnapshot. */
   load(): Promise<void> {
@@ -259,19 +263,27 @@ class SubscriptionStore {
   }
 
   /**
-   * Stores a record. False, and nothing stored, when the id is new and the store
-   * already holds `limit` records: an id that is there can always be replaced.
-   * Rejects when it can't be written, and then keeps the one before.
+   * Stores a record, registered from `address` (null when the relay can't tell).
+   * False, and nothing stored, when the id is new and the store already holds
+   * `limit` records: an id that is there can always be replaced. Rejects when it
+   * can't be written, and then keeps the one before.
    */
-  async put(id: string, record: SubscriptionRecord, limit = Infinity): Promise<boolean> {
+  async put(id: string, record: SubscriptionRecord, options: { limit?: number; address?: string | null } = {}): Promise<boolean> {
     await this.ensureLoaded();
     return this.serial(async () => {
-      if (!this.records.has(id) && this.records.size >= limit) return false;
+      if (!this.records.has(id) && this.records.size >= (options.limit ?? Infinity)) return false;
       await this.append(id, record);
       this.records.set(id, record);
+      if (options.address) this.origins.set(id, options.address);
+      else this.origins.delete(id);
       await this.foldIfDue();
       return true;
     });
+  }
+
+  /** The client address the record was last registered from since the start, if the relay could tell. */
+  addressOf(id: string): string | null {
+    return this.origins.get(id) ?? null;
   }
 
   async delete(id: string): Promise<void> {
@@ -280,6 +292,7 @@ class SubscriptionStore {
       if (!this.records.has(id)) return;
       await this.append(id, null);
       this.records.delete(id);
+      this.origins.delete(id);
       await this.foldIfDue();
     });
   }
@@ -318,6 +331,7 @@ class SubscriptionStore {
       if (this.records.get(id) !== expected) return false;
       await this.append(id, null);
       this.records.delete(id);
+      this.origins.delete(id);
       await this.foldIfDue();
       return true;
     });
@@ -377,7 +391,10 @@ class SubscriptionStore {
       for (const [id, record] of this.records) if (this.isExpired(record, now)) expired.add(id);
       if (expired.size === 0) return 0;
       await this.fold(expired);
-      for (const id of expired) this.records.delete(id);
+      for (const id of expired) {
+        this.records.delete(id);
+        this.origins.delete(id);
+      }
       return expired.size;
     });
   }

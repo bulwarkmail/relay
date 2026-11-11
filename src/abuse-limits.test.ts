@@ -674,6 +674,103 @@ describe('one endpoint written many ways', () => {
       await apns.close();
     }
   });
+
+  // Each of `devices` delivers one push, then its service answers 429 to the next.
+  // `forwardedFor` gives the client address each was registered from.
+  async function throttle(relay: { base: string }, devices: string[], forwardedFor: (i: number) => string | undefined) {
+    const ids: string[] = [];
+    for (const [i, pathname] of devices.entries()) {
+      const id = newId();
+      ids.push(id);
+      const res = await fetch(`${relay.base}/api/push/register/web`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(forwardedFor(i) ? { 'x-forwarded-for': forwardedFor(i)! } : {}) },
+        body: JSON.stringify({ subscriptionId: id, subscription: { endpoint: service.url(pathname), keys: makeDevice().keys } }),
+      });
+      await res.arrayBuffer();
+      assert.equal(res.status, 200);
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e0']))).status, 200);
+    }
+    for (const pathname of devices) service.answer(pathname, { status: 429 });
+    for (const id of ids) await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
+  }
+
+  it('cannot put its push service on hold for everyone once each spelling has delivered a push', async () => {
+    const relay = await startRelay();
+    try {
+      const victim = newId();
+      assert.equal((await web(relay, victim, '/honest-device-q')).status, 200);
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${victim}`, emailPush('a', ['e1']))).status, 200);
+      // One endpoint, twenty queries. A push service answers 2xx until an endpoint is over its
+      // quota, so each of them has delivered a push before the 429s come.
+      await throttle(relay, Array.from({ length: 20 }, (_, i) => `/one-endpoint?n=${i}`), () => undefined);
+      const push = await postJson(relay.base, `/api/push/jmap/${victim}`, emailPush('a', ['e2']));
+      assert.equal(push.status, 200, `the honest device's push was held: ${JSON.stringify(push.body)}`);
+      assert.equal(service.to('/honest-device-q').length, 2);
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('does not hold a host for everyone over devices registered from one client address', async () => {
+    const relay = await startRelay({ env: { TRUST_PROXY: '1' } });
+    try {
+      const victim = newId();
+      assert.equal((await web(relay, victim, '/one-address-victim')).status, 200);
+      await throttle(relay, Array.from({ length: 20 }, (_, i) => `/one-address-${i}`), () => '198.51.100.30');
+      const push = await postJson(relay.base, `/api/push/jmap/${victim}`, emailPush('a', ['e2']));
+      assert.equal(push.status, 200, `the honest device's push was held: ${JSON.stringify(push.body)}`);
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('still holds a host that throttles many devices of many users', async () => {
+    const relay = await startRelay({ env: { TRUST_PROXY: '1' } });
+    try {
+      const other = newId();
+      assert.equal((await web(relay, other, '/many-users-other')).status, 200);
+      await throttle(relay, Array.from({ length: 20 }, (_, i) => `/many-users-${i}`), (i) => `198.51.100.${100 + i}`);
+      const push = await postJson(relay.base, `/api/push/jmap/${other}`, emailPush('a', ['e2']));
+      assert.equal(push.status, 503);
+      assert.deepEqual(push.body, { ok: false, held: 'push-service-throttle' });
+      assert.equal(service.to('/many-users-other').length, 0);
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('forwards no more to one endpoint than its own budget, however many ids share it', async () => {
+    const relay = await startRelay();
+    try {
+      const ids: string[] = [];
+      for (let i = 0; i < 5; i++) {
+        const id = newId();
+        ids.push(id);
+        assert.equal((await web(relay, id, '/shared-endpoint')).status, 200);
+      }
+      const held: unknown[] = [];
+      for (const id of ids) {
+        for (let i = 0; i < 10; i++) {
+          const res = await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', [`e${i}`]));
+          if (res.status !== 200) {
+            assert.equal(res.status, 429);
+            held.push(res.body);
+          }
+        }
+      }
+      // Each id may have ten at once; the endpoint thirty in all.
+      assert.equal(service.to('/shared-endpoint').length, 30);
+      assert.equal(held.length, 20);
+      assert.deepEqual(held[0], { ok: false, held: 'endpoint-rate-limit' });
+      // Another endpoint is not held by it.
+      const other = newId();
+      assert.equal((await web(relay, other, '/shared-endpoint-other')).status, 200);
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${other}`, emailPush('a', ['e1']))).status, 200);
+    } finally {
+      await relay.stop();
+    }
+  });
 });
 
 // Cost, measured as bytes the relay process hands to write(): on a store twice the size, the same
