@@ -19,13 +19,15 @@ import {
   type SendResult,
 } from './forward-result.js';
 import {
+  accountLabelOf,
   isValidApnsEnvironment,
   isValidApnsToken,
   isValidFcmToken,
   isValidSubscriptionId,
-  isValidUnifiedPushEndpoint,
-  isValidUnifiedPushKeys,
-  isValidWebPushSubscription,
+  isValidVerificationCode,
+  normalizeEndpoint,
+  normalizeKeys,
+  normalizeWebPushSubscription,
 } from './validation.js';
 import type {
   ApnsSubscriptionRecord,
@@ -58,7 +60,6 @@ const PORT = Number(process.env.PORT ?? 3003);
 const HOST = process.env.HOST ?? '0.0.0.0';
 const MAX_BODY_BYTES = 64 * 1024;
 const OVERSIZE_GRACE_MS = 2000;
-const MAX_VERIFICATION_CODE_CHARS = 512;
 const REPO_URL = 'https://github.com/bulwarkmail/relay';
 
 // How long after registration we still report a subscription as "active" even
@@ -192,6 +193,10 @@ async function handleRegister(
   if (!isValidFcmToken(fcmToken)) {
     return sendJson(res, 400, { error: 'Invalid fcmToken' });
   }
+  const label = accountLabelOf(accountLabel);
+  if (label === null) {
+    return sendJson(res, 400, { error: 'Invalid accountLabel' });
+  }
 
   const existing = await subscriptionStore.get(subscriptionId);
   const record: FcmSubscriptionRecord = {
@@ -205,8 +210,7 @@ async function handleRegister(
     // path (existing JMAP sub still alive) skips polling entirely.
     verificationCode: null,
     ...carriedOver(subscriptionId, existing),
-    accountLabel:
-      typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
+    accountLabel: label,
   };
   await subscriptionStore.put(subscriptionId, record);
   subscriptionsRegistered.inc({ transport: 'fcm' });
@@ -240,6 +244,10 @@ async function handleRegisterApns(
   if (!isValidApnsEnvironment(environment)) {
     return sendJson(res, 400, { error: 'Invalid environment' });
   }
+  const label = accountLabelOf(accountLabel);
+  if (label === null) {
+    return sendJson(res, 400, { error: 'Invalid accountLabel' });
+  }
 
   const existing = await subscriptionStore.get(subscriptionId);
   const record: ApnsSubscriptionRecord = {
@@ -249,8 +257,7 @@ async function handleRegisterApns(
     // See handleRegister for why we always reset this.
     verificationCode: null,
     ...carriedOver(subscriptionId, existing),
-    accountLabel:
-      typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
+    accountLabel: label,
   };
   await subscriptionStore.put(subscriptionId, record);
   subscriptionsRegistered.inc({ transport: 'apns' });
@@ -282,19 +289,23 @@ async function handleRegisterWeb(
   if (!isValidSubscriptionId(subscriptionId)) {
     return sendJson(res, 400, { error: 'Invalid subscriptionId' });
   }
-  if (!isValidWebPushSubscription(subscription)) {
+  const webPush = normalizeWebPushSubscription(subscription);
+  if (!webPush) {
     return sendJson(res, 400, { error: 'Invalid subscription' });
+  }
+  const label = accountLabelOf(accountLabel);
+  if (label === null) {
+    return sendJson(res, 400, { error: 'Invalid accountLabel' });
   }
 
   const existing = await subscriptionStore.get(subscriptionId);
   const record: WebSubscriptionRecord = {
     kind: 'web',
-    webPush: subscription,
+    webPush,
     // See handleRegister for why we always reset this.
     verificationCode: null,
     ...carriedOver(subscriptionId, existing),
-    accountLabel:
-      typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
+    accountLabel: label,
   };
   await subscriptionStore.put(subscriptionId, record);
   subscriptionsRegistered.inc({ transport: 'web' });
@@ -325,23 +336,28 @@ async function handleRegisterUnifiedPush(
   if (!isValidSubscriptionId(subscriptionId)) {
     return sendJson(res, 400, { error: 'Invalid subscriptionId' });
   }
-  if (!isValidUnifiedPushEndpoint(endpoint)) {
+  const target = normalizeEndpoint(endpoint);
+  if (!target) {
     return sendJson(res, 400, { error: 'Invalid endpoint' });
   }
-  if (keys != null && !isValidUnifiedPushKeys(keys)) {
+  const webPushKeys = keys == null ? null : normalizeKeys(keys);
+  if (keys != null && !webPushKeys) {
     return sendJson(res, 400, { error: 'Invalid keys' });
+  }
+  const label = accountLabelOf(accountLabel);
+  if (label === null) {
+    return sendJson(res, 400, { error: 'Invalid accountLabel' });
   }
 
   const existing = await subscriptionStore.get(subscriptionId);
   const record: UnifiedPushSubscriptionRecord = {
     kind: 'up',
-    endpoint,
-    keys: keys ?? null,
+    endpoint: target,
+    keys: webPushKeys,
     // See handleRegister for why we always reset this.
     verificationCode: null,
     ...carriedOver(subscriptionId, existing),
-    accountLabel:
-      typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
+    accountLabel: label,
   };
   await subscriptionStore.put(subscriptionId, record);
   subscriptionsRegistered.inc({ transport: 'up' });
@@ -441,9 +457,8 @@ async function handleJmap(
   }
 
   if (body['@type'] === 'PushVerification') {
-    // Stalwart sends 32 characters; this ends up on disk and in a client's poll.
     const code: unknown = body.verificationCode;
-    if (typeof code !== 'string' || code.length === 0 || code.length > MAX_VERIFICATION_CODE_CHARS) {
+    if (!isValidVerificationCode(code)) {
       return sendJson(res, 400, { error: 'Invalid verification code' });
     }
     pushesReceived.inc({ type: 'PushVerification' });

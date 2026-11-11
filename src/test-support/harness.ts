@@ -263,6 +263,11 @@ export function newId(): string {
   return crypto.randomBytes(16).toString('hex');
 }
 
+/** The records a relay keeps in this data directory, as it would load them. */
+export function storedRecords(dataDir: string): Record<string, any> {
+  return JSON.parse(fs.readFileSync(path.join(dataDir, 'subscriptions.json'), 'utf8')).records;
+}
+
 export async function postJson(base: string, pathname: string, body: unknown): Promise<{ status: number; body: any; headers: Headers }> {
   const res = await fetch(base + pathname, {
     method: 'POST',
