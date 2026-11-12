@@ -545,6 +545,29 @@ describe('the first change on a store without a number, cut short by a crash', (
   }
 });
 
+describe('the first snapshot on a store without a number, when it cannot be written', () => {
+  it('refuses the changes and tries it once a minute, not with every change, and leaves the older store as it was', async () => {
+    const now = Date.now();
+    const old = newId();
+    const olderStore = JSON.stringify({ records: { [old]: { kind: 'up', endpoint: service.url('/first-refused-old'), keys: null, verificationCode: null, createdAt: now, lastPushAt: now, lastRegisteredAt: now } } }, null, 2);
+    const dataDir = storeWith({ [SNAPSHOT]: olderStore });
+    // Nothing can be written where the snapshot goes before its rename.
+    fs.mkdirSync(path.join(dataDir, `${SNAPSHOT}.tmp`));
+    const relay = await startRelay({ dataDir, env: { METRICS_TOKEN } });
+    try {
+      for (let i = 0; i < 3; i++) assert.equal((await plain(relay, newId(), `/first-refused-${i}`)).status, 500);
+      assert.equal(relay.logs().split('could not write a snapshot').length - 1, 1, 'the snapshot was tried more than once within the minute');
+      const metrics = await (await fetch(`${relay.base}/metrics`, { headers: { authorization: `Bearer ${METRICS_TOKEN}` } })).text();
+      assert.match(metrics, /^relay_store_write_failures_total 3$/m);
+      assert.equal(read(dataDir, SNAPSHOT), olderStore, 'the older store changed');
+      assert.ok(!fs.existsSync(path.join(dataDir, JOURNAL)), 'a refused change went to a journal');
+      assert.equal((await getJson(relay.base, `/api/push/active/${old}`)).status, 200);
+    } finally {
+      await relay.stop('SIGKILL');
+    }
+  });
+});
+
 describe('a change the journal could not take', () => {
   it('costs nothing of the change answered before it, also on a journal that began with a torn line', async () => {
     // A crash in the middle of a journal's very first append leaves the start of a line and

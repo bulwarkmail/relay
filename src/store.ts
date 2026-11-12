@@ -637,11 +637,20 @@ class SubscriptionStore {
   // the snapshot it continues. On a snapshot without a number (an older relay's,
   // or none) the first change writes a snapshot of this relay's own first, so no
   // journal ever continues one an older relay could rewrite; should that fail,
-  // the change is refused.
+  // the change is refused, and so is every change until the next try, a minute later.
   private async append(id: string, record: SubscriptionRecord | null): Promise<void> {
     if (this.closed) throw new Error('the store is closed');
     if (record && recordBytes(record) > MAX_RECORD_BYTES) throw new Error('the record is larger than a record may be');
-    if (this.journalBytes === 0 && !this.snapshotNumbered) await this.fold();
+    if (this.journalBytes === 0 && !this.snapshotNumbered) {
+      if (Date.now() < this.foldRetryAt) {
+        storeWriteFailures.inc();
+        throw new Error('the first snapshot could not be written; it is tried again a minute after the last try');
+      }
+      await this.fold().catch((error: unknown) => {
+        this.foldRetryAt = Date.now() + FOLD_RETRY_MS;
+        throw error;
+      });
+    }
     const seq = this.seq + 1;
     const header = this.journalBytes === 0 ? `\n${JSON.stringify({ from: this.snapshotSeq })}` : '';
     const line = `${header}\n${JSON.stringify({ seq, id, record })}`;

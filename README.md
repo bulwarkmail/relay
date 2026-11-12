@@ -169,8 +169,10 @@ before an older relay wrote `subscriptions.json`, which then has no number) is k
 as `subscriptions.journal.stale-<time>` with a warning, not replayed. A
 change that can't be written is answered `500`, is not kept, and counts in
 `relay_store_write_failures_total`; a snapshot that can't be written is tried again
-a minute later, while the journal keeps taking changes. A snapshot that isn't valid is kept as
-`subscriptions.json.corrupt-<time>` and logged as an error, and the relay starts
+a minute later, while the journal keeps taking changes. The first one, on a store
+without a number, comes before any journal: until it is written every change is
+answered `500`, and it too is tried at most once a minute. A snapshot that isn't
+valid is kept as `subscriptions.json.corrupt-<time>` and logged as an error, and the relay starts
 from the previous version. A file that can't be read at all (permissions, a bad
 mount) stops the relay at startup with an error, so it can't overwrite the store.
 A relay that starts on the `subscriptions.json` of an older relay takes every
