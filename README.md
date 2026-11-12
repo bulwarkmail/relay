@@ -61,7 +61,11 @@ A client can bind its record to a secret instead:
   other shape answers `400` and stores nothing. The secret is bound when the id is
   first registered, and only to an id of 40 characters or more (32 random bytes in
   base64url again); the released clients' ids are 32 hex digits and never take
-  one.
+  one. A registration that brought a secret answers `{ "ok": true, "owned": true }`.
+  An older relay ignores the field and answers `{ "ok": true }`, which tells a
+  client its record there has no secret. A browser should then not send the
+  `Authorization` header to that relay, since an older relay's CORS answer doesn't
+  allow it and the browser would block the request.
 - **Afterwards.** A registration for that id needs the same `secret` in its body,
   on any of the four routes, and may change the transport; without it, or with
   another one, it answers `403` and the record stays as it was.

@@ -254,6 +254,16 @@ function registeredSecret(res: http.ServerResponse, id: string, value: unknown):
   return secretHashOf(value);
 }
 
+/**
+ * A stored registration's answer. One that brought a secret hears that the
+ * record is bound to it: a relay from before secrets answers `{ ok: true }` to
+ * the same body, so a client can tell whether to send the secret later, which a
+ * browser can only do to a relay whose CORS answer allows the header.
+ */
+function registered(secretHash: string | undefined) {
+  return secretHash ? { ok: true, owned: true } : { ok: true };
+}
+
 /** The hash of the secret in `Authorization: Bearer <secret>`, or null. */
 function bearerSecret(req: http.IncomingMessage): string | null {
   const match = /^Bearer +([^\s]+)$/i.exec((req.headers.authorization ?? '').trim());
@@ -325,7 +335,7 @@ async function handleRegister(
   };
   if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'fcm' });
-  return sendJson(res, 200, { ok: true });
+  return sendJson(res, 200, registered(secretHash));
 }
 
 // The iOS app. Refused up front when the relay has no APNs key, as Web Push
@@ -374,7 +384,7 @@ async function handleRegisterApns(
   };
   if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'apns' });
-  return sendJson(res, 200, { ok: true });
+  return sendJson(res, 200, registered(secretHash));
 }
 
 async function handleRegisterWeb(
@@ -425,7 +435,7 @@ async function handleRegisterWeb(
   };
   if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'web' });
-  return sendJson(res, 200, { ok: true });
+  return sendJson(res, 200, registered(secretHash));
 }
 
 // UnifiedPush (mobile app without Google Play services). No VAPID gate like
@@ -480,7 +490,7 @@ async function handleRegisterUnifiedPush(
   };
   if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'up' });
-  return sendJson(res, 200, { ok: true });
+  return sendJson(res, 200, registered(secretHash));
 }
 
 async function handleUnregister(

@@ -405,6 +405,28 @@ describe('a record registered without a secret', () => {
   });
 });
 
+describe('the answer to a registration', () => {
+  it('says the record is bound when the registration brought a secret, and nothing new otherwise', async () => {
+    const bodies = (id: string, secret?: string) => [
+      ['/api/push/register/web', { subscriptionId: id, subscription: { endpoint: service.url('/answer'), keys: makeDevice().keys }, ...(secret ? { secret } : {}) }],
+      ['/api/push/register/unifiedpush', { subscriptionId: id, endpoint: service.url('/answer'), ...(secret ? { secret } : {}) }],
+      ['/api/push/register', { subscriptionId: id, fcmToken: 'f'.repeat(100), ...(secret ? { secret } : {}) }],
+      ['/api/push/register/apns', { subscriptionId: id, deviceToken: 'ab'.repeat(32), environment: 'production', ...(secret ? { secret } : {}) }],
+    ] as const;
+    const owned = longId();
+    for (const [route, body] of bodies(owned, SECRET)) {
+      // The first binds the record, the others replace it with the same secret.
+      assert.deepEqual((await postJson(relay.base, route, body)).body, { ok: true, owned: true }, route);
+    }
+    const plain = newId();
+    for (const [route, body] of bodies(plain)) {
+      assert.deepEqual((await postJson(relay.base, route, body)).body, { ok: true }, route);
+    }
+    assert.equal((await del(owned, SECRET)).status, 200);
+    assert.equal((await del(plain)).status, 200);
+  });
+});
+
 describe('a browser that sends the secret in a header', () => {
   it('is allowed to by the preflight', async () => {
     const res = await fetch(`${relay.base}/api/push/register/${longId()}`, {
