@@ -141,10 +141,20 @@ const DEVICE_IN_PATH = [
 
 // The value of the first `token` parameter, decoded; null when there is none.
 // WNS (Edge), Gotify and the UnifiedPush FCM distributor keep the device there.
+// The name counts decoded and in any case, as servers that read it by name do
+// (.NET's query collection, which WNS runs on, ignores case); a name that can't
+// be decoded is not `token`. Given twice, the first counts, as Go's, Java's and
+// Python's query readers take it, so values added after it change nothing.
 function tokenOf(search: string): string | null {
   for (const part of search.replace(/^\?/, '').split('&')) {
     const equals = part.indexOf('=');
-    if ((equals === -1 ? part : part.slice(0, equals)) !== 'token') continue;
+    let name: string;
+    try {
+      name = decodeURIComponent(equals === -1 ? part : part.slice(0, equals));
+    } catch {
+      continue;
+    }
+    if (name.toLowerCase() !== 'token') continue;
     const value = equals === -1 ? '' : part.slice(equals + 1);
     try {
       return decodeURIComponent(value);
@@ -161,11 +171,11 @@ function tokenOf(search: string): string | null {
  * dot on the host; in the path, characters a segment may hold written as
  * themselves and the hex digits of any other %XX in upper case (`%2F` stays apart
  * from `/`), repeated slashes as one, no dot segments, no trailing slash; no
- * fragment (it never reaches the service). The query, only when `withQuery`: of a
- * query with a `token` parameter only that value counts, on a host that keeps the
- * device in the path none of it, and on any other host all of it, since a
- * service the relay doesn't know may keep the device there. The endpoint the
- * relay stores and calls stays as the client registered it.
+ * fragment (it never reaches the service). The query, only when `withQuery`: on a
+ * host that keeps the device in the path none of it; elsewhere, of a query with a
+ * `token` parameter only that value, and of any other all of it, since a service
+ * the relay doesn't know may keep the device there. The endpoint the relay stores
+ * and calls stays as the client registered it.
  */
 function endpointKey(endpoint: string, withQuery: boolean): string {
   try {
@@ -174,10 +184,9 @@ function endpointKey(endpoint: string, withQuery: boolean): string {
     const port = url.port ? `:${url.port}` : '';
     const segments = withoutDotSegments(samePercentEncoding(url.pathname, PATH_CHARACTER).replace(/\/{2,}/g, '/'));
     const base = `${url.protocol}//${host}${port}${segments.length > 1 ? segments.replace(/\/$/, '') : segments}`;
-    if (!withQuery || !url.search) return base;
+    if (!withQuery || !url.search || DEVICE_IN_PATH.some((pattern) => pattern.test(host))) return base;
     const token = tokenOf(url.search);
-    if (token !== null) return `${base}?token=${token}`;
-    return DEVICE_IN_PATH.some((pattern) => pattern.test(host)) ? base : `${base}${samePercentEncoding(url.search)}`;
+    return token !== null ? `${base}?token=${token}` : `${base}${samePercentEncoding(url.search)}`;
   } catch {
     return endpoint;
   }

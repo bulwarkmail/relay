@@ -115,6 +115,52 @@ describe('one endpoint written many ways', () => {
     assert.equal(shareBudget('https://push.example.net/up/a?up=1', 'https://push.example.net/up/a?up=2'), false);
   });
 
+  // On the hosts that keep the device in the path a parameter named `token` is one more extra
+  // parameter. Where the token does count, its name is read decoded and in any case, as .NET,
+  // which WNS runs on, reads query names.
+  it('shares one budget between one device\'s endpoint and a parameter that looks like the device token', () => {
+    const wns = (c: number) => `BQYAAAD${c}x${'x'.repeat(40)}%2babc%2f%3d%3d`;
+    const fcm = (c: number) => `dXk3c2V0${c}ZG9tOmV4:APA91bH${'y'.repeat(120)}`;
+    const cases: Array<[string, (c: number) => string, (c: number) => string]> = [
+      ['FCM web with ?token added', (c) => `https://fcm.googleapis.com/fcm/send/${fcm(c)}`, (c) => `https://fcm.googleapis.com/fcm/send/${fcm(c)}?token=1`],
+      ['FCM web with two different ?token values', (c) => `https://fcm.googleapis.com/fcm/send/${fcm(c)}?token=1`, (c) => `https://fcm.googleapis.com/fcm/send/${fcm(c)}?token=2`],
+      ['Mozilla with ?token added', (c) => `https://updates.push.services.mozilla.com/wpush/v2/gAAAAAB${c}d`, (c) => `https://updates.push.services.mozilla.com/wpush/v2/gAAAAAB${c}d?token=1`],
+      ['Apple with ?token added', (c) => `https://web.push.apple.com/Q${c}device`, (c) => `https://web.push.apple.com/Q${c}device?token=1`],
+      ['ntfy.sh with &token added', (c) => `https://ntfy.sh/up${c}Topic?up=1`, (c) => `https://ntfy.sh/up${c}Topic?up=1&token=1`],
+      ['WNS with the name escaped and one more parameter', (c) => `https://wns2-am3p.notify.windows.com/w/?token=${wns(c)}`, (c) => `https://wns2-am3p.notify.windows.com/w/?%74oken=${wns(c)}&x=1`],
+      ['WNS with the name in capitals and one more parameter', (c) => `https://wns2-am3p.notify.windows.com/w/?token=${wns(c)}`, (c) => `https://wns2-am3p.notify.windows.com/w/?Token=${wns(c)}&x=1`],
+    ];
+    const apart = cases.map(([what, a, b], i) => [what, a(100 + i), b(100 + i)] as const)
+      .filter(([, a, b]) => !shareBudget(normalizeEndpoint(a)!, normalizeEndpoint(b)!)).map(([what]) => what);
+    assert.deepEqual(apart, []);
+  });
+
+  // `token` given twice: the first counts, as most servers that read the parameter by name take it.
+  // Values added after it change nothing, and a different first value is a different device.
+  it('counts the first of two token parameters, so they give neither one device two budgets nor two devices one', () => {
+    const wns = (value: string) => `https://wns2-am3p.notify.windows.com/w/?token=${value}`;
+    const same: Array<[string, string, string]> = [
+      ['a second token after the first', wns('Twice1A'), `${wns('Twice1A')}&token=Twice1B`],
+      ['two different second tokens', `${wns('Twice2A')}&token=Extra1`, `${wns('Twice2A')}&token=Extra2`],
+      ['a second token written another way', wns('Twice3A'), `${wns('Twice3A')}&TOKEN=Twice3B&%74oken=Twice3C`],
+    ];
+    const apart: Array<[string, string, string]> = [
+      ['the second value alone, another device', `${wns('Twice4A')}&token=Twice4B`, wns('Twice4B')],
+      ['the same two values the other way round', `${wns('Twice5A')}&token=Twice5B`, `${wns('Twice5B')}&token=Twice5A`],
+      ['two devices', wns('Twice6A'), wns('Twice6B')],
+    ];
+    assert.deepEqual(same.filter(([, a, b]) => !shareBudget(normalizeEndpoint(a)!, normalizeEndpoint(b)!)).map(([what]) => what), []);
+    assert.deepEqual(apart.filter(([, a, b]) => shareBudget(normalizeEndpoint(a)!, normalizeEndpoint(b)!)).map(([what]) => what), []);
+  });
+
+  // A parameter whose name can't be decoded is no `token`: it doesn't hide the token after it, and
+  // without a token the whole query counts, as on any host the relay doesn't know.
+  it('reads past a parameter whose name cannot be decoded', () => {
+    const base = 'https://wns2-am3p.notify.windows.com/w/';
+    assert.equal(shareBudget(normalizeEndpoint(`${base}?token=Undecodable1`)!, normalizeEndpoint(`${base}?%E0%A4%A=x&token=Undecodable1`)!), true);
+    assert.equal(shareBudget(normalizeEndpoint(`${base}?%E0%A4%A=x1`)!, normalizeEndpoint(`${base}?%E0%A4%A=x2`)!), false);
+  });
+
   // Whether another device on the host is held once these endpoints, each of which delivered
   // before, got a 429, each registered from an address of its own.
   function holdsHost(endpoints: string[], bystander: string): boolean {

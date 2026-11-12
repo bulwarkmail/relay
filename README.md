@@ -79,13 +79,14 @@ default, merging whatever arrived meanwhile into one push.
   default port; in the path, characters a path may hold written as `%XX` read as
   themselves, the hex digits of other `%XX` in upper case (`%2F` stays apart from
   `/`), repeated slashes as one, no `.` or `..` segments, no trailing slash; no
-  fragment. Of the query only the value of a `token` parameter counts when there
-  is one (WNS, which Edge uses, Gotify and the UnifiedPush FCM distributor keep the
-  device there); on FCM, Mozilla, Apple, ntfy.sh and Conversations' server, which
-  keep the device in the path, none of it; on any other host all of it, since a
-  service the relay doesn't know may keep the device in another parameter. The
-  same holds for a backoff. The endpoint is stored and called as the client
-  registered it.
+  fragment. On FCM, Mozilla, Apple, ntfy.sh and Conversations' server, which keep
+  the device in the path, none of the query counts, whatever it holds. Elsewhere
+  only the value of a `token` parameter counts when there is one (WNS, which Edge
+  uses, Gotify and the UnifiedPush FCM distributor keep the device there): its name
+  read decoded and in any case, and of two the first; without one all of the query
+  counts, since a service the relay doesn't know may keep the device in another
+  parameter. The same holds for a backoff. The endpoint is stored and called as the
+  client registered it.
 - **Backoff.** After a `429`, or any answer with `Retry-After`, the relay leaves that
   endpoint (or token) alone for as long as the service says (60 seconds without a
   header, an hour at most), for every subscription on it. Registering the same
