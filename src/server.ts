@@ -973,6 +973,10 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
   }
 }
 
+// Another relay holds the data directory now. Nothing more is written (see
+// store.ts); the process ends without the fold a stop makes.
+subscriptionStore.onLockLost = () => process.exit(1);
+
 subscriptionStore.load().then(
   () => {
     server.listen(PORT, HOST, () => {

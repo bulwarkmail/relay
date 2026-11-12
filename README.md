@@ -280,19 +280,33 @@ mount) stops the relay at startup with an error, so it can't overwrite the store
 A relay that starts on the `subscriptions.json` of an older relay takes every
 record from it.
 
-One data directory takes one relay. A relay writes its process number and host
-name into `subscriptions.lock` before it reads the store, and removes the file
-when it stops cleanly. A second relay that finds the lock of one that still runs
-doesn't start, and logs an error with that relay's process number, host and start
-time. A lock whose relay no longer runs (it was killed, or the machine restarted)
-is taken over, with a warning. The relay tells by the process number on the same
-host, on Linux also by that process's start time, so a number handed to another
-process since doesn't count. In a container the relay gets the same number at
-every start, so a lock with its own number is an earlier run's. A lock written on
-another host can't be checked and counts as held. The compose file gives the
-container a fixed host name for that reason, so a container created anew takes
-over its predecessor's lock; with `docker run`, pass `--hostname`. Remove the file
-by hand only when no relay runs on the directory.
+One data directory takes one relay. Before it reads the store, a relay writes a
+token of its own into `subscriptions.lock`, then refreshes the file's modification
+time every fifth of `PUSH_LOCK_STALE_MS` (every 2 seconds by default), and removes
+it when it stops cleanly. A start that finds a lock refreshed within
+`PUSH_LOCK_STALE_MS` (10 seconds by default) doesn't start: it exits with an error
+that says how many seconds ago the lock was refreshed, and by which process and
+host. A lock that wasn't refreshed for longer is taken over, with a warning: its
+relay was killed, crashed or lost its machine. Of two relays that start at the same
+moment, one runs. A relay checks its token before every write and at every
+refresh; when another token is there, because another relay took the lock over,
+it writes nothing more and exits with an error. This works the same in containers
+and under orchestrators that give each instance a new host name (Kubernetes,
+Swarm), and on a directory several machines share, as long as their clocks agree
+within a few seconds.
+
+What that means after a crash: a relay restarted on the same directory waits until
+the lock is stale. Docker's restart policy tries again after 0.1, 0.2, 0.4, ... seconds,
+so with the default the relay is back after about 10 to 15 seconds; Kubernetes
+retries after 10 seconds. Update strategies that start the new instance before
+the old one stops (a Kubernetes `RollingUpdate`, Swarm's `start-first`) keep the new
+one out until the old one is gone; use `Recreate` or `stop-first`. A clean stop
+removes the lock at once. A relay that is paused (a suspended machine, a stopped
+process, a stall) for less than `PUSH_LOCK_STALE_MS` carries on as before. Paused
+longer, it carries on too if no other relay started meanwhile; if one did and took
+the lock over, the paused relay stops at its next write or refresh, without
+writing. Set the same `PUSH_LOCK_STALE_MS` for every relay that may use the
+directory: a start judges a lock by its own setting.
 
 Only the relay's user may read the store: the data directory is
 mode 700 and the store's files 600, and a start narrows what it finds wider (the
@@ -525,6 +539,7 @@ journal is replayed as after any unclean stop.
 | `PUSH_MAX_SUBSCRIPTIONS_PER_ADDRESS` | `1000` | Records one client address may hold; a new device past it gets `507`. Off where addresses can't be told apart |
 | `PUSH_REGISTER_BURST` | `60` | Registrations one client address may make at once; past it `429` with `Retry-After` |
 | `PUSH_REGISTER_REFILL_MS` | `2000` | Time until that address may make one more |
+| `PUSH_LOCK_STALE_MS` | `10000` | How long the data directory's lock may go without a refresh before a start takes it over (at least 1000); the holder refreshes it every fifth of this. See [What it stores](#what-it-stores) |
 | `TRUST_PROXY` | `0` | Proxies in front of the relay. With `1` the client address is the last entry of `X-Forwarded-For` |
 | `METRICS_TOKEN` | unset | Turns on `/metrics`. Prometheus sends it as a bearer token (`authorization: { credentials: <token> }` in the scrape config) |
 | `METRICS_TOKEN_FILE` | unset | Path to a file holding the token instead, read on every scrape |

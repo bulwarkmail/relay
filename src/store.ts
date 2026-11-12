@@ -1,5 +1,6 @@
+import { randomBytes } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { readFile, open, mkdir, rename, unlink, chmod, readdir, stat, truncate } from 'node:fs/promises';
+import { readFile, open, mkdir, rename, unlink, chmod, readdir, stat, truncate, utimes } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
@@ -76,79 +77,63 @@ function journalPath(): string {
   return path.join(getPushDir(), 'subscriptions.journal');
 }
 
-// Which relay process holds the data directory: written at its start, removed
-// when it stops cleanly. Two relays on one directory would each write changes
-// the other doesn't know about.
+// Which relay holds the data directory. Two relays on one directory would each
+// write changes the other doesn't know about. The holder writes a token of its
+// own into the lock at its start, refreshes the lock's modification time every
+// fifth of PUSH_LOCK_STALE_MS, and removes it when it stops cleanly. A start
+// that finds a lock refreshed within PUSH_LOCK_STALE_MS doesn't start; one that
+// finds an older lock takes it over. The holder checks its token before every
+// write and at every refresh, and stops when it finds another one there.
 function lockPath(): string {
   return path.join(getPushDir(), 'subscriptions.lock');
 }
 
-/** Who wrote a lock: enough to tell on this machine whether that process still runs. */
-export interface LockHolder {
-  pid: number;
-  host: string;
-  // Linux only: the boot the process ran in, and its start time in that boot, so
-  // that a process number given to another process since doesn't count.
-  boot?: string;
-  start?: string;
-  startedAt: number;
+// Only one start at a time may remove a stale lock: whoever creates this file.
+function takeoverPath(): string {
+  return `${lockPath()}.takeover`;
 }
 
-async function bootId(): Promise<string | undefined> {
-  return (await readFile('/proc/sys/kernel/random/boot_id', 'utf8').catch(() => '')).trim() || undefined;
+const DEFAULT_LOCK_STALE_MS = 10_000;
+// After writing its lock a start looks again this much later: should a start that
+// judged an older lock stale at the same moment have replaced it, one of the two
+// gives way here.
+const LOCK_CONFIRM_MS = 100;
+
+/** PUSH_LOCK_STALE_MS: how long a lock may go without a refresh before a start takes it over. */
+export function lockStaleMs(): number {
+  const value = Number(process.env.PUSH_LOCK_STALE_MS);
+  return Number.isFinite(value) && value >= 1000 ? Math.floor(value) : DEFAULT_LOCK_STALE_MS;
 }
 
-async function startTimeOf(pid: number): Promise<string | undefined> {
-  const stat = await readFile(`/proc/${pid}/stat`, 'utf8').catch(() => '');
-  // After the command name, which may hold spaces: field 22 is the 20th.
-  return stat ? stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19] : undefined;
-}
-
-function isRunning(pid: number): boolean {
+/** What a lock says about its holder, for the log line of a start that gives way. */
+function holderOf(text: string): { pid?: unknown; host?: unknown; since?: string } {
   try {
-    process.kill(pid, 0);
+    const value = JSON.parse(text) as { pid?: unknown; host?: unknown; startedAt?: unknown };
+    const since = typeof value.startedAt === 'number' && Number.isFinite(value.startedAt) ? new Date(value.startedAt).toISOString() : undefined;
+    return { pid: value.pid, host: value.host, since };
+  } catch {
+    return {};
+  }
+}
+
+/** Creates a file only if there is none. False when there is one already. */
+async function createOnly(file: string, text: string): Promise<boolean> {
+  try {
+    const handle = await open(file, 'wx', PRIVATE_FILE);
+    try {
+      await handle.writeFile(text, 'utf-8');
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
     return true;
   } catch (error) {
-    // It runs, as another user.
-    return (error as NodeJS.ErrnoException).code === 'EPERM';
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw error;
   }
 }
 
-export async function currentLockHolder(): Promise<LockHolder> {
-  return { pid: process.pid, host: os.hostname(), boot: await bootId(), start: await startTimeOf(process.pid), startedAt: Date.now() };
-}
-
-/**
- * Whether the relay that wrote a lock may still run, as far as `me` can tell.
- * Its process number only means something on the same host: a lock from another
- * host (another container without a fixed host name, another machine on a shared
- * mount) counts as held. On the same host it is free when the machine has
- * restarted since, when the number is this process's own (an earlier run in a
- * new container, where the relay gets the same number every time), when no
- * process has the number, or when the process that has it started at another
- * time (the number went to another process).
- */
-export async function lockHolderRuns(holder: LockHolder, me: LockHolder): Promise<boolean> {
-  if (holder.host !== me.host) return true;
-  if (holder.boot && me.boot && holder.boot !== me.boot) return false;
-  if (holder.pid === me.pid) return false;
-  if (!isRunning(holder.pid)) return false;
-  if (holder.start) {
-    const start = await startTimeOf(holder.pid);
-    if (start !== undefined && start !== holder.start) return false;
-  }
-  return true;
-}
-
-function parseLock(text: string): LockHolder | null {
-  try {
-    const value = JSON.parse(text) as Partial<LockHolder>;
-    if (!value || !Number.isSafeInteger(value.pid) || typeof value.host !== 'string') return null;
-    return value as LockHolder;
-  } catch {
-    return null;
-  }
-}
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : 'Unknown error';
@@ -241,8 +226,13 @@ class SubscriptionStore {
   private snapshotNumbered = false;
   private foldRetryAt = 0;
   private closed = false;
-  // What this process wrote into subscriptions.lock, while it holds it.
+  // What this process wrote into subscriptions.lock, while it holds it, and the
+  // timer that refreshes it.
   private lock: string | null = null;
+  private lockRefresh: NodeJS.Timeout | null = null;
+  private lockLost = false;
+  /** Called once when another relay has taken the lock over. The server exits. */
+  onLockLost: () => void = () => undefined;
   // The client address each record was last registered from, while the relay
   // runs. Never written to disk: after a start a record has none until its
   // client registers again, which it does on every page load and app start.
@@ -276,52 +266,122 @@ class SubscriptionStore {
   }
 
   /**
-   * Takes subscriptions.lock for this process before anything is read. Rejects,
-   * so the relay doesn't start, while another relay that may still run holds it
-   * (see lockHolderRuns); one left by a relay that is gone is taken over.
+   * Takes subscriptions.lock for this process before anything is read, and starts
+   * refreshing it. Rejects, so the relay doesn't start, while a lock refreshed
+   * within the stale time is there; takes over one that wasn't.
    */
   private async takeLock(): Promise<void> {
     const file = lockPath();
-    const text = JSON.stringify(await currentLockHolder());
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const handle = await open(file, 'wx', PRIVATE_FILE);
-        try {
-          await handle.writeFile(text, 'utf-8');
-          await handle.sync();
-        } finally {
-          await handle.close();
+    const text = JSON.stringify({ token: randomBytes(16).toString('hex'), pid: process.pid, host: os.hostname(), startedAt: Date.now() });
+    const staleMs = lockStaleMs();
+    try {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (await createOnly(file, text)) {
+          await sleep(LOCK_CONFIRM_MS);
+          if ((await readFile(file, 'utf-8').catch(() => null)) !== text) continue;
+          this.lock = text;
+          this.lockRefresh = setInterval(() => void this.refreshLock(), Math.max(200, Math.floor(staleMs / 5)));
+          this.lockRefresh.unref();
+          return;
         }
-        this.lock = text;
-        return;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-          logger.error('store: could not write subscriptions.lock', { error: message(error) });
-          throw error;
+        const found = await readFile(file, 'utf-8').catch(() => null);
+        const info = await stat(file).catch(() => null);
+        if (found === null || info === null) continue;
+        const age = Date.now() - info.mtimeMs;
+        if (age < staleMs) {
+          logger.error('store: another relay holds this data directory, so this one does not start; stop that relay first, or wait until its lock goes stale if it was killed', {
+            refreshedSecondsAgo: Math.max(0, Math.round(age / 100) / 10),
+            staleAfterSeconds: staleMs / 1000,
+            ...holderOf(found),
+          });
+          throw new Error('the data directory is held by another relay');
         }
+        await this.removeStaleLock(found, info.mtimeMs, staleMs);
       }
-      const found = await readFile(file, 'utf-8').catch(() => null);
-      if (found === null) continue;
-      const holder = parseLock(found);
-      if (holder && (await lockHolderRuns(holder, JSON.parse(text) as LockHolder))) {
-        logger.error('store: another relay holds this data directory, so this one does not start; stop that relay first, or remove subscriptions.lock if it no longer runs', {
-          pid: holder.pid,
-          host: holder.host,
-          since: Number.isFinite(holder.startedAt) ? new Date(holder.startedAt).toISOString() : undefined,
-        });
-        throw new Error('the data directory is held by another relay');
+      throw new Error('could not take subscriptions.lock');
+    } catch (error) {
+      if (!(error instanceof Error && error.message === 'the data directory is held by another relay')) {
+        logger.error('store: could not take subscriptions.lock', { error: message(error) });
       }
-      // Only the lock judged here goes, not one a relay starting at the same time wrote since.
-      if ((await readFile(file, 'utf-8').catch(() => null)) !== found) continue;
-      await unlink(file).catch(() => undefined);
-      logger.warn('store: took over subscriptions.lock from a relay that no longer runs', holder ? { pid: holder.pid, host: holder.host } : {});
+      throw error;
     }
-    logger.error('store: could not take subscriptions.lock; another relay keeps writing it');
-    throw new Error('could not take subscriptions.lock');
   }
 
-  // Removes subscriptions.lock, if it is still the one this process wrote.
+  // Removes a lock that went stale, if it is still the one judged stale: only one
+  // start at a time may (it holds the takeover file), so a lock another start has
+  // just written stays.
+  private async removeStaleLock(found: string, mtimeMs: number, staleMs: number): Promise<void> {
+    if (!(await createOnly(takeoverPath(), String(process.pid)))) {
+      // A start that died while it held the takeover file leaves it behind.
+      const left = await stat(takeoverPath()).catch(() => null);
+      if (left && Date.now() - left.mtimeMs > staleMs) await unlink(takeoverPath()).catch(() => undefined);
+      await sleep(20 + Math.floor(Math.random() * 30));
+      return;
+    }
+    try {
+      const again = await readFile(lockPath(), 'utf-8').catch(() => null);
+      const info = await stat(lockPath()).catch(() => null);
+      if (again === found && info?.mtimeMs === mtimeMs) {
+        await unlink(lockPath()).catch(() => undefined);
+        logger.warn('store: took over subscriptions.lock from a relay that stopped refreshing it', {
+          refreshedSecondsAgo: Math.round((Date.now() - mtimeMs) / 100) / 10,
+          ...holderOf(found),
+        });
+      }
+    } finally {
+      await unlink(takeoverPath()).catch(() => undefined);
+    }
+  }
+
+  // Keeps the lock fresh, as long as it is still this process's.
+  private async refreshLock(): Promise<void> {
+    if (this.lock === null) return;
+    let found: string | null;
+    try {
+      found = await readFile(lockPath(), 'utf-8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        logger.warn('store: could not read subscriptions.lock to refresh it', { error: message(error) });
+        return;
+      }
+      found = null;
+    }
+    if (this.lock === null) return;
+    if (found !== this.lock) {
+      this.loseLock();
+      return;
+    }
+    const now = new Date();
+    await utimes(lockPath(), now, now).catch((error: unknown) => {
+      logger.warn('store: could not refresh subscriptions.lock', { error: message(error) });
+    });
+  }
+
+  // Before every write: the lock must still be this process's.
+  private async checkLock(): Promise<void> {
+    if (this.lockLost) throw new Error('another relay took over the data directory');
+    if (this.lock === null) return;
+    if ((await readFile(lockPath(), 'utf-8').catch(() => null)) === this.lock) return;
+    this.loseLock();
+    throw new Error('another relay took over the data directory');
+  }
+
+  // Another relay holds the directory now: nothing more is written, and the server ends.
+  private loseLock(): void {
+    if (this.lock === null) return;
+    this.lock = null;
+    this.lockLost = true;
+    this.closed = true;
+    if (this.lockRefresh) clearInterval(this.lockRefresh);
+    this.lockRefresh = null;
+    logger.error('store: another relay took over subscriptions.lock, so this one stops writing and exits');
+    this.onLockLost();
+  }
+
+  // Stops refreshing, and removes subscriptions.lock if it is still this process's.
   private async releaseLock(): Promise<void> {
+    if (this.lockRefresh) clearInterval(this.lockRefresh);
+    this.lockRefresh = null;
     if (this.lock === null) return;
     const file = lockPath();
     if ((await readFile(file, 'utf-8').catch(() => null)) === this.lock) await unlink(file).catch(() => undefined);
@@ -818,6 +878,7 @@ class SubscriptionStore {
   private async append(id: string, record: SubscriptionRecord | null): Promise<void> {
     if (this.closed) throw new Error('the store is closed');
     if (record && recordBytes(record) > MAX_RECORD_BYTES) throw new Error('the record is larger than a record may be');
+    await this.checkLock();
     if (this.journalBytes === 0 && !this.snapshotNumbered) {
       if (Date.now() < this.foldRetryAt) {
         storeWriteFailures.inc();
@@ -876,6 +937,7 @@ class SubscriptionStore {
   // with the last change, written aside and renamed into place; the one it
   // replaces stays as the previous version. Only then does the journal go.
   private async fold(leaveOut?: Set<string>): Promise<void> {
+    await this.checkLock();
     const target = subscriptionsPath();
     const tmp = `${target}.tmp`;
     let bytes = 0;

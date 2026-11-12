@@ -64,12 +64,16 @@ async function register(relay: { base: string }, id: string, pathname: string, f
 
 const known = async (relay: { base: string }, id: string) => (await getJson(relay.base, `/api/push/active/${id}`)).status === 200;
 
-/** Every file under the data directory with its size, change time and inode. */
+/**
+ * Every file under the data directory with its size, change time and inode. Not
+ * the lock: its holder refreshes it every few seconds, whatever the requests do.
+ */
 function dirStamp(dir: string): string {
   const lines: string[] = [];
   const walk = (folder: string) => {
     for (const entry of fs.readdirSync(folder, { withFileTypes: true })) {
       const full = path.join(folder, entry.name);
+      if (entry.name.startsWith('subscriptions.lock')) continue;
       if (entry.isDirectory()) walk(full);
       else {
         const stat = fs.statSync(full, { bigint: true });
