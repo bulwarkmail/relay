@@ -217,7 +217,14 @@ real ones take a few hundred bytes.
 The `accountLabel` is what the client sends, and Bulwark clients send the sign-in
 name. It is stored here and copied into every push: encrypted to the device for Web
 Push and UnifiedPush with keys, but readable to Google and Apple in FCM and APNs
-payloads, and to the distributor on a UnifiedPush endpoint without keys.
+payloads, and to the distributor on a UnifiedPush endpoint without keys. Whatever a
+client registers is what goes to them. The relay never needs the label to be a
+sign-in name: it only hands it back, so the client can tell which account a push
+is for. A client can register any opaque text up to 120 characters instead, such
+as a random value it keeps with the account, and match pushes by that; one of
+letters, digits, `_` and `-` also reaches a UnifiedPush device without keys. The
+apps released so far pick the account by the sign-in name in the push, so the
+relay passes on whatever label was registered, unchanged.
 
 Subscriptions with no push and no registration for 90 days are evicted. One that
 never delivered a push and whose verification code no client picked up goes after
