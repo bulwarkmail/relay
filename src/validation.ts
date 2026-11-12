@@ -142,9 +142,28 @@ export function mayTakeSecret(id: string): boolean {
   return id.length >= MIN_ID_CHARS_WITH_SECRET;
 }
 
-/** What the store keeps of a secret: its SHA-256, base64url. Never the secret. */
-export function secretHashOf(secret: string): string {
-  return createHash('sha256').update(secret, 'utf8').digest('base64url');
+/**
+ * What the store keeps of a secret or a push key: its SHA-256, base64url. Never
+ * the value itself.
+ */
+export function secretHashOf(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('base64url');
+}
+
+// The push URL the client hands the mail server carries a push key, not the
+// secret: the mail server stores and may log that URL. The key only lets its
+// holder push to the record. Rule, fixed for every client: SHA-256 over these
+// ASCII bytes followed by the secret's, base64url without padding (43 characters).
+const PUSH_KEY_LABEL = 'bulwark-relay-push-key-v1:';
+
+/** The push key that belongs to a secret. */
+export function pushKeyOf(secret: string): string {
+  return createHash('sha256').update(PUSH_KEY_LABEL + secret, 'utf8').digest('base64url');
+}
+
+/** Whether a value has a push key's shape. */
+export function isValidPushKey(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value);
 }
 
 /** Whether two stored hashes are the same, in a time that doesn't depend on where they differ. */

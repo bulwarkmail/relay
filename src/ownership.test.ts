@@ -10,7 +10,7 @@
 //   - only an id of 40 characters or more takes a secret (released clients use 32 hex
 //     digits); a shorter one, or an id registered without a secret, answers 409
 //   - DELETE /api/push/register/:id and GET /api/push/verify/:id take the secret as
-//     `Authorization: Bearer <secret>`, POST /api/push/jmap/:id as `?k=<secret>`
+//     `Authorization: Bearer <secret>`, POST /api/push/jmap/:id takes the push key
 //   - GET /api/push/active/:id stays open
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -68,6 +68,13 @@ after(async () => {
 const SECRET = 'fake-owner-secret-0123456789abcdefghijklm';
 const OTHER_SECRET = 'fake-other-secret-0123456789abcdefghijklm';
 
+/**
+ * The push key a client puts into the push URL: base64url, without padding, of
+ * SHA-256 over "bulwark-relay-push-key-v1:" followed by the secret.
+ */
+const pushKeyOf = (secret: string) => crypto.createHash('sha256').update(`bulwark-relay-push-key-v1:${secret}`, 'utf8').digest('base64url');
+const PUSH_KEY = pushKeyOf(SECRET);
+
 /** An id of the form a client that sends a secret uses: 32 random bytes, base64url. */
 const longId = () => crypto.randomBytes(32).toString('base64url');
 
@@ -123,7 +130,7 @@ describe('a record registered with a secret', () => {
       const res = await postJson(relay.base, route, body);
       assert.equal(res.status, 403, `${route} answered ${res.status}`);
     }
-    assert.equal((await postJson(relay.base, `/api/push/jmap/${id}?k=${SECRET}`, emailPush('a', ['e1']))).status, 200);
+    assert.equal((await postJson(relay.base, `/api/push/jmap/${id}?k=${PUSH_KEY}`, emailPush('a', ['e1']))).status, 200);
     assert.equal(service.to('/owned').length, 1, 'the push went somewhere else');
     assert.equal(service.to('/taker').length, 0);
   });
@@ -132,13 +139,13 @@ describe('a record registered with a secret', () => {
     const { id } = await registerWithSecret('/owned-web');
     const again = await postJson(relay.base, '/api/push/register/web', { subscriptionId: id, subscription: { endpoint: service.url('/owned-web-2'), keys: makeDevice().keys }, secret: SECRET });
     assert.equal(again.status, 200);
-    assert.equal((await postJson(relay.base, `/api/push/jmap/${id}?k=${SECRET}`, emailPush('a', ['e1']))).status, 200);
+    assert.equal((await postJson(relay.base, `/api/push/jmap/${id}?k=${PUSH_KEY}`, emailPush('a', ['e1']))).status, 200);
     assert.equal(service.to('/owned-web-2').length, 1);
     // Web Push to UnifiedPush: the record stays the owner's.
     const moved = await postJson(relay.base, '/api/push/register/unifiedpush', { subscriptionId: id, endpoint: service.url('/owned-up'), secret: SECRET });
     assert.equal(moved.status, 200);
     assert.equal((await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e2']))).status, 403, 'the secret did not carry over');
-    assert.equal((await postJson(relay.base, `/api/push/jmap/${id}?k=${SECRET}`, emailPush('a', ['e3']))).status, 200);
+    assert.equal((await postJson(relay.base, `/api/push/jmap/${id}?k=${PUSH_KEY}`, emailPush('a', ['e3']))).status, 200);
     assert.equal(service.to('/owned-up').length, 1);
     assert.equal((await del(id)).status, 403);
     assert.equal((await del(id, SECRET)).status, 200);
@@ -158,7 +165,7 @@ describe('a record registered with a secret', () => {
 
   it('gives its verification code only to a poll with its secret, and a refused poll changes nothing', async () => {
     const { id } = await registerWithSecret('/owned-verify');
-    assert.equal((await postJson(relay.base, `/api/push/jmap/${id}?k=${SECRET}`, pushVerification('the-code'))).status, 200);
+    assert.equal((await postJson(relay.base, `/api/push/jmap/${id}?k=${PUSH_KEY}`, pushVerification('the-code'))).status, 200);
     for (const attempt of [poll(id), poll(id, OTHER_SECRET), call(relay.base, `/api/push/verify/${id}?k=${SECRET}`, 'GET')]) {
       const refused = await attempt;
       assert.equal(refused.status, 403);
@@ -169,15 +176,18 @@ describe('a record registered with a secret', () => {
     assert.ok(storedRecords(relay.dataDir)[id].codeCollectedAt);
   });
 
-  it('takes pushes and codes only on the URL with its secret, decoded, given once', async () => {
+  it('takes pushes and codes only on the URL with its push key, decoded, given once', async () => {
     const { id } = await registerWithSecret('/owned-push');
     const refusedTargets = [
       `/api/push/jmap/${id}`,
-      `/api/push/jmap/${id}?k=${OTHER_SECRET}`,
+      `/api/push/jmap/${id}?k=${pushKeyOf(OTHER_SECRET)}`,
       `/api/push/jmap/${id}?k=`,
-      `/api/push/jmap/${id}?k=${SECRET}x`,
-      `/api/push/jmap/${id}?k=${SECRET}&k=${SECRET}`,
-      `/api/push/jmap/${id}?key=${SECRET}`,
+      `/api/push/jmap/${id}?k=${PUSH_KEY}x`,
+      `/api/push/jmap/${id}?k=${PUSH_KEY.slice(1)}`,
+      `/api/push/jmap/${id}?k=${PUSH_KEY}&k=${PUSH_KEY}`,
+      `/api/push/jmap/${id}?key=${PUSH_KEY}`,
+      // The secret itself is no push key.
+      `/api/push/jmap/${id}?k=${SECRET}`,
     ];
     for (const target of refusedTargets) {
       for (const body of [emailPush('a', ['forged']), pushVerification('forged-code')]) {
@@ -186,15 +196,59 @@ describe('a record registered with a secret', () => {
       }
     }
     // The header belongs to the other routes: on the push URL it counts for nothing.
-    assert.equal((await call(relay.base, `/api/push/jmap/${id}`, 'POST', { bearer: SECRET, body: emailPush('a', ['forged']) })).status, 403);
+    for (const bearer of [SECRET, PUSH_KEY]) {
+      assert.equal((await call(relay.base, `/api/push/jmap/${id}`, 'POST', { bearer, body: emailPush('a', ['forged']) })).status, 403);
+    }
     assert.equal(service.to('/owned-push').length, 0, 'something reached the device');
     assert.deepEqual((await poll(id, SECRET)).body, { verificationCode: null }, 'a refused push stored a code');
     // A percent-encoded character is the character it stands for.
-    const encoded = SECRET.replace('-', '%2D');
-    assert.notEqual(encoded, SECRET);
+    const encoded = `%${PUSH_KEY.charCodeAt(0).toString(16)}${PUSH_KEY.slice(1)}`;
+    assert.notEqual(encoded, PUSH_KEY);
     assert.equal((await postJson(relay.base, `/api/push/jmap/${id}?k=${encoded}`, emailPush('a', ['e1']))).status, 200);
-    assert.equal((await postJson(relay.base, `/api/push/jmap/${id}?other=1&k=${SECRET}`, emailPush('a', ['e2']))).status, 200);
+    assert.equal((await postJson(relay.base, `/api/push/jmap/${id}?other=1&k=${PUSH_KEY}`, emailPush('a', ['e2']))).status, 200);
     assert.equal(service.to('/owned-push').length, 2);
+  });
+
+  it('has the push key the documented rule gives, which clients can check their code against', async () => {
+    const vectors = [
+      // 32 bytes 0x00 to 0x1f, base64url: what a client's random secret looks like.
+      ['AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8', 'j5u1SE4uZtEqYP6s1cBnuAyp6AeXXZzlUO2d2N1yHX4'],
+      // The longest secret the relay takes, of the two characters besides letters and digits.
+      ['-_'.repeat(64), 'NYzeMuKHzCMv54rOjyAWixIcpOUb6s7Otgp4-ONFwk8'],
+    ];
+    for (const [secret, pushKey] of vectors) {
+      assert.equal(pushKeyOf(secret), pushKey);
+      const id = longId();
+      await registerWithSecret(`/vector-${pushKey.slice(0, 6)}`, id, secret);
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${id}?k=${pushKey}`, emailPush('a', ['e1']))).status, 200, 'the relay derives another key');
+      assert.equal(service.to(`/vector-${pushKey.slice(0, 6)}`).length, 1);
+      assert.equal((await del(id, secret)).status, 200);
+    }
+  });
+
+  it('lets whoever holds only the push URL push and post codes, and nothing else', async () => {
+    const { id } = await registerWithSecret('/url-only');
+    // What the mail server does with the URL: both kinds of push.
+    assert.equal((await postJson(relay.base, `/api/push/jmap/${id}?k=${PUSH_KEY}`, pushVerification('code-from-url'))).status, 200);
+    assert.equal((await postJson(relay.base, `/api/push/jmap/${id}?k=${PUSH_KEY}`, emailPush('a', ['e1']))).status, 200);
+    // The owner's routes refuse the push key, wherever it is put.
+    assert.equal((await poll(id, PUSH_KEY)).status, 403, 'the push key read the verification code');
+    assert.equal((await del(id, PUSH_KEY)).status, 403, 'the push key deleted the record');
+    for (const [route, body] of [
+      ['/api/push/register/web', { subscriptionId: id, subscription: { endpoint: service.url('/url-taker'), keys: makeDevice().keys }, secret: PUSH_KEY }],
+      ['/api/push/register/unifiedpush', { subscriptionId: id, endpoint: service.url('/url-taker'), secret: PUSH_KEY }],
+      ['/api/push/register', { subscriptionId: id, fcmToken: 'f'.repeat(100), secret: PUSH_KEY }],
+      ['/api/push/register/apns', { subscriptionId: id, deviceToken: 'ab'.repeat(32), environment: 'production', secret: PUSH_KEY }],
+      ['/api/push/register/web', { subscriptionId: id, subscription: { endpoint: service.url('/url-taker'), keys: makeDevice().keys } }],
+    ] as const) {
+      assert.equal((await postJson(relay.base, route, body)).status, 403, `${route} took the push key as the secret`);
+    }
+    // The record is the owner's as before.
+    assert.equal((await postJson(relay.base, `/api/push/jmap/${id}?k=${PUSH_KEY}`, emailPush('a', ['e2']))).status, 200);
+    assert.equal(service.to('/url-only').length, 2);
+    assert.equal(service.to('/url-taker').length, 0);
+    assert.deepEqual((await poll(id, SECRET)).body, { verificationCode: 'code-from-url' });
+    assert.equal((await del(id, SECRET)).status, 200);
   });
 
   it('is not made from a secret of the wrong shape, on any route', async () => {
@@ -220,11 +274,12 @@ describe('a record registered with a secret', () => {
       const id = longId();
       const unknown = longId();
       assert.equal((await postJson(own.base, '/api/push/register/web', { subscriptionId: id, subscription: { endpoint: service.url('/owned-store'), keys: makeDevice().keys }, secret: SECRET })).status, 200);
-      await postJson(own.base, `/api/push/jmap/${id}?k=${SECRET}`, emailPush('a', ['e1']));
+      await postJson(own.base, `/api/push/jmap/${id}?k=${PUSH_KEY}`, emailPush('a', ['e1']));
       await postJson(own.base, `/api/push/jmap/${id}?k=${OTHER_SECRET}`, emailPush('a', ['e2']));
+      await postJson(own.base, `/api/push/jmap/${id}?k=${SECRET}`, emailPush('a', ['e2']));
       // The paths that answer early or fail.
-      await postJson(own.base, `/api/push/jmap/${id}?k=${SECRET}`, '{not json');
-      await postJson(own.base, `/api/push/jmap/${unknown}?k=${SECRET}`, emailPush('a', ['e3']));
+      await postJson(own.base, `/api/push/jmap/${id}?k=${PUSH_KEY}`, '{not json');
+      await postJson(own.base, `/api/push/jmap/${unknown}?k=${PUSH_KEY}`, emailPush('a', ['e3']));
       await call(own.base, `/api/push/register/${id}`, 'DELETE', { bearer: OTHER_SECRET });
       await call(own.base, `/api/push/verify/${id}`, 'GET', { bearer: OTHER_SECRET });
       await postJson(own.base, '/api/push/register/web', { subscriptionId: newId(), subscription: { endpoint: service.url('/owned-store'), keys: makeDevice().keys }, secret: SECRET });
@@ -235,15 +290,17 @@ describe('a record registered with a secret', () => {
         const content = fs.readFileSync(path.join(entry.parentPath ?? (entry as any).path, entry.name), 'latin1');
         assert.ok(!content.includes(SECRET), `${entry.name} holds the secret`);
         assert.ok(!content.includes(OTHER_SECRET), `${entry.name} holds a secret somebody tried`);
+        assert.ok(!content.includes(PUSH_KEY), `${entry.name} holds the push key`);
       }
       assert.ok(!own.logs().includes(SECRET), 'the logs hold the secret');
       assert.ok(!own.logs().includes(OTHER_SECRET), 'the logs hold a secret somebody tried');
+      assert.ok(!own.logs().includes(PUSH_KEY), 'the logs hold the push key');
 
       again = await own.restart();
       assert.equal((await del(id, undefined, again.base)).status, 403);
       assert.equal((await poll(id, undefined, again.base)).status, 403);
       assert.equal((await postJson(again.base, `/api/push/jmap/${id}`, emailPush('a', ['e4']))).status, 403);
-      assert.equal((await postJson(again.base, `/api/push/jmap/${id}?k=${SECRET}`, emailPush('a', ['e5']))).status, 200);
+      assert.equal((await postJson(again.base, `/api/push/jmap/${id}?k=${PUSH_KEY}`, emailPush('a', ['e5']))).status, 200);
       assert.equal((await poll(id, SECRET, again.base)).status, 200);
       assert.equal((await del(id, SECRET, again.base)).status, 200);
       assert.ok(!again.logs().includes(SECRET));

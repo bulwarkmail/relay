@@ -212,6 +212,16 @@ export function mayUse(record: SubscriptionRecord, secretHash: string | null): b
   return record.secretHash === undefined || (secretHash !== null && sameSecretHash(record.secretHash, secretHash));
 }
 
+/**
+ * Whether a caller who presents the push key with this hash (null: none) may push
+ * to the record, or post its verification code. Always on a record without a
+ * secret; never on one with a secret but no push key's hash. The secret itself is
+ * no push key, and a push key owns nothing.
+ */
+export function mayPush(record: SubscriptionRecord, pushKeyHash: string | null): boolean {
+  return record.secretHash === undefined || (pushKeyHash !== null && sameSecretHash(record.pushKeyHash, pushKeyHash));
+}
+
 const registeredAt = (record: SubscriptionRecord) => Math.max(record.createdAt, record.lastRegisteredAt ?? 0);
 
 class SubscriptionStore {

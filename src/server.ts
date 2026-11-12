@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { URL } from 'node:url';
 import { logger } from './logger.js';
-import { MAX_REGISTRATION_BYTES, mayUse, recordBytes, subscriptionStore } from './store.js';
+import { MAX_REGISTRATION_BYTES, mayPush, mayUse, recordBytes, subscriptionStore } from './store.js';
 import { isFcmConfigured, sendFcmPush } from './fcm.js';
 import { getApnsConfig, sendApnsPush } from './apns.js';
 import { getVapidPublicKey, sendWebPush } from './webpush.js';
@@ -25,6 +25,7 @@ import {
   isValidApnsEnvironment,
   isValidApnsToken,
   isValidFcmToken,
+  isValidPushKey,
   isValidSecret,
   isValidSubscriptionId,
   isValidVerificationCode,
@@ -32,6 +33,7 @@ import {
   normalizeEndpoint,
   normalizeKeys,
   normalizeWebPushSubscription,
+  pushKeyOf,
   secretHashOf,
 } from './validation.js';
 import type {
@@ -228,20 +230,28 @@ async function store(req: http.IncomingMessage, res: http.ServerResponse, id: st
 // A record registered with a secret belongs to whoever holds that secret: the
 // store keeps its hash (see store.ts, put). A registration for its id brings
 // the same secret in the body; DELETE and the verification poll send it as
-// `Authorization: Bearer <secret>`; the mail server's push URL carries it as
-// `?k=<secret>`, since a URL is all the mail server has. Each route looks in its
-// one place and nowhere else, so a proxy's access log can be told what to drop.
-// A record without a secret works by its id alone on every route, whatever
-// header or query comes along, as it always has.
+// `Authorization: Bearer <secret>`. The mail server's push URL carries the push
+// key derived from it (pushKeyOf) as `?k=<push key>`, since a URL is all the mail
+// server has and it stores and may log that URL: the key pushes and owns nothing.
+// Each route looks in its one place and nowhere else, so a proxy's access log can
+// be told what to drop. A record without a secret works by its id alone on every
+// route, whatever header or query comes along, as it always has.
 const NOT_OWNER = 'Wrong or missing secret for this subscription';
+const NO_PUSH_KEY = 'Wrong or missing push key for this subscription';
 const NO_SECRET_FOR_ID = 'This subscription id cannot take a secret; register a new id of 40 characters or more with it';
 
+interface Owner {
+  secretHash: string;
+  pushKeyHash: string;
+}
+
 /**
- * The hash of the secret a registration brings: undefined when it brings none,
- * null after answering a `secret` the relay can't take (400), or one for an id
- * that may not take a secret (409, see mayTakeSecret).
+ * What a registration that brings a secret binds the record to: the hashes of
+ * the secret and of its push key. Undefined when it brings none, null after
+ * answering a `secret` the relay can't take (400), or one for an id that may not
+ * take a secret (409, see mayTakeSecret).
  */
-function registeredSecret(res: http.ServerResponse, id: string, value: unknown): string | undefined | null {
+function registeredSecret(res: http.ServerResponse, id: string, value: unknown): Owner | undefined | null {
   if (value === undefined) return undefined;
   if (!isValidSecret(value)) {
     sendJson(res, 400, { error: 'Invalid secret' });
@@ -251,7 +261,7 @@ function registeredSecret(res: http.ServerResponse, id: string, value: unknown):
     sendJson(res, 409, { error: NO_SECRET_FOR_ID });
     return null;
   }
-  return secretHashOf(value);
+  return { secretHash: secretHashOf(value), pushKeyHash: secretHashOf(pushKeyOf(value)) };
 }
 
 /**
@@ -260,8 +270,8 @@ function registeredSecret(res: http.ServerResponse, id: string, value: unknown):
  * the same body, so a client can tell whether to send the secret later, which a
  * browser can only do to a relay whose CORS answer allows the header.
  */
-function registered(secretHash: string | undefined) {
-  return secretHash ? { ok: true, owned: true } : { ok: true };
+function registered(owner: Owner | undefined) {
+  return owner ? { ok: true, owned: true } : { ok: true };
 }
 
 /** The hash of the secret in `Authorization: Bearer <secret>`, or null. */
@@ -270,10 +280,10 @@ function bearerSecret(req: http.IncomingMessage): string | null {
   return match && isValidSecret(match[1]) ? secretHashOf(match[1]) : null;
 }
 
-/** The hash of the secret in the query's one `k`, decoded, or null. Two `k` count as none. */
-function querySecret(query: URLSearchParams): string | null {
+/** The hash of the push key in the query's one `k`, decoded, or null. Two `k` count as none. */
+function queryPushKey(query: URLSearchParams): string | null {
   const values = query.getAll('k');
-  return values.length === 1 && isValidSecret(values[0]) ? secretHashOf(values[0]) : null;
+  return values.length === 1 && isValidPushKey(values[0]) ? secretHashOf(values[0]) : null;
 }
 
 // What a new registration keeps from the record it replaces. A backoff the push
@@ -315,8 +325,8 @@ async function handleRegister(
   if (label === null) {
     return sendJson(res, 400, { error: 'Invalid accountLabel' });
   }
-  const secretHash = registeredSecret(res, subscriptionId, secret);
-  if (secretHash === null) return;
+  const owner = registeredSecret(res, subscriptionId, secret);
+  if (owner === null) return;
 
   const existing = await subscriptionStore.get(subscriptionId);
   const record: FcmSubscriptionRecord = {
@@ -331,11 +341,11 @@ async function handleRegister(
     verificationCode: null,
     ...carriedOver(existing),
     accountLabel: label,
-    ...(secretHash ? { secretHash } : {}),
+    ...owner,
   };
   if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'fcm' });
-  return sendJson(res, 200, registered(secretHash));
+  return sendJson(res, 200, registered(owner));
 }
 
 // The iOS app. Refused up front when the relay has no APNs key, as Web Push
@@ -368,8 +378,8 @@ async function handleRegisterApns(
   if (label === null) {
     return sendJson(res, 400, { error: 'Invalid accountLabel' });
   }
-  const secretHash = registeredSecret(res, subscriptionId, secret);
-  if (secretHash === null) return;
+  const owner = registeredSecret(res, subscriptionId, secret);
+  if (owner === null) return;
 
   const existing = await subscriptionStore.get(subscriptionId);
   const record: ApnsSubscriptionRecord = {
@@ -380,11 +390,11 @@ async function handleRegisterApns(
     verificationCode: null,
     ...carriedOver(existing),
     accountLabel: label,
-    ...(secretHash ? { secretHash } : {}),
+    ...owner,
   };
   if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'apns' });
-  return sendJson(res, 200, registered(secretHash));
+  return sendJson(res, 200, registered(owner));
 }
 
 async function handleRegisterWeb(
@@ -420,8 +430,8 @@ async function handleRegisterWeb(
   if (label === null) {
     return sendJson(res, 400, { error: 'Invalid accountLabel' });
   }
-  const secretHash = registeredSecret(res, subscriptionId, secret);
-  if (secretHash === null) return;
+  const owner = registeredSecret(res, subscriptionId, secret);
+  if (owner === null) return;
 
   const existing = await subscriptionStore.get(subscriptionId);
   const record: WebSubscriptionRecord = {
@@ -431,11 +441,11 @@ async function handleRegisterWeb(
     verificationCode: null,
     ...carriedOver(existing),
     accountLabel: label,
-    ...(secretHash ? { secretHash } : {}),
+    ...owner,
   };
   if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'web' });
-  return sendJson(res, 200, registered(secretHash));
+  return sendJson(res, 200, registered(owner));
 }
 
 // UnifiedPush (mobile app without Google Play services). No VAPID gate like
@@ -474,8 +484,8 @@ async function handleRegisterUnifiedPush(
   if (label === null) {
     return sendJson(res, 400, { error: 'Invalid accountLabel' });
   }
-  const secretHash = registeredSecret(res, subscriptionId, secret);
-  if (secretHash === null) return;
+  const owner = registeredSecret(res, subscriptionId, secret);
+  if (owner === null) return;
 
   const existing = await subscriptionStore.get(subscriptionId);
   const record: UnifiedPushSubscriptionRecord = {
@@ -486,11 +496,11 @@ async function handleRegisterUnifiedPush(
     verificationCode: null,
     ...carriedOver(existing),
     accountLabel: label,
-    ...(secretHash ? { secretHash } : {}),
+    ...owner,
   };
   if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'up' });
-  return sendJson(res, 200, registered(secretHash));
+  return sendJson(res, 200, registered(owner));
 }
 
 async function handleUnregister(
@@ -578,14 +588,14 @@ async function handleJmap(
     return sendJson(res, 400, { error: 'Invalid subscriptionId' });
   }
 
-  // Only the push URL the owner gave the mail server carries its secret.
-  const presented = querySecret(query);
+  // Only the push URL the owner gave the mail server carries the push key.
+  const presented = queryPushKey(query);
   let record = await subscriptionStore.get(id);
   if (!record) {
     return sendJson(res, 404, { error: 'Unknown subscription' });
   }
-  if (!mayUse(record, presented)) {
-    return sendJson(res, 403, { error: NOT_OWNER });
+  if (!mayPush(record, presented)) {
+    return sendJson(res, 403, { error: NO_PUSH_KEY });
   }
 
   const body = (await readJson(req)) as JmapPushBody | null | undefined;
@@ -597,8 +607,8 @@ async function handleJmap(
   if (!record) {
     return sendJson(res, 404, { error: 'Unknown subscription' });
   }
-  if (!mayUse(record, presented)) {
-    return sendJson(res, 403, { error: NOT_OWNER });
+  if (!mayPush(record, presented)) {
+    return sendJson(res, 403, { error: NO_PUSH_KEY });
   }
 
   if (body['@type'] === 'PushVerification') {

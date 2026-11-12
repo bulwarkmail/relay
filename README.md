@@ -72,14 +72,27 @@ A client can bind its record to a secret instead:
   `DELETE /api/push/register/:id` and `GET /api/push/verify/:id` need
   `Authorization: Bearer <secret>` and answer `403` without it (a refused poll
   doesn't count as the code being collected). `POST /api/push/jmap/:id` needs the
-  secret in the query, `?k=<secret>`, since a URL is all the mail server has: the
-  client hands it `.../api/push/jmap/<id>?k=<secret>` as the PushSubscription's
-  `url`, which JMAP never shows to other clients. Without it the relay answers
-  `403`, forwards nothing and stores no code. `k` given twice counts as missing;
-  percent-encoding is decoded first. Each route looks in its one place only: the
-  secret in the query of a DELETE, or in a header on the push URL, counts as
-  missing. `GET /api/push/active/:id` stays open, because other devices of the
-  account ask it about ids that aren't theirs, and it only says yes or no.
+  record's push key in the query, `?k=<push key>` (below), and answers `403`
+  without it, forwards nothing and stores no code. `k` given twice counts as
+  missing; percent-encoding is decoded first. Each route looks in its one place
+  only: the secret on the push URL, the push key in a header or in a
+  registration, and the secret in the query of a DELETE all count as missing.
+  `GET /api/push/active/:id` stays open, because other devices of the account ask
+  it about ids that aren't theirs, and it only says yes or no.
+- **Push key.** The mail server only has a URL, and it keeps that URL, so the URL
+  doesn't carry the secret. It carries a push key the client derives from the
+  secret, and the key lets its holder push and post a verification code, nothing
+  else. The rule is fixed: the push key is SHA-256 over the ASCII bytes
+  `bulwark-relay-push-key-v1:` followed by the secret's, written in base64url
+  without padding, 43 characters. The client hands the mail server
+  `.../api/push/jmap/<id>?k=<push key>` as the PushSubscription's `url`. The relay
+  derives the same key from the secret at registration. Two values to check a
+  client against:
+
+  | Secret | Push key |
+  | --- | --- |
+  | `AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8` (bytes 0 to 31) | `j5u1SE4uZtEqYP6s1cBnuAyp6AeXXZzlUO2d2N1yHX4` |
+  | `-_` 64 times | `NYzeMuKHzCMv54rOjyAWixIcpOUb6s7Otgp4-ONFwk8` |
 - **`409`.** A registration that brings a `secret` for an id that exists without
   one, or for an id shorter than 40 characters, answers `409` and changes nothing.
   A client that wants a secret registers a new id with it. A record is never given
@@ -89,9 +102,9 @@ A client can bind its record to a secret instead:
 - **Freed.** When a record with a secret is deleted or expires, its id is free
   again, and the next registration decides, with or without a secret.
 
-The relay stores a SHA-256 of the secret, never the secret, and compares in
-constant time. It doesn't log a query string, and neither the secret nor its hash
-goes into the logs or into a metric.
+The relay stores a SHA-256 of the secret and one of the push key, never either
+value, and compares in constant time. It doesn't log a query string, and neither
+the secret, the push key nor their hashes go into the logs or into a metric.
 
 Old and new together: a new client works with an older relay, which ignores the
 unknown `secret` field, the header and the query, so its record just has no
@@ -207,7 +220,7 @@ Per `subscriptionId`: an FCM token (Android app), an APNs device token (iOS
 app), a Web Push subscription (`endpoint` + `p256dh`/`auth` keys for the PWA), or
 a UnifiedPush endpoint (Android app without Google Play services), the
 verification code, an optional free-form `accountLabel` (max 120 chars), the
-SHA-256 of the record's secret if it has one, and timestamps. No server URL, no
+SHA-256 of the record's secret and of its push key if it has one, and timestamps. No server URL, no
 mail content.
 
 Nothing else a client sends is kept. The endpoint is stored as the URL parser
@@ -324,7 +337,7 @@ the relay started; it is kept in memory only, never in the store, so after a
 restart a record counts for no address until its client registers again.
 
 How large the store can get: 50,000 records of the largest kind the relay takes
-(every field at its limit, a secret's hash included) are 192 MB on disk. The
+(every field at its limit, the two hashes included) are 195 MB on disk. The
 snapshot is read a line at a time, and a start that also folds a journal into it
 peaks at about 215 MB of heap and 340 MB resident (measured with Node 22 on Linux,
 `--max-old-space-size=256`, which gives V8 304 MB in all). That start is the peak:
