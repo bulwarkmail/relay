@@ -27,6 +27,7 @@ const payload: ForwardPayload = {
   accountId: 'c',
   emailIds: ['e1', 'e2'],
   changed: { c: { EmailDelivery: 's9' } },
+  sub: 'registration-hash-0000',
 };
 
 const token = 'ab'.repeat(32);
@@ -56,6 +57,7 @@ describe('apnsPayload', () => {
       accountId: 'c',
       emailIds: ['e1', 'e2'],
       changed: { c: { EmailDelivery: 's9' } },
+      sub: 'registration-hash-0000',
     });
   });
 });

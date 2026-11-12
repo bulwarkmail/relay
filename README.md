@@ -109,6 +109,29 @@ default, merging whatever arrived meanwhile into one push.
 | 429, 408, 5xx, no answer within 8 s, network error, a name that resolves to no public address | Keeps the record | `503 { ok: false }` (`500` when FCM or APNs can't be reached at all) |
 | Any other 4xx | Keeps the record, logs it | `200 { ok: false }` |
 
+## What a device gets
+
+Every push carries the same fields, whatever the transport:
+
+| Field | What it holds |
+| --- | --- |
+| `kind` | `jmap-email-push` for an `EmailPush`, `jmap-state-change` for a `StateChange` |
+| `accountLabel` | The label the client registered (on a UnifiedPush endpoint without keys only when it looks like a sign-in name, otherwise empty) |
+| `accountId` | The JMAP account the push is about; of several in a `StateChange`, the one with new mail |
+| `emailIds` | The new messages' ids, nothing else about them |
+| `changed` | The accounts and states, in the shape of a `StateChange`, for clients that read only that |
+| `sub` | Which registration the push is for: the first 16 bytes of SHA-256 over the `subscriptionId`, base64url (22 characters) |
+
+A device with several registrations (two logins, or one browser with two
+accounts on one endpoint) compares `sub` with the same hash of each of its ids.
+The id itself never goes out: the push service reads FCM, APNs and plain
+UnifiedPush payloads, and the id is what registers a record. Web Push and
+UnifiedPush with keys get the fields as encrypted JSON, UnifiedPush without keys
+as plain JSON, FCM as `data` strings (`emailIds` and `changed` JSON-encoded), and
+APNs under `body`, next to a fixed "New message" alert. A push stays under 3,000
+bytes: older ids are left out first, then accounts without new mail; the other
+fields always stay. Clients ignore fields they don't know.
+
 ## How it treats the push services
 
 - **Urgency**, for Web Push and UnifiedPush. New mail goes out at high urgency, or

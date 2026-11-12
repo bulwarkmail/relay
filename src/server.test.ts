@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -479,6 +480,7 @@ describe('POST /api/push/jmap/:id', () => {
       accountId: 'b',
       emailIds: ['e1'],
       changed: { b: { EmailDelivery: 's9' } },
+      sub: crypto.createHash('sha256').update(id).digest().subarray(0, 16).toString('base64url'),
     });
   });
 

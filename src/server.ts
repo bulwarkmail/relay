@@ -6,7 +6,7 @@ import { isFcmConfigured, sendFcmPush } from './fcm.js';
 import { getApnsConfig, sendApnsPush } from './apns.js';
 import { getVapidPublicKey, sendWebPush } from './webpush.js';
 import { sendUnifiedPush } from './unifiedpush.js';
-import { isForwardableBody, toForwardPayload } from './payload.js';
+import { isForwardableBody, subOf, toForwardPayload } from './payload.js';
 import { deliveryOptions, forwardPolicy, type DeliveryOptions } from './forward-policy.js';
 import { clientKey, takeRegistration } from './client-limit.js';
 import {
@@ -624,7 +624,7 @@ async function handleJmap(
     try {
       result = await dispatch(
         record,
-        toForwardPayload(body, record.accountLabel),
+        toForwardPayload(body, record.accountLabel, subOf(id)),
         deliveryOptions(id, body, req.headers.urgency),
       );
     } catch (error) {

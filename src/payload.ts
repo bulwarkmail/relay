@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { EmailPush, ForwardPayload, StateChange } from './types.js';
 
 // Below what any transport carries: Web Push about 3990 bytes once encrypted,
@@ -57,13 +58,25 @@ function fit(payload: ForwardPayload): ForwardPayload {
   return payload;
 }
 
+/**
+ * Which registration a push is for, in a form the device can compare with its
+ * own ids: the first 16 bytes of SHA-256 over the subscription id, base64url.
+ * Never the id itself, which the push service can read on FCM, APNs and
+ * UnifiedPush without keys, and which is what registers and deletes a record.
+ */
+export function subOf(subscriptionId: string): string {
+  return createHash('sha256').update(subscriptionId, 'utf8').digest().subarray(0, 16).toString('base64url');
+}
+
 // Turn a JMAP push body into the device payload. Deliberately content-blind:
 // even if a client asked the server for subjects or senders in its EmailPush
 // config, only the message ids leave the relay. The device fetches the rest
-// over its own JMAP session.
+// over its own JMAP session. `sub` is subOf(the record's id); it counts in
+// what has to fit, and is never trimmed.
 export function toForwardPayload(
   body: StateChange | EmailPush,
   accountLabel: string | undefined,
+  sub: string,
 ): ForwardPayload {
   const label = (accountLabel ?? '').slice(0, MAX_LABEL_CHARS);
   if (body['@type'] === 'EmailPush') {
@@ -77,14 +90,14 @@ export function toForwardPayload(
     const changed: Record<string, Record<string, string>> = accountId
       ? { [accountId]: { EmailDelivery: typeof body.state === 'string' && STATE.test(body.state) ? body.state : '' } }
       : {};
-    return fit({ kind: 'jmap-email-push', accountLabel: label, accountId, emailIds, changed });
+    return fit({ kind: 'jmap-email-push', accountLabel: label, accountId, emailIds, changed, sub });
   }
   const changed = cleanChanged(body.changed);
   // For a client that looks at one account only: the one with new mail. A batch
   // can hold several (the user's own and their groups'), so `changed` keeps them.
   const accounts = Object.entries(changed);
   const accountId = (accounts.find(([, types]) => hasNewMail(types)) ?? accounts[0])?.[0] ?? '';
-  return fit({ kind: 'jmap-state-change', accountLabel: label, accountId, emailIds: [], changed });
+  return fit({ kind: 'jmap-state-change', accountLabel: label, accountId, emailIds: [], changed, sub });
 }
 
 export function isForwardableBody(body: unknown): body is StateChange | EmailPush {

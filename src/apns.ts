@@ -108,6 +108,7 @@ export function apnsPayload(payload: ForwardPayload): Record<string, unknown> {
       accountId: payload.accountId,
       emailIds: payload.emailIds,
       changed: payload.changed,
+      sub: payload.sub,
     },
   };
 }
