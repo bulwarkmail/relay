@@ -29,11 +29,16 @@ const largestCode = '"'.repeat(512);
 
 describe('the largest record the relay takes', () => {
   it('stays under the bound with every field and the verification code at their limits', () => {
-    const fcm: SubscriptionRecord = { kind: 'fcm', fcmToken: 'f'.repeat(1024), verificationCode: null, createdAt: now, lastPushAt: now, lastRegisteredAt: now, codeCollectedAt: now, accountLabel: '€'.repeat(120) };
+    const fcm: SubscriptionRecord = { kind: 'fcm', fcmToken: 'f'.repeat(2048), verificationCode: null, createdAt: now, lastPushAt: now, lastRegisteredAt: now, codeCollectedAt: now, accountLabel: '€'.repeat(120) };
     for (const record of [largestUnifiedPush(), fcm]) {
       assert.ok(recordBytes(record) <= MAX_REGISTRATION_BYTES, `${record.kind}: ${recordBytes(record)} bytes`);
       assert.ok(recordBytes({ ...record, verificationCode: largestCode }) <= MAX_RECORD_BYTES, `${record.kind} with a code`);
     }
+    // The heap a full store needs is measured with UnifiedPush records; no other kind is larger.
+    assert.ok(
+      recordBytes({ ...fcm, verificationCode: largestCode }) <= recordBytes({ ...largestUnifiedPush(), verificationCode: largestCode }),
+      `the largest FCM record takes ${recordBytes({ ...fcm, verificationCode: largestCode })} bytes`,
+    );
   });
 
   it('writes no record larger than the bound, and keeps nothing of it', async () => {

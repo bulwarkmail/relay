@@ -130,7 +130,7 @@ timestamps. No server URL, no mail content.
 Nothing else a client sends is kept. The endpoint is stored as the URL parser
 writes it, up to 2,048 characters, and is refused (`400`) with a control
 character, tab or newline anywhere in it. The keys are base64 or base64url of
-exactly 65 and 16 bytes, with no other character. An FCM token is 64 to 1,024
+exactly 65 and 16 bytes, with no other character. An FCM token is 64 to 2,048
 characters (Firebase hands out about 160), an APNs token 64 to 200 hex digits. The
 label is printable text, the verification code 1 to 512 printable ASCII
 characters. A record takes at most 4 KB as JSON, a registration at most 3 KB of it;

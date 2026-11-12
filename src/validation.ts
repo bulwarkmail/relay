@@ -10,12 +10,14 @@ export function isValidSubscriptionId(id: unknown): id is string {
 }
 
 // FCM registration tokens are an instance id, a colon and about 140 more
-// characters, some 160 in all; this leaves six times that.
+// characters, some 160 in all, and Google names no maximum; this leaves twelve
+// times that, as much as an endpoint may take. The largest record it allows
+// stays below the largest UnifiedPush record (see store-size.test.ts).
 export function isValidFcmToken(value: unknown): value is string {
   return (
     typeof value === 'string' &&
     value.length >= 64 &&
-    value.length <= 1024 &&
+    value.length <= 2048 &&
     /^[A-Za-z0-9:_-]+$/.test(value)
   );
 }

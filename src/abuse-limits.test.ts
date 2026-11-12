@@ -592,7 +592,7 @@ describe('what one registration may put into the store', () => {
     }
   });
 
-  it('takes an FCM token as long as Firebase hands out, with room, and none longer than 1,024', async () => {
+  it('takes an FCM token as long as Firebase hands out, with room, and none longer than 2,048', async () => {
     service.answer('/oauth/size-token', { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ access_token: 'fake-access-token', expires_in: 3600 }) });
     const relay = await startRelay({
       env: {
@@ -605,7 +605,10 @@ describe('what one registration may put into the store', () => {
       // The shape Firebase hands out: an instance id, a colon, about 140 more.
       assert.equal((await fcm(`${'c'.repeat(22)}:APA91b${'d'.repeat(134)}`)).status, 200);
       assert.equal((await fcm('e'.repeat(1024))).status, 200);
-      assert.equal((await fcm('e'.repeat(1025))).status, 400);
+      assert.equal((await fcm('e'.repeat(1025))).status, 200);
+      // With the longest label, so the whole registration is as large as an FCM one gets.
+      assert.equal((await postJson(relay.base, '/api/push/register', { subscriptionId: newId(), fcmToken: 'e'.repeat(2048), accountLabel: '€'.repeat(120) })).status, 200);
+      assert.equal((await fcm('e'.repeat(2049))).status, 400);
       assert.equal((await fcm('e'.repeat(4096))).status, 400);
     } finally {
       await relay.stop();
