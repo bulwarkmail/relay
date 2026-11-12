@@ -364,7 +364,10 @@ class SubscriptionStore {
     }
     if (skipped > 0) logger.warn('store: skipped journal lines that could not be read', { count: skipped });
     if (!stale && changes === 0 && from === null) {
-      // Empty: an append that failed before its first byte stuck.
+      // Nothing in it: an append that failed before its first byte stuck, or a
+      // first append a crash cut short, which was never answered. It goes, so the
+      // next change starts a new journal and its size is counted from nothing.
+      if (reader.size > 0) await unlink(journalPath());
       this.journalBytes = 0;
       return false;
     }
@@ -644,10 +647,13 @@ class SubscriptionStore {
     const seq = this.seq + 1;
     const header = this.journalBytes === 0 ? `\n${JSON.stringify({ from: this.snapshotSeq, snapshot: this.snapshotHash })}` : '';
     const line = `${header}\n${JSON.stringify({ seq, id, record })}`;
+    // Where this append begins in the file, once it is open.
+    let start: number | null = null;
     try {
       await mkdir(getPushDir(), { recursive: true, mode: PRIVATE_DIR });
       const handle = await open(journalPath(), 'a', PRIVATE_FILE);
       try {
+        start = (await handle.stat()).size;
         await handle.writeFile(line, 'utf-8');
         await handle.datasync();
       } finally {
@@ -657,15 +663,19 @@ class SubscriptionStore {
     } catch (error) {
       storeWriteFailures.inc();
       logger.error('store: could not write a change', { error: message(error) });
-      // Nothing of a change that was refused may stay behind. Should that fail
-      // too, its number is used up, so a whole line of it can't pass for the next.
-      await truncate(journalPath(), this.journalBytes).catch(() => {
-        this.seq = seq;
-      });
+      // Nothing of a change that was refused may stay behind, and nothing that
+      // was there before it may go: the cut is back to where it began. Should
+      // that fail, its number is used up, so a whole line of it can't pass for
+      // the next.
+      if (start !== null) {
+        await truncate(journalPath(), start).catch(() => {
+          this.seq = seq;
+        });
+      }
       throw error;
     }
     this.seq = seq;
-    this.journalBytes += Buffer.byteLength(line);
+    this.journalBytes = (start ?? 0) + Buffer.byteLength(line);
   }
 
   // After the change is in memory: the snapshot written now holds it. The

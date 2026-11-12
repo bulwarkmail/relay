@@ -9,6 +9,8 @@
 // one more change, which is the one that triggers the fold.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
@@ -409,6 +411,44 @@ describe('going back to an older relay during this relay\'s first run on a direc
     } finally {
       await again.stop('SIGKILL');
     }
+  });
+});
+
+describe('a change the journal could not take', () => {
+  it('costs nothing of the change answered before it, also on a journal that began with a torn line', async () => {
+    // A crash in the middle of a journal's very first append leaves the start of a line and
+    // nothing else. The next start finds nothing to replay in it, and a refused append
+    // afterwards cuts back only what that append wrote.
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-torn-start-'));
+    fs.writeFileSync(path.join(dataDir, 'subscriptions.journal'), '\n{"fro');
+    process.env.PUSH_DATA_DIR = dataDir;
+    const { subscriptionStore } = await import('./store.js');
+    await subscriptionStore.load();
+    const keys = makeDevice().keys;
+    const now = Date.now();
+    const record = (name: string) => ({ kind: 'up' as const, endpoint: `https://push.example.org/${name}`, keys, verificationCode: null, createdAt: now, lastPushAt: null, lastRegisteredAt: now });
+    const answered = newId();
+    assert.deepEqual(await subscriptionStore.put(answered, record('answered')), { stored: true });
+    assert.ok(storedRecords(dataDir)[answered], 'the answered registration is not on disk to begin with');
+    // The next append fails before it writes a byte, as on a full disk.
+    const realOpen = fsp.open;
+    fsp.open = (async (file: Parameters<typeof realOpen>[0], ...rest: unknown[]) => {
+      if (String(file).endsWith('subscriptions.journal') && rest[0] === 'a') throw Object.assign(new Error('ENOSPC: no space left on device, open'), { code: 'ENOSPC' });
+      return (realOpen as (...args: unknown[]) => unknown)(file, ...rest);
+    }) as typeof realOpen;
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(subscriptionStore.put(newId(), record('refused')), /ENOSPC/);
+    } finally {
+      fsp.open = realOpen;
+      syncBuiltinESMExports();
+    }
+    assert.ok(storedRecords(dataDir)[answered], 'cleaning up after the refused change cut into the line of the one answered before it');
+    // And the next change still goes in whole.
+    const next = newId();
+    assert.deepEqual(await subscriptionStore.put(next, record('next')), { stored: true });
+    const records = storedRecords(dataDir);
+    assert.ok(records[answered] && records[next]);
   });
 });
 
