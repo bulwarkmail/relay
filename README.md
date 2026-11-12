@@ -167,7 +167,8 @@ fields always stay. Clients ignore fields they don't know.
   asked for it, and each one is in the log. At most 10,000 endpoints are remembered
   in backoff; past that the oldest backoff is dropped.
 - **Host hold.** After `429`s for 20 different devices on one host within a minute,
-  registered from at least 5 different client addresses, the relay leaves the whole
+  registered from at least 5 different client addresses (an IPv6 client counted by
+  its /56, as under [Limits](#limits)), the relay leaves the whole
   host alone, for two minutes at most. Only devices that have delivered a push before
   count, a device is its endpoint without query and fragment, written one way as
   above, and browsers and native apps count separately. Devices whose client address
@@ -330,8 +331,11 @@ Which address a registration counts for:
 - With `TRUST_PROXY=1` it is the last entry of `X-Forwarded-For`, the one the proxy
   appended; whatever the client wrote in front of it is ignored. With `2` it is the
   second from the end, and so on. A request without the header counts by its socket.
-- A port after the address is ignored, and an IPv6 client counts by its /64. An entry
-  that is no address at all counts for one budget shared by all such entries.
+- A port after the address is ignored. An IPv4 client counts by its address, an
+  IPv6 client by its /56, since providers hand a customer a /56 or a /48: all the
+  /64s in one /56 are one client, for the rate, the records per address and the
+  host hold. An entry that is no address at all counts for one budget shared by
+  all such entries.
 - When the address is a loopback, private, shared (100.64/10) or link-local one
   the relay can't tell its clients apart, and one budget for all of them would
   refuse real devices. That is the proxy's own address with `TRUST_PROXY=0` behind a
