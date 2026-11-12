@@ -101,7 +101,11 @@ default, merging whatever arrived meanwhile into one push.
   the relay can't tell (see [Limits](#limits)), and records registered before its
   last start, count as one address together. Endpoints that differ only in their
   query (WNS, which Edge uses) count as one device per host and path, so they are
-  held one by one. Held pushes count in `relay_pushes_held_total`.
+  held one by one. Held pushes count in `relay_pushes_held_total`. The 20 is
+  `PUSH_HOST_THROTTLE_LIMIT`, and the number of addresses is 5 or that setting,
+  whichever is smaller: below 5 the hold asks for as many addresses as devices, so
+  at 1 one device of one caller holds its host for everyone, even where addresses
+  are unknown (they count as one).
 
 The host hold needs client addresses: behind a reverse proxy, set `TRUST_PROXY`.
 Without it every registration comes from the proxy's address, all devices count as
@@ -197,10 +201,13 @@ last delivered push is the oldest. Never one registered in the last 10 minutes (
 device in the middle of its setup), no record with a collected code while one
 without is in those 10 minutes, and never one that delivered a push in the last 30
 days. The new record is written before the one that gives way is deleted, so a write
-that fails loses neither. A dropped device gets its record back the next time its
-client registers (every page load, every app start), and counts in
-`relay_subscriptions_unregistered_total{reason="evicted"}`. A
-push counts as delivered when the endpoint answered 2xx; the relay can't tell a
+that fails loses neither. When only the delete can't be written, both stay and the
+store holds one record more than `PUSH_MAX_SUBSCRIPTIONS`; it stays that much over
+until records leave (a client's delete, an expiry), since each new device after
+that still takes the place of just one. A dropped device gets its record back the
+next time its client registers (every page load, every app start), and counts in
+`relay_subscriptions_unregistered_total{reason="evicted"}`. A push counts as
+delivered when the endpoint answered 2xx; the relay can't tell a
 real push service from an endpoint the registering client runs itself, so the
 limit per address is what bounds records kept alive that way.
 
@@ -209,11 +216,12 @@ the relay started; it is kept in memory only, never in the store, so after a
 restart a record counts for no address until its client registers again.
 
 How large the store can get: 50,000 records of the largest kind the relay takes
-(every field at its limit) are 189 MB on disk, and a start reads them with a peak
-of 190 MB of heap, since the snapshot is read a line at a time (measured with Node
-22 on Linux; the relay starts on such a store with `--max-old-space-size=256`). Real
-records are a few hundred bytes, so a full store of real devices is a tenth of
-that. Give the container memory for the store and Node besides; a
+(every field at its limit) are 189 MB on disk. The snapshot is read a line at a
+time, and a start that also folds a journal into it peaks at about 215 MB of heap
+and 340 MB resident (measured with Node 22 on Linux, `--max-old-space-size=256`,
+which gives V8 304 MB in all). Real records are a few hundred bytes, so a full
+store of real devices is a tenth of that. Give the container memory for the store
+and Node besides; a
 `subscriptions.json` written by an older relay is read whole once, which takes
 about four times its size.
 
@@ -342,7 +350,7 @@ journal is replayed as after any unclean stop.
 | `PUSH_FORWARD_TIMEOUT_MS` | `8000` | How long one attempt at a push service may take, start to finish. Keep it below the mail server's own timeout (Stalwart: 10 s), or the same push goes out twice |
 | `PUSH_SUBSCRIPTION_BURST` | `10` | Pushes one subscription may get at once, any transport. Past it the mail server gets `429` |
 | `PUSH_SUBSCRIPTION_REFILL_MS` | `20000` | Time until one more is allowed |
-| `PUSH_HOST_THROTTLE_LIMIT` | `20` | Devices that delivered before getting a `429` from one host within a minute before the whole host is left alone |
+| `PUSH_HOST_THROTTLE_LIMIT` | `20` | Devices that delivered before getting a `429` from one host within a minute before the whole host is left alone. They must come from 5 client addresses, or from this many when it is below 5 |
 | `PUSH_MAX_SUBSCRIPTIONS` | `50000` | Records the store takes; a new device past it takes the place of one that never delivered, or gets `507`. See [Limits](#limits) |
 | `PUSH_MAX_SUBSCRIPTIONS_PER_ADDRESS` | `1000` | Records one client address may hold; a new device past it gets `507`. Off where addresses can't be told apart |
 | `PUSH_REGISTER_BURST` | `60` | Registrations one client address may make at once; past it `429` with `Retry-After` |
