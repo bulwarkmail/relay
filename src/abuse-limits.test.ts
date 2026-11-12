@@ -883,6 +883,73 @@ describe('one endpoint written many ways', () => {
     }
   });
 
+  it('does not hold a host for everyone over devices whose client addresses it cannot tell apart', async () => {
+    // No TRUST_PROXY and a loopback peer, as behind a proxy the relay wasn't told about: every
+    // registration may be one caller's, so they count as one address together.
+    const relay = await startRelay();
+    try {
+      const other = newId();
+      assert.equal((await web(relay, other, '/unknown-addresses-other')).status, 200);
+      await throttle(relay, Array.from({ length: 20 }, (_, i) => `/unknown-addresses-${i}`), () => undefined);
+      const push = await postJson(relay.base, `/api/push/jmap/${other}`, emailPush('a', ['e2']));
+      assert.equal(push.status, 200, `the honest device's push was held: ${JSON.stringify(push.body)}`);
+      // Each endpoint the service throttled still waits on its own.
+      service.answer('/unknown-addresses-0', { status: 201 });
+      const own = newId();
+      assert.equal((await web(relay, own, '/unknown-addresses-0')).status, 200);
+      assert.deepEqual((await postJson(relay.base, `/api/push/jmap/${own}`, emailPush('a', ['e3']))).body, { ok: false, held: 'push-service-backoff' });
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('does not hold a host for everyone over devices whose client address it lost in a restart', async () => {
+    const relay = await startRelay({ env: { TRUST_PROXY: '1' } });
+    let again: Awaited<ReturnType<typeof startRelay>> | null = null;
+    try {
+      const devices = Array.from({ length: 20 }, (_, i) => `/restarted-${i}`);
+      const ids: string[] = [];
+      for (const pathname of devices) {
+        const id = newId();
+        ids.push(id);
+        const res = await fetch(`${relay.base}/api/push/register/web`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-forwarded-for': '198.51.100.31' },
+          body: JSON.stringify({ subscriptionId: id, subscription: { endpoint: service.url(pathname), keys: makeDevice().keys } }),
+        });
+        await res.arrayBuffer();
+        assert.equal(res.status, 200);
+        assert.equal((await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e0']))).status, 200);
+      }
+      // Addresses are kept in memory only: after the restart none of the twenty has one.
+      again = await relay.restart();
+      const other = newId();
+      assert.equal((await web(again, other, '/restarted-other')).status, 200);
+      for (const pathname of devices) service.answer(pathname, { status: 429 });
+      for (const id of ids) await postJson(again.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
+      const push = await postJson(again.base, `/api/push/jmap/${other}`, emailPush('a', ['e2']));
+      assert.equal(push.status, 200, `the honest device's push was held: ${JSON.stringify(push.body)}`);
+    } finally {
+      await again?.stop();
+      await relay.stop();
+    }
+  });
+
+  it('holds a host for everyone over devices from five client addresses, not from four', async () => {
+    for (const [addresses, status] of [[4, 200], [5, 503]] as const) {
+      const relay = await startRelay({ env: { TRUST_PROXY: '1' } });
+      try {
+        const other = newId();
+        assert.equal((await web(relay, other, `/addresses-${addresses}-other`)).status, 200);
+        await throttle(relay, Array.from({ length: 20 }, (_, i) => `/addresses-${addresses}-${i}`), (i) => `198.51.100.${40 + (i % addresses)}`);
+        const push = await postJson(relay.base, `/api/push/jmap/${other}`, emailPush('a', ['e2']));
+        assert.equal(push.status, status, `${addresses} addresses: ${JSON.stringify(push.body)}`);
+      } finally {
+        await relay.stop();
+      }
+    }
+  });
+
   it('still holds a host that throttles many devices of many users', async () => {
     const relay = await startRelay({ env: { TRUST_PROXY: '1' } });
     try {

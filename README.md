@@ -92,11 +92,18 @@ default, merging whatever arrived meanwhile into one push.
   registered from at least 5 different client addresses, the relay leaves the whole
   host alone, for two minutes at most. Only devices that have delivered a push before
   count, a device is its endpoint without query and fragment, written one way as
-  above, and browsers and native apps count separately. Where the relay can't tell
-  client addresses apart (see [Limits](#limits)), and for records registered before
-  its last start, each device counts as an address of its own. Endpoints that
-  differ only in their query (WNS, which Edge uses) count as one device per host and
-  path, so they are held one by one. Held pushes count in `relay_pushes_held_total`.
+  above, and browsers and native apps count separately. Devices whose client address
+  the relay can't tell (see [Limits](#limits)), and records registered before its
+  last start, count as one address together. Endpoints that differ only in their
+  query (WNS, which Edge uses) count as one device per host and path, so they are
+  held one by one. Held pushes count in `relay_pushes_held_total`.
+
+The host hold needs client addresses: behind a reverse proxy, set `TRUST_PROXY`.
+Without it every registration comes from the proxy's address, all devices count as
+one address, and the hold never comes on; each endpoint still backs off on its own
+when its service answers `429`. Addresses are kept in memory only, so right after a
+restart the hold counts a device's address only once its client has registered
+again (every page load, every app start).
 
 ## Which endpoints it calls
 

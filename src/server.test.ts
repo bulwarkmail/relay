@@ -49,14 +49,16 @@ function scrape(target: RunningRelay): Promise<Response> {
   return fetch(`${target.base}/metrics`, { headers: { authorization: `Bearer ${METRICS_TOKEN}` } });
 }
 
-async function registerWeb(pathname: string, target: RunningRelay = relay, label = 'alice@example.org') {
+/** Registers a browser, from `forwardedFor` as the proxy's X-Forwarded-For when given. */
+async function registerWeb(pathname: string, target: RunningRelay = relay, label = 'alice@example.org', forwardedFor?: string) {
   const id = newId();
   const device = makeDevice();
-  const res = await postJson(target.base, '/api/push/register/web', {
-    subscriptionId: id,
-    subscription: { endpoint: service.url(pathname), keys: device.keys },
-    accountLabel: label,
+  const res = await fetch(`${target.base}/api/push/register/web`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(forwardedFor ? { 'x-forwarded-for': forwardedFor } : {}) },
+    body: JSON.stringify({ subscriptionId: id, subscription: { endpoint: service.url(pathname), keys: device.keys }, accountLabel: label }),
   });
+  await res.arrayBuffer();
   assert.equal(res.status, 200);
   return { id, device };
 }
@@ -864,11 +866,12 @@ describe('sending politely', () => {
   });
 
   it('stops calling a service that throttles many subscriptions at once', async () => {
-    const own = await startRelay({ env: { PUSH_HOST_THROTTLE_LIMIT: '3', METRICS_TOKEN } });
+    // Devices of several users: registered from client addresses the relay can tell apart.
+    const own = await startRelay({ env: { PUSH_HOST_THROTTLE_LIMIT: '3', METRICS_TOKEN, TRUST_PROXY: '1' } });
     try {
       for (let i = 0; i < 3; i++) {
         const pathname = `/polite-host-${i}`;
-        const { id } = await registerWeb(pathname, own);
+        const { id } = await registerWeb(pathname, own, undefined, `198.51.100.${60 + i}`);
         // Devices that got a push through before: only their 429s speak for the service.
         assert.equal((await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e0']))).status, 200);
         service.answer(pathname, { status: 429 });
@@ -1075,11 +1078,12 @@ describe('the native transports against a slow service', () => {
 
 describe('how far a throttle reaches', () => {
   it('does not let one Retry-After silence a whole host for long', async () => {
-    const own = await startRelay({ env: { PUSH_HOST_THROTTLE_LIMIT: '2' } });
+    // Devices of several users: registered from client addresses the relay can tell apart.
+    const own = await startRelay({ env: { PUSH_HOST_THROTTLE_LIMIT: '2', TRUST_PROXY: '1' } });
     try {
       for (let i = 0; i < 2; i++) {
         const pathname = `/reach-long-${i}`;
-        const { id } = await registerWeb(pathname, own);
+        const { id } = await registerWeb(pathname, own, undefined, `198.51.100.${70 + i}`);
         // Devices that got a push through before: only their 429s speak for the service.
         await postJson(own.base, `/api/push/jmap/${id}`, emailPush('a', ['e0']));
         service.answer(pathname, { status: 429, headers: { 'retry-after': '3600' } });

@@ -81,10 +81,11 @@ const PRUNE_INTERVAL_MS = 60_000;
 const ENDPOINT_BURST = 30;
 const ENDPOINT_REFILL_MS = 2000;
 // A host is held for everyone only when the devices it throttled were
-// registered from at least this many client addresses, where the relay can tell
-// addresses apart: a service that throttles the relay as a whole throttles the
-// devices of many users, and devices registered from one address are held one by
-// one instead.
+// registered from at least this many client addresses: a service that throttles
+// the relay as a whole throttles the devices of many users, and devices
+// registered from one address are held one by one instead. Devices whose address
+// the relay can't tell count as one address together, so where it can't tell
+// addresses apart the hold never comes on from them alone.
 const HOST_HOLD_MIN_ADDRESSES = 5;
 // Endpoints in backoff at once. Past it the one that went into backoff first is
 // forgotten: endpoints are chosen at registration, and one id can go through many.
@@ -256,16 +257,17 @@ class ForwardPolicy {
   }
 }
 
-// Distinct client addresses behind these devices. A device whose address the
-// relay couldn't tell counts as one address of its own.
+// Distinct client addresses behind these devices. Those whose address the relay
+// couldn't tell (behind a proxy it wasn't told about, or registered before the
+// last start) count as one address together: they may all be one caller's.
 function addressesOf(devices: Map<string, string | null>): number {
   const known = new Set<string>();
-  let unknown = 0;
+  let unknown = false;
   for (const address of devices.values()) {
-    if (address === null) unknown++;
+    if (address === null) unknown = true;
     else known.add(address);
   }
-  return known.size + unknown;
+  return known.size + (unknown ? 1 : 0);
 }
 
 export const forwardPolicy = new ForwardPolicy();
