@@ -93,6 +93,14 @@ A client can bind its record to a secret instead:
   | --- | --- |
   | `AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8` (bytes 0 to 31) | `j5u1SE4uZtEqYP6s1cBnuAyp6AeXXZzlUO2d2N1yHX4` |
   | `-_` 64 times | `NYzeMuKHzCMv54rOjyAWixIcpOUb6s7Otgp4-ONFwk8` |
+
+  Where the push URL ends up: Stalwart doesn't return a PushSubscription's `url`
+  to clients, but writes it, query and all, into its own log with every push
+  event (`push-subscription.success` and `.error`). A proxy's access log holds it
+  unless its format leaves out path and query (see
+  [Behind a reverse proxy](#behind-a-reverse-proxy)). The legacy-proxy returns it
+  to every other client of the same user, until it stops doing so. Whoever reads
+  it can push to the record and post a verification code, and nothing more.
 - **`409`.** A registration that brings a `secret` for an id that exists without
   one, or for an id shorter than 40 characters, answers `409` and changes nothing.
   A client that wants a secret registers a new id with it. A record is never given
@@ -364,7 +372,10 @@ about four times its size.
 
 Which address a registration counts for:
 
-- With `TRUST_PROXY=0` the client address is the socket's.
+- With `TRUST_PROXY=0` the client address is the socket's. Without a proxy in
+  front, the relay sees IPv6 clients only when it listens on an IPv6 address
+  (`HOST`; the default `0.0.0.0` takes IPv4 only), and they count by their /56
+  there too.
 - With `TRUST_PROXY=1` it is the last entry of `X-Forwarded-For`, the one the proxy
   appended; whatever the client wrote in front of it is ignored. With `2` it is the
   second from the end, and so on. A request without the header counts by its socket.
@@ -515,6 +526,12 @@ changes in that journal, which the older relay never saw, are not applied; those
 devices get their records back when their clients register again. If the older
 relay changed nothing, `subscriptions.json` is still this version's and the
 journal is replayed as after any unclean stop.
+
+A relay from before record ownership (see [Record ownership](#record-ownership))
+keeps a record's secret while it doesn't touch the record, but writes the record
+without it at that client's next registration. Back on this version, such a
+record has no secret any more, and its client's next registration with the secret
+answers `409`; the client then registers a new id, as for any `409`.
 
 ## Environment
 
