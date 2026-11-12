@@ -40,12 +40,61 @@ label a client registered with, and timing.
 Every register route answers `503` when the relay has no credentials for that
 transport (except UnifiedPush, which needs none), `400` to a body it can't use,
 `413` to one over 64 KB, `429` past the limit per client address and `507` when
-the store is full (see [Limits](#limits)). A wrong method on a known path answers
-`405`.
+the store is full (see [Limits](#limits)). It answers `403` and `409` as described
+under [Record ownership](#record-ownership). A wrong method on a known path
+answers `405`.
 
-Anyone holding a `subscriptionId` can replace or delete its record, read its
-verification code and post to it, so it has to be long and random. Bulwark
-clients use 128 random bits. The relay only checks its format.
+## Record ownership
+
+A record is named by its `subscriptionId`, which is the JMAP `deviceClientId`:
+the mail server shows it to every client of the same user, and it is in the push
+URL. For a record registered without a secret, knowing the id is enough to
+replace or delete the record, read its verification code and post to it. Every
+webmail and app released so far registers that way, and their records keep
+working exactly like that.
+
+A client can bind its record to a secret instead:
+
+- **Registering.** Each register route takes an optional `secret` in the body:
+  32 to 128 characters of `A-Z`, `a-z`, `0-9`, `_` and `-`, random and the
+  client's own (32 random bytes in base64url are 43 characters). A `secret` of any
+  other shape answers `400` and stores nothing. The secret is bound when the id is
+  first registered, and only to an id of 40 characters or more (32 random bytes in
+  base64url again); the released clients' ids are 32 hex digits and never take
+  one.
+- **Afterwards.** A registration for that id needs the same `secret` in its body,
+  on any of the four routes, and may change the transport; without it, or with
+  another one, it answers `403` and the record stays as it was.
+  `DELETE /api/push/register/:id` and `GET /api/push/verify/:id` need
+  `Authorization: Bearer <secret>` and answer `403` without it (a refused poll
+  doesn't count as the code being collected). `POST /api/push/jmap/:id` needs the
+  secret in the query, `?k=<secret>`, since a URL is all the mail server has: the
+  client hands it `.../api/push/jmap/<id>?k=<secret>` as the PushSubscription's
+  `url`, which JMAP never shows to other clients. Without it the relay answers
+  `403`, forwards nothing and stores no code. `k` given twice counts as missing;
+  percent-encoding is decoded first. Each route looks in its one place only: the
+  secret in the query of a DELETE, or in a header on the push URL, counts as
+  missing. `GET /api/push/active/:id` stays open, because other devices of the
+  account ask it about ids that aren't theirs, and it only says yes or no.
+- **`409`.** A registration that brings a `secret` for an id that exists without
+  one, or for an id shorter than 40 characters, answers `409` and changes nothing.
+  A client that wants a secret registers a new id with it. A record is never given
+  a secret in place: otherwise anyone who knows an old client's id could delete
+  its record and register the id again with a secret of their own, and the old
+  client would be locked out of its id.
+- **Freed.** When a record with a secret is deleted or expires, its id is free
+  again, and the next registration decides, with or without a secret.
+
+The relay stores a SHA-256 of the secret, never the secret, and compares in
+constant time. It doesn't log a query string, and neither the secret nor its hash
+goes into the logs or into a metric.
+
+Old and new together: a new client works with an older relay, which ignores the
+unknown `secret` field, the header and the query, so its record just has no
+secret there. The mail server posts to whatever URL it was given, query and all.
+A record a new client made with a secret can't be registered by an older client
+build on the same device (`403`) until it is deleted or expires; that only
+happens after a downgrade.
 
 ## What the mail server gets back
 
@@ -129,8 +178,9 @@ on your own network, name it in `PUSH_ALLOW_PRIVATE_ENDPOINTS`.
 Per `subscriptionId`: an FCM token (Android app), an APNs device token (iOS
 app), a Web Push subscription (`endpoint` + `p256dh`/`auth` keys for the PWA), or
 a UnifiedPush endpoint (Android app without Google Play services), the
-verification code, an optional free-form `accountLabel` (max 120 chars), and
-timestamps. No server URL, no mail content.
+verification code, an optional free-form `accountLabel` (max 120 chars), the
+SHA-256 of the record's secret if it has one, and timestamps. No server URL, no
+mail content.
 
 Nothing else a client sends is kept. The endpoint is stored as the URL parser
 writes it, up to 2,048 characters, and is refused (`400`) with a control
@@ -219,7 +269,7 @@ the relay started; it is kept in memory only, never in the store, so after a
 restart a record counts for no address until its client registers again.
 
 How large the store can get: 50,000 records of the largest kind the relay takes
-(every field at its limit) are 189 MB on disk. The snapshot is read a line at a
+(every field at its limit, a secret's hash included) are 192 MB on disk. The snapshot is read a line at a
 time, and a start that also folds a journal into it peaks at about 215 MB of heap
 and 340 MB resident (measured with Node 22 on Linux, `--max-old-space-size=256`,
 which gives V8 304 MB in all). Real records are a few hundred bytes, so a full
@@ -282,12 +332,39 @@ server {
 The prefix also covers `DELETE /api/push/register/:id`, which a client sends once
 on logout.
 
+Keep the subscription ids and secrets out of the proxy's access log. nginx's
+default `combined` format writes the whole request line, and for `/api/push/` that
+is the id in the path and, on the push URL, the record's secret in the query.
+Log those requests without the path and the query, or not at all:
+
+```nginx
+# http block
+log_format relay_push '$remote_addr [$time_local] "$request_method" $status $body_bytes_sent $request_time';
+
+server {
+    # ...
+    location /api/push/register {
+        access_log /var/log/nginx/relay-push.log relay_push;
+        # ... limit_req and proxy_pass as above
+    }
+    location /api/push/ {
+        access_log /var/log/nginx/relay-push.log relay_push;   # or: access_log off;
+        proxy_pass http://127.0.0.1:3003;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+```
+
+nginx's error log still quotes the request line when it can't reach the relay,
+so keep it readable to the operator only.
+
 ## What it logs
 
 Requests by route, status and duration, with a short hash that follows one
 subscription through the logs. Failed forwards also log the push service's host,
-status and its reason, with any URL in it removed. Never the subscription id, an
-endpoint path, keys, tokens or the label.
+status and its reason, with any URL in it removed. Never the subscription id, a
+query string, a record's secret or its hash, an endpoint path, keys, tokens or the
+label.
 
 ## Run locally
 

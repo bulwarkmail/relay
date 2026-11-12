@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { isPublicEndpointUrl } from './endpoint-guard.js';
 import type { WebPushSubscription } from './types.js';
 
@@ -119,4 +120,37 @@ export function accountLabelOf(value: unknown): string | undefined | null {
 // Stalwart sends 32 letters and digits. It ends up on disk and in a client's poll.
 export function isValidVerificationCode(value: unknown): value is string {
   return typeof value === 'string' && /^[\x20-\x7e]{1,512}$/.test(value);
+}
+
+/**
+ * The secret a client may bind its record to when it first registers the id:
+ * random text of its own, 32 to 128 characters that need no escaping in a
+ * header or a query.
+ */
+export function isValidSecret(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{32,128}$/.test(value);
+}
+
+// Every webmail and app released before secrets existed names its records with
+// 32 hex digits, and registers them without one. An id that short never takes
+// a secret, so nobody who learns such an id can bind it to a secret of their
+// own, even after its record was deleted or expired, and lock its client out.
+const MIN_ID_CHARS_WITH_SECRET = 40;
+
+/** Whether a record under this id may be bound to a secret. */
+export function mayTakeSecret(id: string): boolean {
+  return id.length >= MIN_ID_CHARS_WITH_SECRET;
+}
+
+/** What the store keeps of a secret: its SHA-256, base64url. Never the secret. */
+export function secretHashOf(secret: string): string {
+  return createHash('sha256').update(secret, 'utf8').digest('base64url');
+}
+
+/** Whether two stored hashes are the same, in a time that doesn't depend on where they differ. */
+export function sameSecretHash(a: string | undefined, b: string | undefined): boolean {
+  if (a === undefined || b === undefined) return false;
+  const left = Buffer.from(a, 'base64url');
+  const right = Buffer.from(b, 'base64url');
+  return left.length === 32 && right.length === 32 && timingSafeEqual(left, right);
 }

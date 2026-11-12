@@ -5,6 +5,7 @@ import { createInterface } from 'node:readline';
 import { logger } from './logger.js';
 import { storeWriteFailures } from './metrics.js';
 import type { SubscriptionRecord } from './types.js';
+import { sameSecretHash } from './validation.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 // Aligned with the JMAP PushSubscription expires the mobile client requests
@@ -126,7 +127,15 @@ interface Snapshot {
 
 export type PutResult =
   | { stored: true; evicted?: { id: string; record: SubscriptionRecord } }
-  | { stored: false; reason: 'full' | 'address-full' };
+  | { stored: false; reason: 'full' | 'address-full' | 'not-owner' | 'taken' };
+
+/**
+ * Whether a caller who holds the secret with this hash (null: none) may act on
+ * the record. Always on a record without a secret, as before secrets existed.
+ */
+export function mayUse(record: SubscriptionRecord, secretHash: string | null): boolean {
+  return record.secretHash === undefined || (secretHash !== null && sameSecretHash(record.secretHash, secretHash));
+}
 
 const registeredAt = (record: SubscriptionRecord) => Math.max(record.createdAt, record.lastRegisteredAt ?? 0);
 
@@ -392,12 +401,16 @@ class SubscriptionStore {
 
   /**
    * Stores a record, registered from `address` (null when the relay can't tell).
-   * An id that is there can always be replaced. A new id is refused when its
-   * address already has `perAddress` records, and when the store holds `limit`
-   * records and none of them may give way (see SETUP_GRACE_MS); otherwise the
-   * new record is written, then the one that gives way is deleted and named in
-   * the result. Rejects when the record can't be written, and then keeps the one
-   * before and the one that would have given way.
+   * The id is the first registration's: a record bound to a secret is replaced
+   * only by one bound to the same secret ('not-owner' otherwise), and a record
+   * without one is never bound to one in place ('taken'), so nobody who merely
+   * knows an id can lock its client out. Past that, an id that is there can
+   * always be replaced. A new id is refused when its address already has
+   * `perAddress` records, and when the store holds `limit` records and none of
+   * them may give way (see SETUP_GRACE_MS); otherwise the new record is written,
+   * then the one that gives way is deleted and named in the result. Rejects when
+   * the record can't be written, and then keeps the one before and the one that
+   * would have given way.
    */
   async put(
     id: string,
@@ -407,8 +420,13 @@ class SubscriptionStore {
     await this.ensureLoaded();
     return this.serial(async (): Promise<PutResult> => {
       const address = options.address ?? null;
+      const current = this.records.get(id);
+      if (current) {
+        if (!mayUse(current, record.secretHash ?? null)) return { stored: false, reason: 'not-owner' };
+        if (current.secretHash === undefined && record.secretHash !== undefined) return { stored: false, reason: 'taken' };
+      }
       let victim: string | null = null;
-      if (!this.records.has(id)) {
+      if (!current) {
         if (address && (this.perAddress.get(address) ?? 0) >= (options.perAddress ?? Infinity)) {
           return { stored: false, reason: 'address-full' };
         }
@@ -443,13 +461,20 @@ class SubscriptionStore {
     return this.origins.get(id) ?? null;
   }
 
-  async delete(id: string): Promise<void> {
+  /**
+   * Deletes a record, if the caller may (see mayUse; `secretHash` is the hash of
+   * the secret it presented, null for none). Says what happened.
+   */
+  async delete(id: string, secretHash: string | null = null): Promise<'deleted' | 'absent' | 'not-owner'> {
     await this.ensureLoaded();
-    await this.serial(async () => {
-      if (!this.records.has(id)) return;
+    return this.serial(async () => {
+      const current = this.records.get(id);
+      if (!current) return 'absent';
+      if (!mayUse(current, secretHash)) return 'not-owner';
       await this.append(id, null);
       this.forget(id);
       await this.foldIfDue();
+      return 'deleted';
     });
   }
 

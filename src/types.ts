@@ -20,6 +20,10 @@ interface BaseSubscriptionRecord {
   // subscription got verified; this is the closest the relay can see.
   codeCollectedAt?: number;
   accountLabel?: string;
+  // The SHA-256 (base64url) of the secret the record was registered with, if
+  // its client sent one. Bound when the id is first registered; from then on
+  // the id alone neither replaces, deletes, polls nor pushes through it.
+  secretHash?: string;
 }
 
 export interface FcmSubscriptionRecord extends BaseSubscriptionRecord {

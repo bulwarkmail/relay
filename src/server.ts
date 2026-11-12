@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { URL } from 'node:url';
 import { logger } from './logger.js';
-import { MAX_REGISTRATION_BYTES, recordBytes, subscriptionStore } from './store.js';
+import { MAX_REGISTRATION_BYTES, mayUse, recordBytes, subscriptionStore } from './store.js';
 import { isFcmConfigured, sendFcmPush } from './fcm.js';
 import { getApnsConfig, sendApnsPush } from './apns.js';
 import { getVapidPublicKey, sendWebPush } from './webpush.js';
@@ -25,11 +25,14 @@ import {
   isValidApnsEnvironment,
   isValidApnsToken,
   isValidFcmToken,
+  isValidSecret,
   isValidSubscriptionId,
   isValidVerificationCode,
+  mayTakeSecret,
   normalizeEndpoint,
   normalizeKeys,
   normalizeWebPushSubscription,
+  secretHashOf,
 } from './validation.js';
 import type {
   ApnsSubscriptionRecord,
@@ -136,13 +139,13 @@ async function readJson(req: http.IncomingMessage): Promise<unknown> {
 }
 
 // The relay is meant to be reachable from any Bulwark deployment's browser
-// frontend, so we serve permissive CORS. There are no cookies or credentials
-// in any request, so `*` here is safe - opaque subscription ids and FCM
-// tokens are the only secrets and clients post them as request bodies.
+// frontend, so we serve permissive CORS. There are no cookies in any request,
+// so `*` here is safe: what proves a caller owns a record is a secret the
+// browser sends itself, in the body or the Authorization header.
 const CORS_HEADERS: Record<string, string> = {
   'access-control-allow-origin': '*',
   'access-control-allow-methods': 'GET, POST, DELETE, OPTIONS',
-  'access-control-allow-headers': 'content-type',
+  'access-control-allow-headers': 'content-type, authorization',
   'access-control-max-age': '86400',
 };
 
@@ -198,6 +201,14 @@ async function store(req: http.IncomingMessage, res: http.ServerResponse, id: st
     }
     return true;
   }
+  if (result.reason === 'not-owner') {
+    sendJson(res, 403, { error: NOT_OWNER });
+    return false;
+  }
+  if (result.reason === 'taken') {
+    sendJson(res, 409, { error: NO_SECRET_FOR_ID });
+    return false;
+  }
   if (result.reason === 'address-full') {
     if (Date.now() - addressFullLoggedAt > 60_000) {
       addressFullLoggedAt = Date.now();
@@ -212,6 +223,47 @@ async function store(req: http.IncomingMessage, res: http.ServerResponse, id: st
   }
   sendJson(res, 507, { error: 'Relay is full' });
   return false;
+}
+
+// A record registered with a secret belongs to whoever holds that secret: the
+// store keeps its hash (see store.ts, put). A registration for its id brings
+// the same secret in the body; DELETE and the verification poll send it as
+// `Authorization: Bearer <secret>`; the mail server's push URL carries it as
+// `?k=<secret>`, since a URL is all the mail server has. Each route looks in its
+// one place and nowhere else, so a proxy's access log can be told what to drop.
+// A record without a secret works by its id alone on every route, whatever
+// header or query comes along, as it always has.
+const NOT_OWNER = 'Wrong or missing secret for this subscription';
+const NO_SECRET_FOR_ID = 'This subscription id cannot take a secret; register a new id of 40 characters or more with it';
+
+/**
+ * The hash of the secret a registration brings: undefined when it brings none,
+ * null after answering a `secret` the relay can't take (400), or one for an id
+ * that may not take a secret (409, see mayTakeSecret).
+ */
+function registeredSecret(res: http.ServerResponse, id: string, value: unknown): string | undefined | null {
+  if (value === undefined) return undefined;
+  if (!isValidSecret(value)) {
+    sendJson(res, 400, { error: 'Invalid secret' });
+    return null;
+  }
+  if (!mayTakeSecret(id)) {
+    sendJson(res, 409, { error: NO_SECRET_FOR_ID });
+    return null;
+  }
+  return secretHashOf(value);
+}
+
+/** The hash of the secret in `Authorization: Bearer <secret>`, or null. */
+function bearerSecret(req: http.IncomingMessage): string | null {
+  const match = /^Bearer +([^\s]+)$/i.exec((req.headers.authorization ?? '').trim());
+  return match && isValidSecret(match[1]) ? secretHashOf(match[1]) : null;
+}
+
+/** The hash of the secret in the query's one `k`, decoded, or null. Two `k` count as none. */
+function querySecret(query: URLSearchParams): string | null {
+  const values = query.getAll('k');
+  return values.length === 1 && isValidSecret(values[0]) ? secretHashOf(values[0]) : null;
 }
 
 // What a new registration keeps from the record it replaces. A backoff the push
@@ -236,13 +288,13 @@ async function handleRegister(
     return sendJson(res, 503, { error: 'FCM not configured' });
   }
   const body = (await readJson(req)) as
-    | { subscriptionId?: unknown; fcmToken?: unknown; accountLabel?: unknown }
+    | { subscriptionId?: unknown; fcmToken?: unknown; accountLabel?: unknown; secret?: unknown }
     | null
     | undefined;
   if (!body || typeof body !== 'object') {
     return sendJson(res, 400, { error: 'Invalid JSON' });
   }
-  const { subscriptionId, fcmToken, accountLabel } = body;
+  const { subscriptionId, fcmToken, accountLabel, secret } = body;
   if (!isValidSubscriptionId(subscriptionId)) {
     return sendJson(res, 400, { error: 'Invalid subscriptionId' });
   }
@@ -253,6 +305,8 @@ async function handleRegister(
   if (label === null) {
     return sendJson(res, 400, { error: 'Invalid accountLabel' });
   }
+  const secretHash = registeredSecret(res, subscriptionId, secret);
+  if (secretHash === null) return;
 
   const existing = await subscriptionStore.get(subscriptionId);
   const record: FcmSubscriptionRecord = {
@@ -267,6 +321,7 @@ async function handleRegister(
     verificationCode: null,
     ...carriedOver(existing),
     accountLabel: label,
+    ...(secretHash ? { secretHash } : {}),
   };
   if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'fcm' });
@@ -283,13 +338,13 @@ async function handleRegisterApns(
     return sendJson(res, 503, { error: 'APNs not configured' });
   }
   const body = (await readJson(req)) as
-    | { subscriptionId?: unknown; deviceToken?: unknown; environment?: unknown; accountLabel?: unknown }
+    | { subscriptionId?: unknown; deviceToken?: unknown; environment?: unknown; accountLabel?: unknown; secret?: unknown }
     | null
     | undefined;
   if (!body || typeof body !== 'object') {
     return sendJson(res, 400, { error: 'Invalid JSON' });
   }
-  const { subscriptionId, deviceToken, environment, accountLabel } = body;
+  const { subscriptionId, deviceToken, environment, accountLabel, secret } = body;
   if (!isValidSubscriptionId(subscriptionId)) {
     return sendJson(res, 400, { error: 'Invalid subscriptionId' });
   }
@@ -303,6 +358,8 @@ async function handleRegisterApns(
   if (label === null) {
     return sendJson(res, 400, { error: 'Invalid accountLabel' });
   }
+  const secretHash = registeredSecret(res, subscriptionId, secret);
+  if (secretHash === null) return;
 
   const existing = await subscriptionStore.get(subscriptionId);
   const record: ApnsSubscriptionRecord = {
@@ -313,6 +370,7 @@ async function handleRegisterApns(
     verificationCode: null,
     ...carriedOver(existing),
     accountLabel: label,
+    ...(secretHash ? { secretHash } : {}),
   };
   if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'apns' });
@@ -333,13 +391,14 @@ async function handleRegisterWeb(
         subscriptionId?: unknown;
         subscription?: unknown;
         accountLabel?: unknown;
+        secret?: unknown;
       }
     | null
     | undefined;
   if (!body || typeof body !== 'object') {
     return sendJson(res, 400, { error: 'Invalid JSON' });
   }
-  const { subscriptionId, subscription, accountLabel } = body;
+  const { subscriptionId, subscription, accountLabel, secret } = body;
   if (!isValidSubscriptionId(subscriptionId)) {
     return sendJson(res, 400, { error: 'Invalid subscriptionId' });
   }
@@ -351,6 +410,8 @@ async function handleRegisterWeb(
   if (label === null) {
     return sendJson(res, 400, { error: 'Invalid accountLabel' });
   }
+  const secretHash = registeredSecret(res, subscriptionId, secret);
+  if (secretHash === null) return;
 
   const existing = await subscriptionStore.get(subscriptionId);
   const record: WebSubscriptionRecord = {
@@ -360,6 +421,7 @@ async function handleRegisterWeb(
     verificationCode: null,
     ...carriedOver(existing),
     accountLabel: label,
+    ...(secretHash ? { secretHash } : {}),
   };
   if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'web' });
@@ -379,13 +441,14 @@ async function handleRegisterUnifiedPush(
         endpoint?: unknown;
         keys?: unknown;
         accountLabel?: unknown;
+        secret?: unknown;
       }
     | null
     | undefined;
   if (!body || typeof body !== 'object') {
     return sendJson(res, 400, { error: 'Invalid JSON' });
   }
-  const { subscriptionId, endpoint, keys, accountLabel } = body;
+  const { subscriptionId, endpoint, keys, accountLabel, secret } = body;
   if (!isValidSubscriptionId(subscriptionId)) {
     return sendJson(res, 400, { error: 'Invalid subscriptionId' });
   }
@@ -401,6 +464,8 @@ async function handleRegisterUnifiedPush(
   if (label === null) {
     return sendJson(res, 400, { error: 'Invalid accountLabel' });
   }
+  const secretHash = registeredSecret(res, subscriptionId, secret);
+  if (secretHash === null) return;
 
   const existing = await subscriptionStore.get(subscriptionId);
   const record: UnifiedPushSubscriptionRecord = {
@@ -411,6 +476,7 @@ async function handleRegisterUnifiedPush(
     verificationCode: null,
     ...carriedOver(existing),
     accountLabel: label,
+    ...(secretHash ? { secretHash } : {}),
   };
   if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'up' });
@@ -418,6 +484,7 @@ async function handleRegisterUnifiedPush(
 }
 
 async function handleUnregister(
+  req: http.IncomingMessage,
   id: string,
   res: http.ServerResponse,
 ): Promise<void> {
@@ -427,7 +494,9 @@ async function handleUnregister(
   // Look up the record before deleting so we can attribute the unregister to
   // the right transport in metrics.
   const existing = await subscriptionStore.get(id);
-  await subscriptionStore.delete(id);
+  if ((await subscriptionStore.delete(id, bearerSecret(req))) === 'not-owner') {
+    return sendJson(res, 403, { error: NOT_OWNER });
+  }
   forwardPolicy.remove(id);
   subscriptionsUnregistered.inc({
     reason: 'client',
@@ -437,6 +506,7 @@ async function handleUnregister(
 }
 
 async function handleVerifyPoll(
+  req: http.IncomingMessage,
   id: string,
   res: http.ServerResponse,
 ): Promise<void> {
@@ -446,6 +516,11 @@ async function handleVerifyPoll(
   const record = await subscriptionStore.get(id);
   if (!record) {
     return sendJson(res, 404, { error: 'Unknown subscription' });
+  }
+  // Before anything is noted: a refused poll doesn't make the record look
+  // collected, and so alive, to the owner's other devices.
+  if (!mayUse(record, bearerSecret(req))) {
+    return sendJson(res, 403, { error: NOT_OWNER });
   }
   if (record.verificationCode && !record.codeCollectedAt) {
     await subscriptionStore.updateIfCurrent(id, record, (current) => {
@@ -486,15 +561,21 @@ async function handleActivePoll(
 async function handleJmap(
   req: http.IncomingMessage,
   id: string,
+  query: URLSearchParams,
   res: http.ServerResponse,
 ): Promise<void> {
   if (!isValidSubscriptionId(id)) {
     return sendJson(res, 400, { error: 'Invalid subscriptionId' });
   }
 
+  // Only the push URL the owner gave the mail server carries its secret.
+  const presented = querySecret(query);
   let record = await subscriptionStore.get(id);
   if (!record) {
     return sendJson(res, 404, { error: 'Unknown subscription' });
+  }
+  if (!mayUse(record, presented)) {
+    return sendJson(res, 403, { error: NOT_OWNER });
   }
 
   const body = (await readJson(req)) as JmapPushBody | null | undefined;
@@ -505,6 +586,9 @@ async function handleJmap(
   record = await subscriptionStore.get(id);
   if (!record) {
     return sendJson(res, 404, { error: 'Unknown subscription' });
+  }
+  if (!mayUse(record, presented)) {
+    return sendJson(res, 403, { error: NOT_OWNER });
   }
 
   if (body['@type'] === 'PushVerification') {
@@ -685,9 +769,12 @@ function allowedMethod(path: string): string | null {
   return null;
 }
 
-function requestPath(target: string | undefined): string | null {
+// The path routes the request. The query only matters on the push route, where
+// it may carry the record's secret; it is never logged or used as a label.
+function requestTarget(target: string | undefined): { path: string; query: URLSearchParams } | null {
   try {
-    return new URL(target ?? '/', 'http://localhost').pathname;
+    const url = new URL(target ?? '/', 'http://localhost');
+    return { path: url.pathname, query: url.searchParams };
   } catch {
     return null;
   }
@@ -718,12 +805,13 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
   const method = req.method ?? 'GET';
   // A request target like `//` is no URL at all. Thrown from here it would take
   // the whole process down, since this callback's promise has no handler.
-  const path = requestPath(req.url);
-  if (path === null) {
+  const target = requestTarget(req.url);
+  if (target === null) {
     sendJson(res, 400, { error: 'Bad request target' });
     httpRequestsTotal.inc({ method, route: 'other', status: '400' });
     return;
   }
+  const { path, query } = target;
   const route = normalizeRoute(method, path);
   const httpTimer = httpDurationSeconds.startTimer({ method, route });
 
@@ -814,12 +902,12 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     const registerIdMatch = path.match(/^\/api\/push\/register\/([^/]+)$/);
     // `/register/unifiedpush` would pass for an id here.
     if (method === 'DELETE' && registerIdMatch && allowedMethod(path) === 'DELETE') {
-      return await handleUnregister(decodeId(registerIdMatch[1]), res);
+      return await handleUnregister(req, decodeId(registerIdMatch[1]), res);
     }
 
     const verifyMatch = path.match(/^\/api\/push\/verify\/([^/]+)$/);
     if (method === 'GET' && verifyMatch) {
-      return await handleVerifyPoll(decodeId(verifyMatch[1]), res);
+      return await handleVerifyPoll(req, decodeId(verifyMatch[1]), res);
     }
 
     const activeMatch = path.match(/^\/api\/push\/active\/([^/]+)$/);
@@ -829,7 +917,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
     const jmapMatch = path.match(/^\/api\/push\/jmap\/([^/]+)$/);
     if (method === 'POST' && jmapMatch) {
-      return await handleJmap(req, decodeId(jmapMatch[1]), res);
+      return await handleJmap(req, decodeId(jmapMatch[1]), query, res);
     }
 
     const allowed = allowedMethod(path);
