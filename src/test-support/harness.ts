@@ -198,6 +198,8 @@ export async function startRelay(options: { env?: Record<string, string>; dataDi
         // Metrics stay off unless a test turns them on.
         METRICS_TOKEN: '',
         METRICS_TOKEN_FILE: '',
+        // No test meets the limit per client address unless it sets one.
+        PUSH_REGISTER_BURST: '1000',
         ...vapid,
         ...options.env,
       },
@@ -261,6 +263,74 @@ export function testVapid() {
 
 export function newId(): string {
   return crypto.randomBytes(16).toString('hex');
+}
+
+// Where the store keeps its files. Tests go through the helpers below instead.
+const SNAPSHOT = 'subscriptions.json';
+const JOURNAL = 'subscriptions.journal';
+
+/**
+ * The records a relay keeps in this data directory, as it would load them: the
+ * snapshot, then the journal's changes past the snapshot's number, when the
+ * journal continues that snapshot. Only a snapshot with a number has a journal.
+ */
+export function storedRecords(dataDir: string): Record<string, any> {
+  const records: Record<string, any> = {};
+  let seq: number | null = null;
+  for (const name of [SNAPSHOT, `${SNAPSHOT}.bak`]) {
+    const file = path.join(dataDir, name);
+    if (!fs.existsSync(file)) continue;
+    const snapshot = JSON.parse(fs.readFileSync(file, 'utf8'));
+    Object.assign(records, snapshot.records);
+    seq = Number.isSafeInteger(snapshot.seq) ? snapshot.seq : null;
+    break;
+  }
+  const journal = path.join(dataDir, JOURNAL);
+  const lines = fs.existsSync(journal) ? fs.readFileSync(journal, 'utf8').split('\n') : [];
+  let from: number | null = null;
+  const changes: Array<{ seq: number; id: string; record: unknown }> = [];
+  for (const line of lines) {
+    if (!line) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (from === null && Number.isSafeInteger(entry.from)) from = entry.from;
+      else if (Number.isSafeInteger(entry.seq) && typeof entry.id === 'string') changes.push(entry);
+    } catch {
+      // A torn line.
+    }
+  }
+  if (from === null || seq === null || from > seq) return records;
+  for (const change of changes) {
+    if (change.seq <= seq) continue;
+    if (change.record === null) delete records[change.id];
+    else records[change.id] = change.record;
+    seq = change.seq;
+  }
+  return records;
+}
+
+/**
+ * Writes a store in the format of the relay before the journal: one
+ * subscriptions.json, which every relay since reads. Records as an object, or
+ * the file's text as is. Returns the data directory, a new one unless given.
+ */
+export function seedStore(records: Record<string, unknown> | string, dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-seed-'))): string {
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(path.join(dataDir, SNAPSHOT), typeof records === 'string' ? records : JSON.stringify({ records }));
+  return dataDir;
+}
+
+/**
+ * From now on no write of the relay's store reaches the disk: a directory sits
+ * where each of its files would be written. What it wrote since its last
+ * snapshot is gone from the disk.
+ */
+export function blockStoreWrites(dataDir: string): void {
+  for (const name of [JOURNAL, `${SNAPSHOT}.tmp`]) {
+    const file = path.join(dataDir, name);
+    fs.rmSync(file, { force: true });
+    fs.mkdirSync(file, { recursive: true });
+  }
 }
 
 export async function postJson(base: string, pathname: string, body: unknown): Promise<{ status: number; body: any; headers: Headers }> {

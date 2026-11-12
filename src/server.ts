@@ -1,16 +1,18 @@
 import http from 'node:http';
 import { URL } from 'node:url';
 import { logger } from './logger.js';
-import { subscriptionStore } from './store.js';
+import { MAX_REGISTRATION_BYTES, recordBytes, subscriptionStore } from './store.js';
 import { isFcmConfigured, sendFcmPush } from './fcm.js';
 import { getApnsConfig, sendApnsPush } from './apns.js';
 import { getVapidPublicKey, sendWebPush } from './webpush.js';
 import { sendUnifiedPush } from './unifiedpush.js';
 import { isForwardableBody, toForwardPayload } from './payload.js';
 import { deliveryOptions, forwardPolicy, type DeliveryOptions } from './forward-policy.js';
+import { clientKey, takeRegistration } from './client-limit.js';
 import {
   classifyForward,
   failureReason,
+  forwardTimeoutMs,
   isTemporaryFailure,
   logRef,
   pushServiceHost,
@@ -19,13 +21,15 @@ import {
   type SendResult,
 } from './forward-result.js';
 import {
+  accountLabelOf,
   isValidApnsEnvironment,
   isValidApnsToken,
   isValidFcmToken,
   isValidSubscriptionId,
-  isValidUnifiedPushEndpoint,
-  isValidUnifiedPushKeys,
-  isValidWebPushSubscription,
+  isValidVerificationCode,
+  normalizeEndpoint,
+  normalizeKeys,
+  normalizeWebPushSubscription,
 } from './validation.js';
 import type {
   ApnsSubscriptionRecord,
@@ -58,7 +62,9 @@ const PORT = Number(process.env.PORT ?? 3003);
 const HOST = process.env.HOST ?? '0.0.0.0';
 const MAX_BODY_BYTES = 64 * 1024;
 const OVERSIZE_GRACE_MS = 2000;
-const MAX_VERIFICATION_CODE_CHARS = 512;
+// A push within this long of the last one doesn't move lastPushAt: nothing that
+// reads it (/active, the expiry) cares about a minute.
+const LAST_PUSH_RESOLUTION_MS = 60 * 1000;
 const REPO_URL = 'https://github.com/bulwarkmail/relay';
 
 // How long after registration we still report a subscription as "active" even
@@ -157,10 +163,61 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
   res.end(payload);
 }
 
-// What a new registration keeps from the record it replaces.
-function carriedOver(id: string, existing: SubscriptionRecord | null) {
+// Records the store takes. An id that is there can always register again; a new
+// one past the limit takes the place of a record that may give way (see store.ts)
+// or is refused.
+const DEFAULT_MAX_SUBSCRIPTIONS = 50_000;
+// Records one client address may hold, where the relay can tell addresses apart:
+// far more than a household or an office has devices and accounts, far fewer than
+// the store takes.
+const DEFAULT_MAX_SUBSCRIPTIONS_PER_ADDRESS = 1_000;
+
+function countEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
+}
+
+let fullLoggedAt = 0;
+let addressFullLoggedAt = 0;
+
+/** Stores a registration, or answers 507 when there is no room for it. Says whether it stored. */
+async function store(req: http.IncomingMessage, res: http.ServerResponse, id: string, record: SubscriptionRecord): Promise<boolean> {
+  // Every field has a limit of its own, which keeps a registration under this;
+  // the store holds no record larger than MAX_RECORD_BYTES whatever comes in.
+  if (recordBytes(record) > MAX_REGISTRATION_BYTES) {
+    sendJson(res, 400, { error: 'Registration too large' });
+    return false;
+  }
+  const limit = countEnv('PUSH_MAX_SUBSCRIPTIONS', DEFAULT_MAX_SUBSCRIPTIONS);
+  const perAddress = countEnv('PUSH_MAX_SUBSCRIPTIONS_PER_ADDRESS', DEFAULT_MAX_SUBSCRIPTIONS_PER_ADDRESS);
+  const result = await subscriptionStore.put(id, record, { limit, address: clientKey(req), perAddress });
+  if (result.stored) {
+    if (result.evicted) {
+      subscriptionsUnregistered.inc({ reason: 'evicted', transport: result.evicted.record.kind });
+      forwardPolicy.remove(result.evicted.id);
+    }
+    return true;
+  }
+  if (result.reason === 'address-full') {
+    if (Date.now() - addressFullLoggedAt > 60_000) {
+      addressFullLoggedAt = Date.now();
+      logger.warn('relay: a client address holds as many records as it may, its new devices are refused', { perAddress });
+    }
+    sendJson(res, 507, { error: 'Too many devices registered from this address' });
+    return false;
+  }
+  if (Date.now() - fullLoggedAt > 60_000) {
+    fullLoggedAt = Date.now();
+    logger.warn('relay: the store is full, new devices are refused', { limit });
+  }
+  sendJson(res, 507, { error: 'Relay is full' });
+  return false;
+}
+
+// What a new registration keeps from the record it replaces. A backoff the push
+// service asked for stays with the endpoint: see forward-policy.ts.
+function carriedOver(existing: SubscriptionRecord | null) {
   const now = Date.now();
-  forwardPolicy.forget(id);
   return {
     createdAt: existing?.createdAt ?? now,
     lastPushAt: existing?.lastPushAt ?? null,
@@ -192,6 +249,10 @@ async function handleRegister(
   if (!isValidFcmToken(fcmToken)) {
     return sendJson(res, 400, { error: 'Invalid fcmToken' });
   }
+  const label = accountLabelOf(accountLabel);
+  if (label === null) {
+    return sendJson(res, 400, { error: 'Invalid accountLabel' });
+  }
 
   const existing = await subscriptionStore.get(subscriptionId);
   const record: FcmSubscriptionRecord = {
@@ -204,13 +265,11 @@ async function handleRegister(
     // every fresh subscription, so dropping the old code is safe - the warm
     // path (existing JMAP sub still alive) skips polling entirely.
     verificationCode: null,
-    ...carriedOver(subscriptionId, existing),
-    accountLabel:
-      typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
+    ...carriedOver(existing),
+    accountLabel: label,
   };
-  await subscriptionStore.put(subscriptionId, record);
+  if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'fcm' });
-  await refreshActiveGauge();
   return sendJson(res, 200, { ok: true });
 }
 
@@ -240,6 +299,10 @@ async function handleRegisterApns(
   if (!isValidApnsEnvironment(environment)) {
     return sendJson(res, 400, { error: 'Invalid environment' });
   }
+  const label = accountLabelOf(accountLabel);
+  if (label === null) {
+    return sendJson(res, 400, { error: 'Invalid accountLabel' });
+  }
 
   const existing = await subscriptionStore.get(subscriptionId);
   const record: ApnsSubscriptionRecord = {
@@ -248,13 +311,11 @@ async function handleRegisterApns(
     environment,
     // See handleRegister for why we always reset this.
     verificationCode: null,
-    ...carriedOver(subscriptionId, existing),
-    accountLabel:
-      typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
+    ...carriedOver(existing),
+    accountLabel: label,
   };
-  await subscriptionStore.put(subscriptionId, record);
+  if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'apns' });
-  await refreshActiveGauge();
   return sendJson(res, 200, { ok: true });
 }
 
@@ -282,23 +343,26 @@ async function handleRegisterWeb(
   if (!isValidSubscriptionId(subscriptionId)) {
     return sendJson(res, 400, { error: 'Invalid subscriptionId' });
   }
-  if (!isValidWebPushSubscription(subscription)) {
+  const webPush = normalizeWebPushSubscription(subscription);
+  if (!webPush) {
     return sendJson(res, 400, { error: 'Invalid subscription' });
+  }
+  const label = accountLabelOf(accountLabel);
+  if (label === null) {
+    return sendJson(res, 400, { error: 'Invalid accountLabel' });
   }
 
   const existing = await subscriptionStore.get(subscriptionId);
   const record: WebSubscriptionRecord = {
     kind: 'web',
-    webPush: subscription,
+    webPush,
     // See handleRegister for why we always reset this.
     verificationCode: null,
-    ...carriedOver(subscriptionId, existing),
-    accountLabel:
-      typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
+    ...carriedOver(existing),
+    accountLabel: label,
   };
-  await subscriptionStore.put(subscriptionId, record);
+  if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'web' });
-  await refreshActiveGauge();
   return sendJson(res, 200, { ok: true });
 }
 
@@ -325,27 +389,31 @@ async function handleRegisterUnifiedPush(
   if (!isValidSubscriptionId(subscriptionId)) {
     return sendJson(res, 400, { error: 'Invalid subscriptionId' });
   }
-  if (!isValidUnifiedPushEndpoint(endpoint)) {
+  const target = normalizeEndpoint(endpoint);
+  if (!target) {
     return sendJson(res, 400, { error: 'Invalid endpoint' });
   }
-  if (keys != null && !isValidUnifiedPushKeys(keys)) {
+  const webPushKeys = keys == null ? null : normalizeKeys(keys);
+  if (keys != null && !webPushKeys) {
     return sendJson(res, 400, { error: 'Invalid keys' });
+  }
+  const label = accountLabelOf(accountLabel);
+  if (label === null) {
+    return sendJson(res, 400, { error: 'Invalid accountLabel' });
   }
 
   const existing = await subscriptionStore.get(subscriptionId);
   const record: UnifiedPushSubscriptionRecord = {
     kind: 'up',
-    endpoint,
-    keys: keys ?? null,
+    endpoint: target,
+    keys: webPushKeys,
     // See handleRegister for why we always reset this.
     verificationCode: null,
-    ...carriedOver(subscriptionId, existing),
-    accountLabel:
-      typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
+    ...carriedOver(existing),
+    accountLabel: label,
   };
-  await subscriptionStore.put(subscriptionId, record);
+  if (!(await store(req, res, subscriptionId, record))) return;
   subscriptionsRegistered.inc({ transport: 'up' });
-  await refreshActiveGauge();
   return sendJson(res, 200, { ok: true });
 }
 
@@ -365,7 +433,6 @@ async function handleUnregister(
     reason: 'client',
     transport: existing?.kind ?? 'unknown',
   });
-  await refreshActiveGauge();
   return sendJson(res, 200, { ok: true });
 }
 
@@ -441,15 +508,17 @@ async function handleJmap(
   }
 
   if (body['@type'] === 'PushVerification') {
-    // Stalwart sends 32 characters; this ends up on disk and in a client's poll.
     const code: unknown = body.verificationCode;
-    if (typeof code !== 'string' || code.length === 0 || code.length > MAX_VERIFICATION_CODE_CHARS) {
+    if (!isValidVerificationCode(code)) {
       return sendJson(res, 400, { error: 'Invalid verification code' });
     }
     pushesReceived.inc({ type: 'PushVerification' });
-    await subscriptionStore.updateIfCurrent(id, record, (current) => {
-      current.verificationCode = code;
-    });
+    // The same code again changes nothing, so nothing is written.
+    if (record.verificationCode !== code) {
+      await subscriptionStore.updateIfCurrent(id, record, (current) => {
+        current.verificationCode = code;
+      });
+    }
     return sendJson(res, 200, { ok: true });
   }
 
@@ -463,7 +532,9 @@ async function handleJmap(
       pushesHeld.inc({ reason: hold.reason, transport: record.kind });
       logger.info('relay: push held back', { subscription: logRef(id), transport: record.kind, ...hold });
       res.setHeader('retry-after', String(hold.retryAfterSeconds));
-      return sendJson(res, hold.reason === 'rate-limit' ? 429 : 503, { ok: false, held: hold.reason });
+      // The relay's own limits answer 429; holds the push service asked for, 503.
+      const ours = hold.reason === 'rate-limit' || hold.reason === 'endpoint-rate-limit';
+      return sendJson(res, ours ? 429 : 503, { ok: false, held: hold.reason });
     }
     let result: SendResult;
     try {
@@ -482,7 +553,7 @@ async function handleJmap(
       return sendJson(res, 500, { error: 'Internal server error' });
     }
     // A record replaced meanwhile points at another endpoint, which this says nothing about.
-    if (await subscriptionStore.isCurrent(id, record)) forwardPolicy.note(id, record, result);
+    if (await subscriptionStore.isCurrent(id, record)) forwardPolicy.note(record, result, subscriptionStore.addressOf(id));
     const outcome = classifyForward(result);
     pushesForwarded.inc({
       result: outcome,
@@ -510,8 +581,7 @@ async function handleJmap(
         subscriptionsUnregistered.inc({ reason, transport: record.kind });
         forwardPolicy.remove(id);
       }
-      await refreshActiveGauge();
-    } else if (result.ok) {
+    } else if (result.ok && Date.now() - (record.lastPushAt ?? 0) >= LAST_PUSH_RESOLUTION_MS) {
       // Only what really went out: /active and the 90 days go by this.
       await subscriptionStore.updateIfCurrent(id, record, (current) => {
         current.lastPushAt = Date.now();
@@ -576,9 +646,8 @@ async function dispatch(
   return result;
 }
 
-// Refresh the active-subscriptions gauge by counting per-transport. Called
-// after every register/unregister and on every /metrics scrape so the gauge
-// stays consistent with the on-disk state.
+// Refresh the active-subscriptions gauge by counting per-transport, on every
+// /metrics scrape: the count walks every record, which no other request does.
 async function refreshActiveGauge(): Promise<void> {
   const counts = await subscriptionStore.sizeByKind();
   subscriptionsActive.set({ transport: 'fcm' }, counts.fcm);
@@ -602,6 +671,8 @@ function normalizeRoute(method: string, path: string): string {
   if (/^\/api\/push\/jmap\/[^/]+$/.test(path)) return '/api/push/jmap/:id';
   return 'other';
 }
+
+const REGISTER_ROUTES = new Set(['/api/push/register', '/api/push/register/web', '/api/push/register/unifiedpush', '/api/push/register/apns']);
 
 function allowedMethod(path: string): string | null {
   // With metrics off, /metrics answers 404 to every method, like any unknown path.
@@ -684,9 +755,9 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       return;
     }
 
+    // Up or not, nothing more: how many records there are is in /metrics.
     if (method === 'GET' && path === '/api/health') {
-      const count = await subscriptionStore.size();
-      return sendJson(res, 200, { ok: true, subscriptions: count });
+      return sendJson(res, 200, { ok: true });
     }
 
     if (method === 'GET' && (path === '/' || path === '/index.html')) {
@@ -705,6 +776,15 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       });
       res.end(LANDING_HTML);
       return;
+    }
+
+    if (method === 'POST' && REGISTER_ROUTES.has(path)) {
+      // Before anything is read: a registration past the address's budget stores nothing.
+      const wait = takeRegistration(req);
+      if (wait !== null) {
+        res.setHeader('retry-after', String(wait));
+        return sendJson(res, 429, { error: 'Too many registrations, try again later' });
+      }
     }
 
     if (method === 'POST' && path === '/api/push/register') {
@@ -797,10 +877,23 @@ subscriptionStore.load().then(
   },
 );
 
+// Every change is on disk before it is answered; a stop doesn't change that. On
+// the way out the journal goes into the snapshot, after the last change, so an
+// older relay, which reads subscriptions.json only, finds every record there.
+// A push still on its way gets its full deadline first.
+let stopping = false;
+const stop = (code: number) => {
+  if (stopping) return;
+  stopping = true;
+  void subscriptionStore.close().then((folded) => {
+    if (!folded) logger.warn('relay: stopped with changes left in subscriptions.journal, which an older relay does not read');
+    process.exit(code);
+  });
+};
 const shutdown = (signal: string) => {
   logger.info('relay: shutting down', { signal });
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 5000).unref();
+  server.close(() => stop(0));
+  setTimeout(() => stop(1), forwardTimeoutMs() + 1000).unref();
 };
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));

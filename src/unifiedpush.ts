@@ -8,6 +8,11 @@ import type { ForwardPayload, UnifiedPushSubscriptionRecord } from './types.js';
 // Web Push transport; the app re-syncs over JMAP on next launch anyway.
 const TTL_SECONDS = 60 * 60;
 
+// Without keys the payload goes out as readable JSON to wherever the endpoint
+// points. The label goes with it only when it looks like a sign-in name, which
+// is what the app registers; anything else goes as an empty string.
+const PLAIN_LABEL = /^[\w.@+-]{1,120}$/;
+
 /**
  * Deliver a payload to a UnifiedPush endpoint. Modern connectors (>= 3.0)
  * hand out RFC 8291 keys, so the message goes out as standard encrypted Web
@@ -35,7 +40,7 @@ export async function sendUnifiedPush(
       getVapidPublicKey();
       return await sendEncrypted({ endpoint: record.endpoint, keys: record.keys }, payload, { urgency: delivery.urgency });
     }
-    const body = JSON.stringify(payload);
+    const body = JSON.stringify(PLAIN_LABEL.test(payload.accountLabel) ? payload : { ...payload, accountLabel: '' });
     const { status, text, retryAfter } = await postToEndpoint(
       record.endpoint,
       {

@@ -6,24 +6,31 @@ const MAX_PAYLOAD_BYTES = 3000;
 const MAX_LABEL_CHARS = 120;
 const JMAP_ID = /^[A-Za-z0-9_-]{1,255}$/;
 const DATA_TYPE = /^[A-Za-z]{1,64}$/;
-const MAX_STATE_CHARS = 255;
+// Stalwart's states are a few letters and digits, the legacy proxy's g<n>r<n>.
+// Clients treat a state as opaque and fetch anyway, so one that isn't like these
+// is left out and the ping goes without it.
+const STATE = /^[A-Za-z0-9_-]{1,64}$/;
 
 function isOversized(payload: ForwardPayload): boolean {
   return Buffer.byteLength(JSON.stringify(payload)) > MAX_PAYLOAD_BYTES;
 }
 
 // Only what JMAP says can be in there. Anyone who knows a subscription id can
-// post here, and this goes on to the device as is.
+// post here, and this goes on to the device as is. An account whose states were
+// all left out stays, with nothing under it: it still has a change to announce.
 function cleanChanged(changed: unknown): Record<string, Record<string, string>> {
   const out: Record<string, Record<string, string>> = {};
   if (!changed || typeof changed !== 'object') return out;
   for (const [account, types] of Object.entries(changed)) {
     if (!JMAP_ID.test(account) || !types || typeof types !== 'object') continue;
     const kept: Record<string, string> = {};
+    let leftOut = false;
     for (const [type, state] of Object.entries(types)) {
-      if (DATA_TYPE.test(type) && typeof state === 'string' && state.length <= MAX_STATE_CHARS) kept[type] = state;
+      if (!DATA_TYPE.test(type) || typeof state !== 'string') continue;
+      if (STATE.test(state)) kept[type] = state;
+      else leftOut = true;
     }
-    if (Object.keys(kept).length > 0) out[account] = kept;
+    if (Object.keys(kept).length > 0 || leftOut) out[account] = kept;
   }
   return out;
 }
@@ -65,9 +72,10 @@ export function toForwardPayload(
       .filter((id): id is string => id !== null);
     const accountId = typeof body.accountId === 'string' && JMAP_ID.test(body.accountId) ? body.accountId : '';
     // Synthesize the legacy state-change shape so an older service worker or
-    // app build that keys on `changed` still resolves the right account.
+    // app build that keys on `changed` still resolves the right account. The key
+    // stays; a state that isn't one goes out empty, like a missing one.
     const changed: Record<string, Record<string, string>> = accountId
-      ? { [accountId]: { EmailDelivery: typeof body.state === 'string' ? body.state.slice(0, MAX_STATE_CHARS) : '' } }
+      ? { [accountId]: { EmailDelivery: typeof body.state === 'string' && STATE.test(body.state) ? body.state : '' } }
       : {};
     return fit({ kind: 'jmap-email-push', accountLabel: label, accountId, emailIds, changed });
   }

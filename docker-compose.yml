@@ -4,8 +4,19 @@ services:
     image: bulwark-relay:local
     container_name: bulwark-relay
     restart: unless-stopped
+    # A stop waits for a push still on its way, then folds the journal into
+    # subscriptions.json (README, "Going back to an older image").
+    stop_grace_period: 30s
     ports:
       - 127.0.0.1:3003:3003
+    # Writable: the data volume and /tmp, nothing else.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     volumes:
       - ./data:/app/data
     env_file:
@@ -14,12 +25,26 @@ services:
       - NODE_ENV=production
       - PORT=3003
       - PUSH_DATA_DIR=/app/data
+      # Limits, defaults shown (README, "Limits"). Set them here or in .env.
+      # Records kept; past it a new device takes the place of one that never
+      # delivered, or gets 507 "Relay is full".
+      # - PUSH_MAX_SUBSCRIPTIONS=50000
+      # Records one client address may hold (with TRUST_PROXY set); past it 507.
+      # - PUSH_MAX_SUBSCRIPTIONS_PER_ADDRESS=1000
+      # Registrations per client address at once, then one per refill; past it 429 with Retry-After.
+      # - PUSH_REGISTER_BURST=60
+      # - PUSH_REGISTER_REFILL_MS=2000
+      # The port is published for a proxy on this host. Once it sends X-Forwarded-For,
+      # set this to 1; until then every client has the proxy's address and only
+      # PUSH_MAX_SUBSCRIPTIONS applies.
+      # - TRUST_PROXY=1
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:3003/api/health"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 5s
+    # bulwark: the network Prometheus scrapes /metrics through (README, "Run in Docker").
     networks:
       - default
       - bulwark

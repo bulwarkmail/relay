@@ -70,6 +70,12 @@ export const subscriptionsActive = new Gauge({
   registers: [registry],
 });
 
+export const storeWriteFailures = new Counter({
+  name: 'relay_store_write_failures_total',
+  help: 'Store writes that failed. The change is not kept: the request that made it got a 500, or after a forward only a log line',
+  registers: [registry],
+});
+
 export const pushesReceived = new Counter({
   name: 'relay_pushes_received_total',
   help: 'JMAP push bodies received from Stalwart',
