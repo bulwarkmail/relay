@@ -74,9 +74,10 @@ const MAX_HOST_HOLD_SECONDS = 120;
 // What has run out goes this often; nothing that is still running.
 const PRUNE_INTERVAL_MS = 60_000;
 // Pushes the relay forwards to one endpoint (or token) at once, then one more
-// every ENDPOINT_REFILL_MS, whatever number of ids share it: an endpoint gets
-// no more for having more ids. Ten accounts in one browser, each at the
-// sustained rate one id gets, still fit.
+// every ENDPOINT_REFILL_MS, whatever number of ids share it and however its path
+// is written: an endpoint gets no more for having more ids. Ten accounts in one
+// browser, each at the sustained rate one id gets, still fit. Endpoints that
+// differ in their query have a budget each: WNS (Edge) keeps the device there.
 const ENDPOINT_BURST = 30;
 const ENDPOINT_REFILL_MS = 2000;
 // A host is held for everyone only when the devices it throttled were
@@ -100,14 +101,56 @@ export function hostThrottleKey(record: SubscriptionRecord, host: string): strin
   return `${record.kind}:${host}`;
 }
 
+// Characters that are the same written as themselves or as %XX (RFC 3986,
+// 2.3). Any other %XX stands for what it encodes: `%2F` is a slash inside a
+// segment, not a separator, and stays.
+const UNRESERVED = /^[A-Za-z0-9._~-]$/;
+
+function samePercentEncoding(text: string): string {
+  return text.replace(/%([0-9A-Fa-f]{2})/g, (_, hex: string) => {
+    const char = String.fromCharCode(parseInt(hex, 16));
+    return UNRESERVED.test(char) ? char : `%${hex.toUpperCase()}`;
+  });
+}
+
+// RFC 3986, 5.2.4, for a path that starts with a slash.
+function withoutDotSegments(pathname: string): string {
+  const segments = pathname.split('/').slice(1);
+  const out: string[] = [];
+  segments.forEach((segment, i) => {
+    if (segment === '..') out.pop();
+    if (segment !== '.' && segment !== '..') out.push(segment);
+    else if (i === segments.length - 1) out.push('');
+  });
+  return `/${out.join('/')}`;
+}
+
+/**
+ * What an endpoint counts as, the same for every way of writing it (RFC 3986,
+ * 6.2.2): scheme and host in lower case, without the default port or a trailing
+ * dot on the host, unreserved characters as themselves and the hex digits of any
+ * other %XX in upper case, no dot segments, no fragment (it never reaches the
+ * service), and the query only when `withQuery`. The endpoint the relay stores
+ * and calls stays as the client registered it.
+ */
+function endpointKey(endpoint: string, withQuery: boolean): string {
+  try {
+    const url = new URL(endpoint);
+    const host = url.hostname.endsWith('.') ? url.hostname.slice(0, -1) : url.hostname;
+    const port = url.port ? `:${url.port}` : '';
+    const query = withQuery && url.search ? samePercentEncoding(url.search) : '';
+    return `${url.protocol}//${host}${port}${withoutDotSegments(samePercentEncoding(url.pathname))}${query}`;
+  } catch {
+    return endpoint;
+  }
+}
+
 // What a push service throttles: the endpoint, or the token. Subscriptions on one
-// are one device, and a fragment is no part of it (it never reaches the service).
+// are one device, however the endpoint is written.
 function deviceOf(record: SubscriptionRecord): string {
   if (record.kind === 'fcm') return `fcm:${record.fcmToken}`;
   if (record.kind === 'apns') return `apns:${record.deviceToken}`;
-  const endpoint = record.kind === 'web' ? record.webPush.endpoint : record.endpoint;
-  const fragment = endpoint.indexOf('#');
-  return fragment === -1 ? endpoint : endpoint.slice(0, fragment);
+  return endpointKey(record.kind === 'web' ? record.webPush.endpoint : record.endpoint, true);
 }
 
 // What counts as one device toward holding a whole host: the endpoint without its
@@ -116,13 +159,13 @@ function deviceOf(record: SubscriptionRecord): string {
 // host and path, and their endpoints are held one by one.
 function hostDeviceOf(record: SubscriptionRecord): string {
   if (record.kind === 'fcm' || record.kind === 'apns') return deviceOf(record);
-  const endpoint = record.kind === 'web' ? record.webPush.endpoint : record.endpoint;
-  try {
-    const url = new URL(endpoint);
-    return `${url.origin}${url.pathname}`;
-  } catch {
-    return endpoint;
-  }
+  return endpointKey(record.kind === 'web' ? record.webPush.endpoint : record.endpoint, false);
+}
+
+// The host a hold is kept for, written one way.
+function holdKey(record: SubscriptionRecord): string {
+  const host = pushServiceHost(record);
+  return hostThrottleKey(record, host.endsWith('.') ? host.slice(0, -1) : host);
 }
 
 export function parseRetryAfter(value: unknown, now = Date.now()): number | undefined {
@@ -155,7 +198,7 @@ class ForwardPolicy {
     if (until !== undefined && until > now) {
       return { reason: 'push-service-backoff', retryAfterSeconds: Math.ceil((until - now) / 1000) };
     }
-    const host = this.hostThrottles.get(hostThrottleKey(record, pushServiceHost(record)));
+    const host = this.hostThrottles.get(holdKey(record));
     if (host && host.until > now) {
       return { reason: 'push-service-throttle', retryAfterSeconds: Math.ceil((host.until - now) / 1000) };
     }
@@ -183,7 +226,7 @@ class ForwardPolicy {
     // A record that never got a push through says nothing about the service's
     // quota for everybody else, and anyone can make one.
     if (!throttled || record.lastPushAt == null) return;
-    const name = hostThrottleKey(record, pushServiceHost(record));
+    const name = holdKey(record);
     const host = this.hostThrottles.get(name);
     const current = host && now - host.windowStart < HOST_WINDOW_MS
       ? host

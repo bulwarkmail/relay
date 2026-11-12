@@ -74,7 +74,13 @@ default, merging whatever arrived meanwhile into one push.
   once and one more every 2 seconds, however many subscriptions share it (one per
   account in a browser or app). Past that the relay answers `429` without calling
   the service (`held: "rate-limit"` or `"endpoint-rate-limit"`), and the mail
-  server's next attempt carries everything that piled up.
+  server's next attempt carries everything that piled up. An endpoint counts as one
+  however it is written: the host in lower case and without a trailing dot, no
+  default port, letters, digits and `-._~` written as `%XX` read as themselves, the
+  hex digits of other `%XX` in upper case (`%2F` stays apart from `/`), no `.` or
+  `..` segments, no fragment. Endpoints that differ in their query keep a budget
+  each, since WNS (Edge) keeps the device there. The endpoint is stored and called
+  as the client registered it.
 - **Backoff.** After a `429`, or any answer with `Retry-After`, the relay leaves that
   endpoint (or token) alone for as long as the service says (60 seconds without a
   header, an hour at most), for every subscription on it. Registering the same
@@ -85,12 +91,12 @@ default, merging whatever arrived meanwhile into one push.
 - **Host hold.** After `429`s for 20 different devices on one host within a minute,
   registered from at least 5 different client addresses, the relay leaves the whole
   host alone, for two minutes at most. Only devices that have delivered a push before
-  count, a device is its endpoint without query and fragment, and browsers and native
-  apps count separately. Where the relay can't tell client addresses apart (see
-  [Limits](#limits)), and for records registered before its last start, each device
-  counts as an address of its own. Endpoints that differ only in their query (WNS,
-  which Edge uses) count as one device per host and path, so they are held one by
-  one. Held pushes count in `relay_pushes_held_total`.
+  count, a device is its endpoint without query and fragment, written one way as
+  above, and browsers and native apps count separately. Where the relay can't tell
+  client addresses apart (see [Limits](#limits)), and for records registered before
+  its last start, each device counts as an address of its own. Endpoints that
+  differ only in their query (WNS, which Edge uses) count as one device per host and
+  path, so they are held one by one. Held pushes count in `relay_pushes_held_total`.
 
 ## Which endpoints it calls
 

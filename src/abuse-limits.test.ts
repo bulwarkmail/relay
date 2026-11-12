@@ -929,6 +929,59 @@ describe('one endpoint written many ways', () => {
       await relay.stop();
     }
   });
+
+  // A letter and its percent-encoding are the same path to the server that gets the request
+  // (RFC 3986, 6.2.2.2), and the relay counts them as one endpoint, though the URL parser keeps
+  // them apart. The relay here can't tell client addresses apart (no TRUST_PROXY, a loopback
+  // peer), as behind a proxy it wasn't told about.
+  it('cannot put its push service on hold for everyone once each spelling of its path has delivered a push', async () => {
+    const relay = await startRelay();
+    try {
+      const web = (id: string, pathname: string) =>
+        postJson(relay.base, '/api/push/register/web', { subscriptionId: id, subscription: { endpoint: service.url(pathname), keys: makeDevice().keys } });
+      const victim = newId();
+      assert.equal((await web(victim, '/honest-device-p')).status, 200);
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${victim}`, emailPush('a', ['e1']))).status, 200);
+      const word = 'abcdefghijklmnopqrstuvwxyz';
+      const spellings = Array.from({ length: 20 }, (_, i) => `/one-endpoint/${word.slice(0, i)}%${word.charCodeAt(i).toString(16)}${word.slice(i + 1)}`);
+      const ids: string[] = [];
+      for (const pathname of spellings) {
+        const id = newId();
+        ids.push(id);
+        assert.equal((await web(id, pathname)).status, 200);
+        assert.equal((await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e0']))).status, 200);
+      }
+      // Then the service throttles that endpoint.
+      for (const pathname of spellings) service.answer(pathname, { status: 429 });
+      for (const id of ids) await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e1']));
+      const push = await postJson(relay.base, `/api/push/jmap/${victim}`, emailPush('a', ['e2']));
+      assert.equal(push.status, 200, `the honest device's push was held: ${JSON.stringify(push.body)}`);
+      assert.equal(service.to('/honest-device-p').length, 2);
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('forwards no more to one endpoint than its own budget, however its path is written', async () => {
+    const relay = await startRelay();
+    try {
+      const word = 'abcde';
+      const spellings = Array.from({ length: 5 }, (_, i) => `/spelled-budget/${word.slice(0, i)}%${word.charCodeAt(i).toString(16)}${word.slice(i + 1)}`);
+      const ids: string[] = [];
+      for (const pathname of spellings) {
+        const id = newId();
+        ids.push(id);
+        assert.equal((await web(relay, id, pathname)).status, 200);
+      }
+      for (const id of ids) {
+        for (let i = 0; i < 10; i++) await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', [`e${i}`]));
+      }
+      // Each id may have ten at once; the endpoint thirty in all, whichever way it is written.
+      assert.equal(service.requests.filter((r) => r.path.startsWith('/spelled-budget/')).length, 30);
+    } finally {
+      await relay.stop();
+    }
+  });
 });
 
 // Cost, measured as bytes the relay process hands to write(): on a store twice the size, the same
