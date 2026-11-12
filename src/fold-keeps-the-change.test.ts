@@ -6,7 +6,9 @@
 //
 // The journal is folded once it is larger than the snapshot and larger than 1 MiB.
 // The first cases fill a fresh store's journal to just under 1 MiB and then make
-// one more change, which is the one that triggers the fold.
+// one more change, which is the one that triggers the fold. On a fresh store the
+// first change writes a snapshot that holds no change yet (number 0) before the
+// journal begins; a fold writes one with the number of the last change it holds.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
@@ -54,10 +56,20 @@ const journalSize = (dataDir: string) => {
   }
 };
 
-/** Waits for the snapshot a fold writes. A store may fold a moment after it answers. */
+/** The number of the last change the snapshot holds; null without a snapshot or a number. */
+function snapshotSeq(dataDir: string): number | null {
+  try {
+    const head = /^\{"seq":(\d+),/.exec(fs.readFileSync(path.join(dataDir, SNAPSHOT), 'utf8').slice(0, 40));
+    return head ? Number(head[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Waits for the snapshot a fold of the journal writes. A store may fold a moment after it answers. */
 async function folded(dataDir: string): Promise<boolean> {
   for (let i = 0; i < 100; i++) {
-    if (fs.existsSync(path.join(dataDir, 'subscriptions.json'))) return true;
+    if ((snapshotSeq(dataDir) ?? 0) > 0) return true;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return false;
@@ -86,7 +98,7 @@ async function fillJournal(relay: RunningRelay, room: number): Promise<void> {
   await line(Math.floor(left() / 2));
   await line(left());
   assert.equal(journalSize(relay.dataDir), FOLD_AT - room, 'the journal is not where the test needs it');
-  assert.ok(!fs.existsSync(path.join(relay.dataDir, 'subscriptions.json')), 'the store folded before the change under test');
+  assert.equal(snapshotSeq(relay.dataDir), 0, 'the store folded before the change under test');
 }
 
 describe('the change that makes the store fold its journal', () => {
@@ -278,10 +290,9 @@ function olderRelayWrites(dataDir: string, records: Record<string, unknown>): vo
 }
 
 describe('going back to an older relay during this relay\'s first run on a directory', () => {
-  // The first journal a relay writes on a store that has no number yet (an older relay's, or
-  // none) continues "snapshot 0", and a snapshot the older relay writes afterwards has no number
-  // either. The journal's first line also names a hash of the snapshot it began on, so it is
-  // not replayed over another one.
+  // On a store without a number (an older relay's, or none) the first change writes a snapshot of
+  // this relay's own, with a number, before the journal begins. Whatever the older relay writes
+  // afterwards has no number, so a journal found next to it is set aside, not replayed over it.
   for (const first of ['an empty directory', 'a store the older relay wrote']) {
     it(`does not replay the journal of that first run over what the older relay wrote since (${first})`, async () => {
       const moved = newId();
@@ -400,7 +411,7 @@ describe('going back to an older relay during this relay\'s first run on a direc
     await Promise.all(Array.from({ length: 16 }, worker));
     await killed;
     assert.ok(answered.length >= 800, `${answered.length} answered`);
-    assert.ok(fs.existsSync(path.join(relay.dataDir, SNAPSHOT)), 'the journal was never folded on the way');
+    assert.ok((snapshotSeq(relay.dataDir) ?? 0) > 0, 'the journal was never folded on the way');
     const again = await startRelay({ dataDir: relay.dataDir });
     try {
       const records = storedRecords(relay.dataDir);
@@ -412,6 +423,126 @@ describe('going back to an older relay during this relay\'s first run on a direc
       await again.stop('SIGKILL');
     }
   });
+});
+
+describe('an older relay between two runs of this one, whose changes end where they began', () => {
+  // This relay's first run on an older relay's store: a device registers, then the process is killed
+  // before any fold. Under the older relay the same device registers again and its user turns push
+  // off, which leaves subscriptions.json byte for byte as the older relay had it. The first run
+  // wrote a snapshot with a number before its journal, and the older relay's rewrite has none, so
+  // the journal is set aside and the device stays gone.
+  const rec = (pathname: string) => ({ kind: 'up', endpoint: service.url(pathname), keys, verificationCode: null, createdAt: Date.now(), lastPushAt: Date.now(), lastRegisteredAt: Date.now() });
+  it('does not bring back a device its user unregistered under the older relay', async () => {
+    const old = newId();
+    const gone = newId();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-aba-'));
+    const before = { [old]: rec('/aba-old') };
+    olderRelayWrites(dir, before);
+    const first = await startRelay({ dataDir: dir });
+    assert.equal((await postJson(first.base, '/api/push/register/unifiedpush', { subscriptionId: gone, endpoint: service.url('/aba-gone'), keys })).status, 200);
+    await first.stop('SIGKILL');
+    assert.ok(fs.existsSync(path.join(dir, 'subscriptions.journal')), 'the first run left no journal');
+    olderRelayWrites(dir, { ...before, [gone]: rec('/aba-gone-2') });
+    olderRelayWrites(dir, before);
+    const again = await startRelay({ dataDir: dir });
+    try {
+      const got = [
+        (await getJson(again.base, `/api/push/active/${old}`)).status,
+        (await getJson(again.base, `/api/push/active/${gone}`)).status,
+      ];
+      assert.deepEqual(got, [200, 404], 'the unregistered device is back');
+    } finally {
+      await again.stop('SIGKILL');
+    }
+  });
+});
+
+describe('the first change on a store without a number, cut short by a crash', () => {
+  // The first change on an older relay's store, or on an empty directory, first writes a snapshot of
+  // this relay's own: the temp file, the older snapshot moved to the previous version's place, the
+  // new one renamed in. Only then does the journal take the change, and only then is it answered.
+  // Each case is the set of files a kill leaves at one of those moments. The next start has every
+  // record the older relay had, the change only once its journal line is whole, sets nothing aside,
+  // and takes and keeps the next change.
+  for (const first of ['an empty directory', 'a store the older relay wrote']) {
+    describe(first, () => {
+      const old = newId();
+      const added = newId();
+      let olderStore: string | null = null;
+      let numbered = '';
+      let journal = '';
+
+      before(async () => {
+        const now = Date.now();
+        olderStore = first === 'an empty directory'
+          ? null
+          : JSON.stringify({ records: { [old]: { kind: 'up', endpoint: service.url('/first-fold-old'), keys: null, verificationCode: null, createdAt: now, lastPushAt: now, lastRegisteredAt: now } } }, null, 2);
+        const dataDir = storeWith(olderStore === null ? {} : { [SNAPSHOT]: olderStore });
+        const relay = await startRelay({ dataDir });
+        assert.equal((await plain(relay, added, '/first-fold-added')).status, 200);
+        await relay.stop('SIGKILL');
+        numbered = read(dataDir, SNAPSHOT);
+        journal = read(dataDir, JOURNAL);
+        assert.match(numbered, /^\{"seq":0,"records":\{/, 'the first change wrote no snapshot with a number');
+        assert.ok(!numbered.includes(added), 'the snapshot written before the journal holds the change');
+        if (olderStore !== null) assert.equal(read(dataDir, `${SNAPSHOT}.bak`), olderStore, 'the older store is not the previous version');
+      });
+
+      const older = () => (olderStore === null ? {} : { [SNAPSHOT]: olderStore });
+      const previous = () => (olderStore === null ? {} : { [`${SNAPSHOT}.bak`]: olderStore });
+
+      async function assertStore(files: () => Record<string, string>, answered: boolean) {
+        const dataDir = storeWith(files());
+        const relay = await startRelay({ dataDir });
+        const next = newId();
+        try {
+          if (olderStore !== null) assert.equal((await getJson(relay.base, `/api/push/active/${old}`)).status, 200, 'a record of the older relay is gone');
+          assert.equal((await getJson(relay.base, `/api/push/active/${added}`)).status, answered ? 200 : 404, answered ? 'an answered change is gone' : 'a change that was never answered is there');
+          assert.ok(!fs.readdirSync(dataDir).some((name) => name.includes('stale') || name.includes('corrupt')), 'a file was set aside');
+          assert.equal((await plain(relay, next, '/first-fold-next')).status, 200);
+        } finally {
+          await relay.stop('SIGKILL');
+        }
+        const again = await startRelay({ dataDir });
+        try {
+          assert.equal((await getJson(again.base, `/api/push/active/${next}`)).status, 200, 'the next change is gone after a restart');
+          if (olderStore !== null) assert.equal((await getJson(again.base, `/api/push/active/${old}`)).status, 200);
+        } finally {
+          await again.stop('SIGKILL');
+        }
+      }
+
+      it('keeps the store as it was when killed while the new snapshot is written', async () => {
+        await assertStore(() => ({ ...older(), [`${SNAPSHOT}.tmp`]: numbered.slice(0, Math.floor(numbered.length / 2)) }), false);
+      });
+
+      it('keeps the store as it was when killed after the new snapshot was written, before its rename', async () => {
+        await assertStore(() => ({ ...older(), [`${SNAPSHOT}.tmp`]: numbered }), false);
+      });
+
+      if (first !== 'an empty directory') {
+        it('keeps the store as it was when killed after the older snapshot became the previous version', async () => {
+          await assertStore(() => ({ ...previous(), [`${SNAPSHOT}.tmp`]: numbered }), false);
+        });
+      }
+
+      it('starts on the new snapshot when killed after its rename, before the journal began', async () => {
+        await assertStore(() => ({ ...previous(), [SNAPSHOT]: numbered }), false);
+      });
+
+      it('leaves out the change when killed in the middle of the journal\'s first line', async () => {
+        await assertStore(() => ({ ...previous(), [SNAPSHOT]: numbered, [JOURNAL]: journal.slice(0, 8) }), false);
+      });
+
+      it('leaves out the change when killed in the middle of its line', async () => {
+        await assertStore(() => ({ ...previous(), [SNAPSHOT]: numbered, [JOURNAL]: journal.slice(0, journal.length - 12) }), false);
+      });
+
+      it('keeps the change once its journal line is whole', async () => {
+        await assertStore(() => ({ ...previous(), [SNAPSHOT]: numbered, [JOURNAL]: journal }), true);
+      });
+    });
+  }
 });
 
 describe('a change the journal could not take', () => {

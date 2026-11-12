@@ -272,40 +272,34 @@ const JOURNAL = 'subscriptions.journal';
 /**
  * The records a relay keeps in this data directory, as it would load them: the
  * snapshot, then the journal's changes past the snapshot's number, when the
- * journal continues that snapshot (by its number, or for a snapshot without one
- * by a hash of its bytes).
+ * journal continues that snapshot. Only a snapshot with a number has a journal.
  */
 export function storedRecords(dataDir: string): Record<string, any> {
   const records: Record<string, any> = {};
-  let seq = 0;
-  let numbered = false;
-  let hash: string | null = null;
+  let seq: number | null = null;
   for (const name of [SNAPSHOT, `${SNAPSHOT}.bak`]) {
     const file = path.join(dataDir, name);
     if (!fs.existsSync(file)) continue;
-    const bytes = fs.readFileSync(file);
-    const snapshot = JSON.parse(bytes.toString('utf8'));
+    const snapshot = JSON.parse(fs.readFileSync(file, 'utf8'));
     Object.assign(records, snapshot.records);
-    numbered = Number.isSafeInteger(snapshot.seq);
-    seq = numbered ? snapshot.seq : 0;
-    hash = crypto.createHash('sha256').update(bytes).digest('hex');
+    seq = Number.isSafeInteger(snapshot.seq) ? snapshot.seq : null;
     break;
   }
   const journal = path.join(dataDir, JOURNAL);
   const lines = fs.existsSync(journal) ? fs.readFileSync(journal, 'utf8').split('\n') : [];
-  let header: { from: number; snapshot?: unknown } | null = null;
+  let from: number | null = null;
   const changes: Array<{ seq: number; id: string; record: unknown }> = [];
   for (const line of lines) {
     if (!line) continue;
     try {
       const entry = JSON.parse(line);
-      if (header === null && Number.isSafeInteger(entry.from)) header = entry;
+      if (from === null && Number.isSafeInteger(entry.from)) from = entry.from;
       else if (Number.isSafeInteger(entry.seq) && typeof entry.id === 'string') changes.push(entry);
     } catch {
       // A torn line.
     }
   }
-  if (header === null || !(numbered ? header.from <= seq : header.snapshot === hash)) return records;
+  if (from === null || seq === null || from > seq) return records;
   for (const change of changes) {
     if (change.seq <= seq) continue;
     if (change.record === null) delete records[change.id];
