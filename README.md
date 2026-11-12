@@ -320,10 +320,12 @@ the relay started; it is kept in memory only, never in the store, so after a
 restart a record counts for no address until its client registers again.
 
 How large the store can get: 50,000 records of the largest kind the relay takes
-(every field at its limit, a secret's hash included) are 192 MB on disk. The snapshot is read a line at a
-time, and a start that also folds a journal into it peaks at about 215 MB of heap
-and 340 MB resident (measured with Node 22 on Linux, `--max-old-space-size=256`,
-which gives V8 304 MB in all). Real records are a few hundred bytes, so a full
+(every field at its limit, a secret's hash included) are 192 MB on disk. The
+snapshot is read a line at a time, and a start that also folds a journal into it
+peaks at about 215 MB of heap and 340 MB resident (measured with Node 22 on Linux,
+`--max-old-space-size=256`, which gives V8 304 MB in all). That start is the peak:
+a fold while the relay runs writes the records it holds 500 at a time, so it needs
+little beyond them. Real records are a few hundred bytes, so a full
 store of real devices is a tenth of that. Give the container memory for the store
 and Node besides; a
 `subscriptions.json` written by an older relay is read whole once, which takes
@@ -385,6 +387,23 @@ server {
 
 The prefix also covers `DELETE /api/push/register/:id`, which a client sends once
 on logout.
+
+Two things about nginx's own limit. Its `429` carries none of the relay's CORS
+headers, so a browser sees a network error instead ("Could not reach the push
+relay" in the webmail), which the webmail retries the same way as a `429`, at the
+next page load. And a browser's preflight `OPTIONS` before a registration (when it
+has none cached) counts against the zone too, so the zone runs out up to twice as
+fast as the relay's own budget. nginx doesn't count a request whose key is empty,
+so to leave preflights out, key the zone on a map that is empty for `OPTIONS`:
+
+```nginx
+# http block, instead of the limit_req_zone above
+map $request_method $relay_register_key {
+    OPTIONS "";
+    default $binary_remote_addr;
+}
+limit_req_zone $relay_register_key zone=relay_register:10m rate=30r/m;
+```
 
 Keep the subscription ids and secrets out of the proxy's access log. nginx's
 default `combined` format writes the whole request line, and for `/api/push/` that
