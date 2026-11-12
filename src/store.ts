@@ -1,3 +1,4 @@
+import { createHash, type Hash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { readFile, open, mkdir, rename, unlink, chmod, readdir, stat, truncate } from 'node:fs/promises';
 import path from 'node:path';
@@ -55,6 +56,7 @@ function getPushDir(): string {
 // {"seq":<last change it holds>,"records":{...}}, one record per line, so that
 // a start reads it a line at a time. An older relay reads the records and ignores
 // the number; one it writes has none, which counts as 0, and is read whole.
+// Snapshots without a number are told apart by a hash of their bytes.
 function subscriptionsPath(): string {
   return path.join(getPushDir(), 'subscriptions.json');
 }
@@ -63,7 +65,8 @@ function previousVersionPath(): string {
   return `${subscriptionsPath()}.bak`;
 }
 
-// The changes since a snapshot: a first line {"from":<the snapshot's seq>}, then
+// The changes since a snapshot: a first line naming the snapshot they continue,
+// {"from":<its seq>,"snapshot":<a hash of its bytes, null without one>}, then
 // one line per change, {"seq":n,"id":..,"record":{..}}, or "record":null for a
 // delete, numbered on from there. Each line starts with its newline, so an
 // append cut short by a crash stays a line of its own, which the next load skips.
@@ -84,8 +87,11 @@ export function recordBytes(record: SubscriptionRecord): number {
 
 const isReadError = (error: unknown) => typeof (error as NodeJS.ErrnoException | null)?.code === 'string';
 
-/** The lines of a file, one at a time. A file that can't be read throws; a missing one says null. */
-async function fileLines(file: string): Promise<{ lines: AsyncIterable<string>; size: number; close(): void } | null> {
+/**
+ * The lines of a file, one at a time, and its bytes into `hash` as they are read.
+ * A file that can't be read throws; a missing one says null.
+ */
+async function fileLines(file: string, hash?: Hash): Promise<{ lines: AsyncIterable<string>; size: number; close(): void } | null> {
   let size: number;
   try {
     const info = await stat(file);
@@ -95,9 +101,17 @@ async function fileLines(file: string): Promise<{ lines: AsyncIterable<string>; 
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
   }
-  const input = createReadStream(file, 'utf-8');
+  // Bytes, which the line reader decodes as UTF-8.
+  const input = createReadStream(file);
   const lines = createInterface({ input, crlfDelay: Infinity });
+  if (hash) input.on('data', (chunk) => hash.update(chunk));
   return { lines, size, close: () => { lines.close(); input.destroy(); } };
+}
+
+/** A whole file as text, with a hash of its bytes. */
+async function wholeFile(file: string): Promise<{ text: string; hash: string }> {
+  const bytes = await readFile(file);
+  return { text: bytes.toString('utf-8'), hash: createHash('sha256').update(bytes).digest('hex') };
 }
 
 // After a rename or a new file the directory itself goes to disk too, or a power
@@ -117,7 +131,10 @@ interface SubscriptionsFile {
 
 interface Snapshot {
   records: Record<string, SubscriptionRecord>;
-  seq: number;
+  // The last change it holds; null for one an older relay wrote.
+  seq: number | null;
+  // Of the file's bytes.
+  hash: string;
 }
 
 export type PutResult =
@@ -137,8 +154,14 @@ class SubscriptionStore {
   // The number of the last change made. Every change up to it is on disk, in
   // the snapshot or in the journal.
   private seq = 0;
-  // What the snapshot on disk holds, up to which change.
+  // What the snapshot on disk holds, up to which change, and whether it says
+  // so: one an older relay wrote has no number.
   private snapshotSeq = 0;
+  private snapshotNumbered = false;
+  // A hash of the snapshot's bytes, null while there is none. A journal names it
+  // in its first line, so that a snapshot an older relay wrote since is told
+  // apart from the one the journal continues even where neither has a number.
+  private snapshotHash: string | null = null;
   private foldRetryAt = 0;
   private closed = false;
   // The client address each record was last registered from, while the relay
@@ -167,6 +190,8 @@ class SubscriptionStore {
       if (id !== '__proto__') this.records.set(id, record);
     }
     this.seq = this.snapshotSeq = snapshot?.seq ?? 0;
+    this.snapshotNumbered = snapshot != null && snapshot.seq !== null;
+    this.snapshotHash = snapshot?.hash ?? null;
     const journal = await this.readJournal();
     this.migrateLegacyRecords();
     this.evictExpired();
@@ -211,7 +236,8 @@ class SubscriptionStore {
   // more memory than the records themselves. Null for a file in another form
   // (an older relay's), which readSnapshotWhole reads.
   private async readSnapshotLines(file: string): Promise<Snapshot | null | undefined> {
-    const reader = await fileLines(file);
+    const hash = createHash('sha256');
+    const reader = await fileLines(file, hash);
     if (!reader) return undefined;
     const records: Record<string, SubscriptionRecord> = Object.create(null);
     let seq: number | null = null;
@@ -236,23 +262,23 @@ class SubscriptionStore {
     }
     if (seq === null) return null;
     if (!ended) throw new SyntaxError('the records end early');
-    return { records, seq };
+    return { records, seq, hash: hash.digest('hex') };
   }
 
   // A snapshot in any other form, read whole: what an older relay wrote.
   private async readSnapshotWhole(file: string): Promise<Snapshot | null> {
-    let raw: string;
+    let raw: { text: string; hash: string };
     try {
-      raw = await readFile(file, 'utf-8');
+      raw = await wholeFile(file);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
       throw error;
     }
-    const parsed = JSON.parse(raw) as SubscriptionsFile;
+    const parsed = JSON.parse(raw.text) as SubscriptionsFile;
     if (!parsed || typeof parsed.records !== 'object' || parsed.records === null) {
       throw new SyntaxError('no records in the file');
     }
-    return { records: parsed.records, seq: isSeq(parsed.seq) ? parsed.seq : 0 };
+    return { records: parsed.records, seq: isSeq(parsed.seq) ? parsed.seq : null, hash: raw.hash };
   }
 
   // Creates the data directory for the relay's user alone, and narrows the
@@ -284,9 +310,9 @@ class SubscriptionStore {
    * Applies the changes since the snapshot. Says whether there was a journal to
    * fold. Changes the snapshot already holds are skipped, so a crash between a
    * snapshot's rename and the journal's removal applies nothing twice. A journal
-   * started on a later snapshot than the one loaded (an older relay wrote the
-   * snapshot since, or only the previous version could be read) is set aside
-   * unread: its changes don't follow from what is in memory.
+   * that doesn't continue the snapshot loaded (an older relay wrote the snapshot
+   * since, or only the previous version could be read) is set aside unread: its
+   * changes don't follow from what is in memory. See continues().
    */
   private async readJournal(): Promise<boolean> {
     let reader: Awaited<ReturnType<typeof fileLines>>;
@@ -301,12 +327,12 @@ class SubscriptionStore {
         // A line at a time: the journal can be as large as the snapshot.
         for await (const line of reader.lines) {
           if (!line) continue;
-          let entry: { from?: unknown; seq?: unknown; id?: unknown; record?: unknown };
+          let entry: { from?: unknown; snapshot?: unknown; seq?: unknown; id?: unknown; record?: unknown };
           try {
             entry = JSON.parse(line);
             if (from === null && isSeq(entry.from)) {
               from = entry.from;
-              if (from > this.snapshotSeq) {
+              if (!this.continues(from, entry.snapshot)) {
                 stale = true;
                 break;
               }
@@ -356,6 +382,18 @@ class SubscriptionStore {
     }
     this.journalBytes = reader.size;
     return true;
+  }
+
+  /**
+   * Whether a journal that began on snapshot `from`, with this hash, continues
+   * the snapshot loaded. A snapshot this relay wrote has a number, which an older
+   * relay's rewrite drops: the journal continues it when it began on it or on an
+   * earlier one (a crash before the journal's removal leaves it next to the
+   * snapshot it was folded into). A snapshot without a number, an older relay's
+   * or none at all, is continued only by a journal that began on that very file.
+   */
+  private continues(from: number, snapshot: unknown): boolean {
+    return this.snapshotNumbered ? from <= this.snapshotSeq : snapshot === this.snapshotHash;
   }
 
   async ensureLoaded(): Promise<void> {
@@ -604,7 +642,7 @@ class SubscriptionStore {
     if (this.closed) throw new Error('the store is closed');
     if (record && recordBytes(record) > MAX_RECORD_BYTES) throw new Error('the record is larger than a record may be');
     const seq = this.seq + 1;
-    const header = this.journalBytes === 0 ? `\n${JSON.stringify({ from: this.snapshotSeq })}` : '';
+    const header = this.journalBytes === 0 ? `\n${JSON.stringify({ from: this.snapshotSeq, snapshot: this.snapshotHash })}` : '';
     const line = `${header}\n${JSON.stringify({ seq, id, record })}`;
     try {
       await mkdir(getPushDir(), { recursive: true, mode: PRIVATE_DIR });
@@ -647,6 +685,7 @@ class SubscriptionStore {
     const target = subscriptionsPath();
     const tmp = `${target}.tmp`;
     let bytes = 0;
+    const hash = createHash('sha256');
     try {
       await mkdir(getPushDir(), { recursive: true, mode: PRIVATE_DIR });
       // On disk before the rename: a power cut must not leave a renamed, empty file.
@@ -663,12 +702,14 @@ class SubscriptionStore {
           if (count % SNAPSHOT_BATCH === 0) {
             await handle.writeFile(chunk, 'utf-8');
             bytes += Buffer.byteLength(chunk);
+            hash.update(chunk);
             chunk = '';
           }
         }
         chunk += '\n}}';
         await handle.writeFile(chunk, 'utf-8');
         bytes += Buffer.byteLength(chunk);
+        hash.update(chunk);
         await handle.sync();
       } finally {
         await handle.close();
@@ -681,6 +722,8 @@ class SubscriptionStore {
       await rename(tmp, target);
       await syncDirectory();
       this.snapshotSeq = this.seq;
+      this.snapshotNumbered = true;
+      this.snapshotHash = hash.digest('hex');
       this.snapshotBytes = bytes;
       // A crash before this leaves a journal whose changes the snapshot holds
       // already: load skips them by their numbers.

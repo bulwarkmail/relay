@@ -138,10 +138,11 @@ stops, the journal is folded into a new snapshot that records the number of the
 last change it holds. That one is written atomically, with the previous version
 kept as `subscriptions.json.bak`. A crash at any point of a fold loses no change
 that was answered: a start replays the journal's changes past the snapshot's
-number, and a journal that doesn't continue the snapshot (one left from before an
-older relay wrote `subscriptions.json`) is kept as
-`subscriptions.journal.stale-<time>` with a warning, not replayed. A change that
-can't be written is answered `500`, is not kept, and counts in
+number. The journal's first line names the snapshot it continues, by its number
+and a hash of its bytes, so a journal that doesn't continue the snapshot (one left
+from before an older relay wrote `subscriptions.json`, which then has no number)
+is kept as `subscriptions.journal.stale-<time>` with a warning, not replayed. A
+change that can't be written is answered `500`, is not kept, and counts in
 `relay_store_write_failures_total`; a snapshot that can't be written is tried again
 a minute later, while the journal keeps taking changes. A snapshot that isn't valid is kept as
 `subscriptions.json.corrupt-<time>` and logged as an error, and the relay starts
@@ -288,9 +289,14 @@ the journal into `subscriptions.json` and removes it. The compose file gives it 
 seconds for that. Then check that `data/subscriptions.journal` is gone before you
 start the older image. If it is still there (the stop was cut short, or the log
 says "stopped with changes left in subscriptions.journal"), start this version
-again and stop it again. Coming back to this version later is safe either way: a
-journal from before the older relay ran is set aside, not replayed over what the
-older relay wrote.
+again and stop it again. Coming back to this version later is safe either way,
+also when the stop was cut short before this version ever folded its journal: a
+journal is replayed only over the snapshot it began on, so once the older relay
+has written `subscriptions.json` the journal is set aside as
+`subscriptions.journal.stale-<time>` and what the older relay wrote stands. The
+changes in that journal, which the older relay never saw, are not applied; those
+devices get their records back when their clients register again. If the older
+relay changed nothing, the journal is replayed as after any unclean stop.
 
 ## Environment
 

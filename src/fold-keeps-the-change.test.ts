@@ -18,6 +18,7 @@ import {
   newId,
   postJson,
   pushVerification,
+  seedStore,
   startFakePushService,
   startRelay,
   stateChange,
@@ -264,6 +265,149 @@ describe('a fold cut short by a crash', () => {
       assert.equal(relay.logs().split('does not continue the snapshot').length - 1, 1);
     } finally {
       await relay.stop('SIGKILL');
+    }
+  });
+});
+
+// What the relay before the journal does on a directory: it reads subscriptions.json only and
+// rewrites it whole, without a number. Written here by hand, since that relay is not in this tree.
+function olderRelayWrites(dataDir: string, records: Record<string, unknown>): void {
+  fs.writeFileSync(path.join(dataDir, SNAPSHOT), JSON.stringify({ records }, null, 2));
+}
+
+describe('going back to an older relay during this relay\'s first run on a directory', () => {
+  // The first journal a relay writes on a store that has no number yet (an older relay's, or
+  // none) continues "snapshot 0", and a snapshot the older relay writes afterwards has no number
+  // either. The journal's first line also names a hash of the snapshot it began on, so it is
+  // not replayed over another one.
+  for (const first of ['an empty directory', 'a store the older relay wrote']) {
+    it(`does not replay the journal of that first run over what the older relay wrote since (${first})`, async () => {
+      const moved = newId();
+      const deleted = newId();
+      const old = newId();
+      const now = Date.now();
+      const record = (pathname: string) => ({ kind: 'up', endpoint: service.url(pathname), keys: null, verificationCode: null, createdAt: now, lastPushAt: now, lastRegisteredAt: now });
+      const dataDir = first === 'an empty directory' ? fs.mkdtempSync(path.join(os.tmpdir(), 'relay-first-run-')) : seedStore({ [old]: record('/first-old') });
+      // This relay's first run: two devices register, then the process is killed. Nothing was folded.
+      const relay = await startRelay({ dataDir });
+      assert.equal((await plain(relay, moved, '/first-endpoint')).status, 200);
+      assert.equal((await plain(relay, deleted, '/first-deleted')).status, 200);
+      await relay.stop('SIGKILL');
+      assert.ok(fs.existsSync(path.join(dataDir, 'subscriptions.journal')), 'the first run left no journal');
+      // Back on the older relay: it never read the journal. The device registers there with a
+      // new endpoint; the other one is not known to it, which is how its user left it.
+      olderRelayWrites(dataDir, { ...(first === 'an empty directory' ? {} : { [old]: record('/first-old') }), [moved]: record('/second-endpoint') });
+      // Up again to this relay, the journal of the first run still there.
+      const again = await startRelay({ dataDir });
+      try {
+        const atSecond = service.to('/second-endpoint').length;
+        const atFirst = service.to('/first-endpoint').length;
+        assert.equal((await postJson(again.base, `/api/push/jmap/${moved}`, stateChange({ a: { EmailDelivery: 's1' } }))).status, 200);
+        assert.equal(service.to('/first-endpoint').length, atFirst, 'the device was moved back to the endpoint it had left');
+        assert.equal(service.to('/second-endpoint').length, atSecond + 1);
+        assert.equal((await getJson(again.base, `/api/push/active/${deleted}`)).status, 404, 'a record the older relay did not have is back');
+        assert.equal(fs.readdirSync(dataDir).filter((name) => name.startsWith('subscriptions.journal.stale-')).length, 1, 'the journal was not set aside');
+      } finally {
+        await again.stop('SIGKILL');
+      }
+    });
+
+    it(`sets the journal aside as well once this relay has folded on that directory (${first})`, async () => {
+      const moved = newId();
+      const deleted = newId();
+      const old = newId();
+      const now = Date.now();
+      const record = (pathname: string) => ({ kind: 'up', endpoint: service.url(pathname), keys: null, verificationCode: null, createdAt: now, lastPushAt: now, lastRegisteredAt: now });
+      const dataDir = first === 'an empty directory' ? fs.mkdtempSync(path.join(os.tmpdir(), 'relay-first-run-')) : seedStore({ [old]: record('/folded-old') });
+      let relay = await startRelay({ dataDir });
+      assert.equal((await plain(relay, moved, '/folded-first')).status, 200);
+      await relay.stop('SIGKILL');
+      // A start that finds a journal folds it into a snapshot of this relay's own.
+      relay = await startRelay({ dataDir });
+      assert.ok(!fs.existsSync(path.join(dataDir, JOURNAL)), 'the start did not fold the journal');
+      assert.equal((await plain(relay, moved, '/folded-endpoint')).status, 200);
+      assert.equal((await plain(relay, deleted, '/folded-deleted')).status, 200);
+      await relay.stop('SIGKILL');
+      assert.ok(fs.existsSync(path.join(dataDir, JOURNAL)), 'the second run left no journal');
+      olderRelayWrites(dataDir, { ...(first === 'an empty directory' ? {} : { [old]: record('/folded-old') }), [moved]: record('/folded-second') });
+      const again = await startRelay({ dataDir });
+      try {
+        const atSecond = service.to('/folded-second').length;
+        const atEndpoint = service.to('/folded-endpoint').length;
+        assert.equal((await postJson(again.base, `/api/push/jmap/${moved}`, stateChange({ a: { EmailDelivery: 's1' } }))).status, 200);
+        assert.equal(service.to('/folded-endpoint').length, atEndpoint, 'the device was moved back to the endpoint it had left');
+        assert.equal(service.to('/folded-second').length, atSecond + 1);
+        assert.equal((await getJson(again.base, `/api/push/active/${deleted}`)).status, 404, 'a record the older relay did not have is back');
+        if (first !== 'an empty directory') assert.equal((await getJson(again.base, `/api/push/active/${old}`)).status, 200);
+        assert.equal(fs.readdirSync(dataDir).filter((name) => name.startsWith(`${JOURNAL}.stale-`)).length, 1, 'the journal was not set aside');
+      } finally {
+        await again.stop('SIGKILL');
+      }
+    });
+
+    it(`replays the journal of a first run after an unclean stop when no other relay wrote the snapshot (${first})`, async () => {
+      const old = newId();
+      const now = Date.now();
+      const dataDir = first === 'an empty directory'
+        ? fs.mkdtempSync(path.join(os.tmpdir(), 'relay-first-run-'))
+        : seedStore({ [old]: { kind: 'up', endpoint: service.url('/replay-old'), keys: null, verificationCode: null, createdAt: now, lastPushAt: now, lastRegisteredAt: now } });
+      const relay = await startRelay({ dataDir });
+      const ids = Array.from({ length: 200 }, () => newId());
+      // Eight at a time, as page loads come in.
+      for (let i = 0; i < ids.length; i += 8) {
+        const statuses = await Promise.all(ids.slice(i, i + 8).map(async (id) => (await plain(relay, id, `/replay-${id}`)).status));
+        assert.deepEqual(statuses, Array(statuses.length).fill(200));
+      }
+      // One device moves on, one leaves.
+      assert.equal((await plain(relay, ids[0], '/replay-moved')).status, 200);
+      assert.equal((await getJson(relay.base, `/api/push/register/${ids[1]}`, 'DELETE')).status, 200);
+      await relay.stop('SIGKILL');
+      const again = await startRelay({ dataDir });
+      try {
+        const records = storedRecords(dataDir);
+        const missing = ids.slice(2).filter((id) => !records[id]);
+        assert.deepEqual(missing, [], `${missing.length} answered registrations were gone after the restart`);
+        assert.equal(records[ids[0]]?.endpoint, service.url('/replay-moved'), 'the device is not at its new endpoint');
+        assert.equal(records[ids[1]], undefined, 'a deleted record is back');
+        if (first !== 'an empty directory') assert.ok(records[old], 'the older relay\'s record is gone');
+        assert.equal((await getJson(again.base, `/api/push/active/${ids[2]}`)).status, 200);
+        assert.equal((await getJson(again.base, `/api/push/active/${ids[1]}`)).status, 404);
+        assert.ok(!fs.readdirSync(dataDir).some((name) => name.includes('stale')), 'a journal of this snapshot was set aside');
+      } finally {
+        await again.stop('SIGKILL');
+      }
+    });
+  }
+
+  it('keeps every change it answered across a fold and a kill, on the journals before and after the fold', async () => {
+    // Endpoints long enough that the journal passes the size at which it is folded on the
+    // way, sixteen registrations at a time; then a kill with more of them in flight.
+    const relay = await startRelay();
+    const ids = Array.from({ length: 900 }, () => newId());
+    const answered: string[] = [];
+    let next = 0;
+    let killed: Promise<unknown> | null = null;
+    const worker = async () => {
+      while (next < ids.length && !killed) {
+        const id = ids[next++];
+        const res = await register(relay, id, `/across-${id}/${'x'.repeat(1400)}`).catch(() => null);
+        if (res?.status === 200) answered.push(id);
+        if (answered.length >= 800 && !killed) killed = relay.stop('SIGKILL');
+      }
+    };
+    await Promise.all(Array.from({ length: 16 }, worker));
+    await killed;
+    assert.ok(answered.length >= 800, `${answered.length} answered`);
+    assert.ok(fs.existsSync(path.join(relay.dataDir, SNAPSHOT)), 'the journal was never folded on the way');
+    const again = await startRelay({ dataDir: relay.dataDir });
+    try {
+      const records = storedRecords(relay.dataDir);
+      const missing = answered.filter((id) => !records[id]);
+      assert.deepEqual(missing, [], `${missing.length} of ${answered.length} answered registrations were gone after the restart`);
+      assert.equal((await getJson(again.base, `/api/push/active/${answered.at(-1)}`)).status, 200);
+      assert.ok(!fs.readdirSync(relay.dataDir).some((name) => name.includes('stale')), 'a journal of this snapshot was set aside');
+    } finally {
+      await again.stop('SIGKILL');
     }
   });
 });

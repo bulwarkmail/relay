@@ -272,34 +272,40 @@ const JOURNAL = 'subscriptions.journal';
 /**
  * The records a relay keeps in this data directory, as it would load them: the
  * snapshot, then the journal's changes past the snapshot's number, when the
- * journal continues that snapshot.
+ * journal continues that snapshot (by its number, or for a snapshot without one
+ * by a hash of its bytes).
  */
 export function storedRecords(dataDir: string): Record<string, any> {
   const records: Record<string, any> = {};
   let seq = 0;
+  let numbered = false;
+  let hash: string | null = null;
   for (const name of [SNAPSHOT, `${SNAPSHOT}.bak`]) {
     const file = path.join(dataDir, name);
     if (!fs.existsSync(file)) continue;
-    const snapshot = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const bytes = fs.readFileSync(file);
+    const snapshot = JSON.parse(bytes.toString('utf8'));
     Object.assign(records, snapshot.records);
-    seq = Number.isSafeInteger(snapshot.seq) ? snapshot.seq : 0;
+    numbered = Number.isSafeInteger(snapshot.seq);
+    seq = numbered ? snapshot.seq : 0;
+    hash = crypto.createHash('sha256').update(bytes).digest('hex');
     break;
   }
   const journal = path.join(dataDir, JOURNAL);
   const lines = fs.existsSync(journal) ? fs.readFileSync(journal, 'utf8').split('\n') : [];
-  let from: number | null = null;
+  let header: { from: number; snapshot?: unknown } | null = null;
   const changes: Array<{ seq: number; id: string; record: unknown }> = [];
   for (const line of lines) {
     if (!line) continue;
     try {
       const entry = JSON.parse(line);
-      if (from === null && Number.isSafeInteger(entry.from)) from = entry.from;
+      if (header === null && Number.isSafeInteger(entry.from)) header = entry;
       else if (Number.isSafeInteger(entry.seq) && typeof entry.id === 'string') changes.push(entry);
     } catch {
       // A torn line.
     }
   }
-  if (from === null || from > seq) return records;
+  if (header === null || !(numbered ? header.from <= seq : header.snapshot === hash)) return records;
   for (const change of changes) {
     if (change.seq <= seq) continue;
     if (change.record === null) delete records[change.id];
