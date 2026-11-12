@@ -72,14 +72,35 @@ A client can bind its record to a secret instead:
   `DELETE /api/push/register/:id` and `GET /api/push/verify/:id` need
   `Authorization: Bearer <secret>` and answer `403` without it (a refused poll
   doesn't count as the code being collected). `POST /api/push/jmap/:id` needs the
-  secret in the query, `?k=<secret>`, since a URL is all the mail server has: the
-  client hands it `.../api/push/jmap/<id>?k=<secret>` as the PushSubscription's
-  `url`, which JMAP never shows to other clients. Without it the relay answers
-  `403`, forwards nothing and stores no code. `k` given twice counts as missing;
-  percent-encoding is decoded first. Each route looks in its one place only: the
-  secret in the query of a DELETE, or in a header on the push URL, counts as
-  missing. `GET /api/push/active/:id` stays open, because other devices of the
-  account ask it about ids that aren't theirs, and it only says yes or no.
+  record's push key in the query, `?k=<push key>` (below), and answers `403`
+  without it, forwards nothing and stores no code. `k` given twice counts as
+  missing; percent-encoding is decoded first. Each route looks in its one place
+  only: the secret on the push URL, the push key in a header or in a
+  registration, and the secret in the query of a DELETE all count as missing.
+  `GET /api/push/active/:id` stays open, because other devices of the account ask
+  it about ids that aren't theirs, and it only says yes or no.
+- **Push key.** The mail server only has a URL, and it keeps that URL, so the URL
+  doesn't carry the secret. It carries a push key the client derives from the
+  secret, and the key lets its holder push and post a verification code, nothing
+  else. The rule is fixed: the push key is SHA-256 over the ASCII bytes
+  `bulwark-relay-push-key-v1:` followed by the secret's, written in base64url
+  without padding, 43 characters. The client hands the mail server
+  `.../api/push/jmap/<id>?k=<push key>` as the PushSubscription's `url`. The relay
+  derives the same key from the secret at registration. Two values to check a
+  client against:
+
+  | Secret | Push key |
+  | --- | --- |
+  | `AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8` (bytes 0 to 31) | `j5u1SE4uZtEqYP6s1cBnuAyp6AeXXZzlUO2d2N1yHX4` |
+  | `-_` 64 times | `NYzeMuKHzCMv54rOjyAWixIcpOUb6s7Otgp4-ONFwk8` |
+
+  Where the push URL ends up: Stalwart doesn't return a PushSubscription's `url`
+  to clients, but writes it, query and all, into its own log with every push
+  event (`push-subscription.success` and `.error`). A proxy's access log holds it
+  unless its format leaves out path and query (see
+  [Behind a reverse proxy](#behind-a-reverse-proxy)). The legacy-proxy returns it
+  to every other client of the same user, until it stops doing so. Whoever reads
+  it can push to the record and post a verification code, and nothing more.
 - **`409`.** A registration that brings a `secret` for an id that exists without
   one, or for an id shorter than 40 characters, answers `409` and changes nothing.
   A client that wants a secret registers a new id with it. A record is never given
@@ -89,9 +110,9 @@ A client can bind its record to a secret instead:
 - **Freed.** When a record with a secret is deleted or expires, its id is free
   again, and the next registration decides, with or without a secret.
 
-The relay stores a SHA-256 of the secret, never the secret, and compares in
-constant time. It doesn't log a query string, and neither the secret nor its hash
-goes into the logs or into a metric.
+The relay stores a SHA-256 of the secret and one of the push key, never either
+value, and compares in constant time. It doesn't log a query string, and neither
+the secret, the push key nor their hashes go into the logs or into a metric.
 
 Old and new together: a new client works with an older relay, which ignores the
 unknown `secret` field, the header and the query, so its record just has no
@@ -207,7 +228,7 @@ Per `subscriptionId`: an FCM token (Android app), an APNs device token (iOS
 app), a Web Push subscription (`endpoint` + `p256dh`/`auth` keys for the PWA), or
 a UnifiedPush endpoint (Android app without Google Play services), the
 verification code, an optional free-form `accountLabel` (max 120 chars), the
-SHA-256 of the record's secret if it has one, and timestamps. No server URL, no
+SHA-256 of the record's secret and of its push key if it has one, and timestamps. No server URL, no
 mail content.
 
 Nothing else a client sends is kept. The endpoint is stored as the URL parser
@@ -267,19 +288,33 @@ mount) stops the relay at startup with an error, so it can't overwrite the store
 A relay that starts on the `subscriptions.json` of an older relay takes every
 record from it.
 
-One data directory takes one relay. A relay writes its process number and host
-name into `subscriptions.lock` before it reads the store, and removes the file
-when it stops cleanly. A second relay that finds the lock of one that still runs
-doesn't start, and logs an error with that relay's process number, host and start
-time. A lock whose relay no longer runs (it was killed, or the machine restarted)
-is taken over, with a warning. The relay tells by the process number on the same
-host, on Linux also by that process's start time, so a number handed to another
-process since doesn't count. In a container the relay gets the same number at
-every start, so a lock with its own number is an earlier run's. A lock written on
-another host can't be checked and counts as held. The compose file gives the
-container a fixed host name for that reason, so a container created anew takes
-over its predecessor's lock; with `docker run`, pass `--hostname`. Remove the file
-by hand only when no relay runs on the directory.
+One data directory takes one relay. Before it reads the store, a relay writes a
+token of its own into `subscriptions.lock`, then refreshes the file's modification
+time every fifth of `PUSH_LOCK_STALE_MS` (every 2 seconds by default), and removes
+it when it stops cleanly. A start that finds a lock refreshed within
+`PUSH_LOCK_STALE_MS` (10 seconds by default) doesn't start: it exits with an error
+that says how many seconds ago the lock was refreshed, and by which process and
+host. A lock that wasn't refreshed for longer is taken over, with a warning: its
+relay was killed, crashed or lost its machine. Of two relays that start at the same
+moment, one runs. A relay checks its token before every write and at every
+refresh; when another token is there, because another relay took the lock over,
+it writes nothing more and exits with an error. This works the same in containers
+and under orchestrators that give each instance a new host name (Kubernetes,
+Swarm), and on a directory several machines share, as long as their clocks agree
+within a few seconds.
+
+What that means after a crash: a relay restarted on the same directory waits until
+the lock is stale. Docker's restart policy tries again after 0.1, 0.2, 0.4, ... seconds,
+so with the default the relay is back after about 10 to 15 seconds; Kubernetes
+retries after 10 seconds. Update strategies that start the new instance before
+the old one stops (a Kubernetes `RollingUpdate`, Swarm's `start-first`) keep the new
+one out until the old one is gone; use `Recreate` or `stop-first`. A clean stop
+removes the lock at once. A relay that is paused (a suspended machine, a stopped
+process, a stall) for less than `PUSH_LOCK_STALE_MS` carries on as before. Paused
+longer, it carries on too if no other relay started meanwhile; if one did and took
+the lock over, the paused relay stops at its next write or refresh, without
+writing. Set the same `PUSH_LOCK_STALE_MS` for every relay that may use the
+directory: a start judges a lock by its own setting.
 
 Only the relay's user may read the store: the data directory is
 mode 700 and the store's files 600, and a start narrows what it finds wider (the
@@ -324,7 +359,7 @@ the relay started; it is kept in memory only, never in the store, so after a
 restart a record counts for no address until its client registers again.
 
 How large the store can get: 50,000 records of the largest kind the relay takes
-(every field at its limit, a secret's hash included) are 192 MB on disk. The
+(every field at its limit, the two hashes included) are 195 MB on disk. The
 snapshot is read a line at a time, and a start that also folds a journal into it
 peaks at about 215 MB of heap and 340 MB resident (measured with Node 22 on Linux,
 `--max-old-space-size=256`, which gives V8 304 MB in all). That start is the peak:
@@ -337,7 +372,10 @@ about four times its size.
 
 Which address a registration counts for:
 
-- With `TRUST_PROXY=0` the client address is the socket's.
+- With `TRUST_PROXY=0` the client address is the socket's. Without a proxy in
+  front, the relay sees IPv6 clients only when it listens on an IPv6 address
+  (`HOST`; the default `0.0.0.0` takes IPv4 only), and they count by their /56
+  there too.
 - With `TRUST_PROXY=1` it is the last entry of `X-Forwarded-For`, the one the proxy
   appended; whatever the client wrote in front of it is ignored. With `2` it is the
   second from the end, and so on. A request without the header counts by its socket.
@@ -489,6 +527,12 @@ devices get their records back when their clients register again. If the older
 relay changed nothing, `subscriptions.json` is still this version's and the
 journal is replayed as after any unclean stop.
 
+A relay from before record ownership (see [Record ownership](#record-ownership))
+keeps a record's secret while it doesn't touch the record, but writes the record
+without it at that client's next registration. Back on this version, such a
+record has no secret any more, and its client's next registration with the secret
+answers `409`; the client then registers a new id, as for any `409`.
+
 ## Environment
 
 | Var | Default | Notes |
@@ -512,6 +556,7 @@ journal is replayed as after any unclean stop.
 | `PUSH_MAX_SUBSCRIPTIONS_PER_ADDRESS` | `1000` | Records one client address may hold; a new device past it gets `507`. Off where addresses can't be told apart |
 | `PUSH_REGISTER_BURST` | `60` | Registrations one client address may make at once; past it `429` with `Retry-After` |
 | `PUSH_REGISTER_REFILL_MS` | `2000` | Time until that address may make one more |
+| `PUSH_LOCK_STALE_MS` | `10000` | How long the data directory's lock may go without a refresh before a start takes it over (at least 1000); the holder refreshes it every fifth of this. See [What it stores](#what-it-stores) |
 | `TRUST_PROXY` | `0` | Proxies in front of the relay. With `1` the client address is the last entry of `X-Forwarded-For` |
 | `METRICS_TOKEN` | unset | Turns on `/metrics`. Prometheus sends it as a bearer token (`authorization: { credentials: <token> }` in the scrape config) |
 | `METRICS_TOKEN_FILE` | unset | Path to a file holding the token instead, read on every scrape |

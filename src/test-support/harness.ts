@@ -158,11 +158,18 @@ export function makeDevice(): FakeDevice {
 export interface RunningRelay {
   base: string;
   port: number;
+  /** The relay's process. */
+  pid: number;
   dataDir: string;
   logs(): string;
   exited(): boolean;
   exitCode(): number | null;
-  stop(signal?: NodeJS.Signals): Promise<number | null>;
+  /**
+   * Ends the relay. A relay that didn't stop cleanly (a kill, and every stop on
+   * Windows) leaves its lock, which keeps the next relay on the directory out until
+   * it goes stale; the harness removes it, unless `keepLock` asks it not to.
+   */
+  stop(signal?: NodeJS.Signals, options?: { keepLock?: boolean }): Promise<number | null>;
   /** Another relay process over the same data directory. */
   restart(): Promise<RunningRelay>;
 }
@@ -235,13 +242,16 @@ export async function startRelay(options: { env?: Record<string, string>; dataDi
   const relay: RunningRelay = {
     base,
     port,
+    pid: child.pid!,
     dataDir,
     logs: () => output,
     exited: () => hasExited,
     exitCode: () => exitCode,
-    stop: async (signal = 'SIGTERM') => {
+    stop: async (signal = 'SIGTERM', stopOptions = {}) => {
       if (!hasExited) child.kill(signal);
-      return exit;
+      const code = await exit;
+      if (!stopOptions.keepLock) removeLockOf(dataDir, child.pid!);
+      return code;
     },
     restart: async () => {
       await relay.stop();
@@ -268,6 +278,17 @@ export function newId(): string {
 // Where the store keeps its files. Tests go through the helpers below instead.
 const SNAPSHOT = 'subscriptions.json';
 const JOURNAL = 'subscriptions.journal';
+const LOCK = 'subscriptions.lock';
+
+/** Removes the data directory's lock if the process `pid`, which has ended, wrote it. */
+function removeLockOf(dataDir: string, pid: number): void {
+  const file = path.join(dataDir, LOCK);
+  try {
+    if (JSON.parse(fs.readFileSync(file, 'utf8')).pid === pid) fs.rmSync(file);
+  } catch {
+    // No lock, or another one.
+  }
+}
 
 /**
  * The records a relay keeps in this data directory, as it would load them: the

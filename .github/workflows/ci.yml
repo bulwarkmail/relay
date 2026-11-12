@@ -30,7 +30,9 @@ jobs:
           cache: npm
 
       - name: Every action pinned to a commit
-        run: node scripts/check-action-pins.mjs
+        run: |
+          node scripts/check-action-pins.mjs --self-test
+          node scripts/check-action-pins.mjs
 
       - name: Install dependencies
         run: npm ci --no-audit --no-fund

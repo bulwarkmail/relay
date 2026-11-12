@@ -24,6 +24,9 @@ interface BaseSubscriptionRecord {
   // its client sent one. Bound when the id is first registered; from then on
   // the id alone neither replaces, deletes, polls nor pushes through it.
   secretHash?: string;
+  // The SHA-256 (base64url) of the push key that belongs to that secret (see
+  // pushKeyOf in validation.ts): the only thing the push URL may carry.
+  pushKeyHash?: string;
 }
 
 export interface FcmSubscriptionRecord extends BaseSubscriptionRecord {
