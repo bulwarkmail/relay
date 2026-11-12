@@ -254,7 +254,11 @@ a minute later, while the journal keeps taking changes. The first one, on a stor
 without a number, comes before any journal: until it is written every change is
 answered `500`, and it too is tried at most once a minute. A snapshot that isn't
 valid is kept as `subscriptions.json.corrupt-<time>` and logged as an error, and the relay starts
-from the previous version. A file that can't be read at all (permissions, a bad
+from the previous version. The journal is replayed onto that version only when it
+continues it; a journal that continues the snapshot that isn't valid is set aside
+as above, so every change since the previous version was written is lost, and
+those records stay as the previous version has them until their clients register
+again. A file that can't be read at all (permissions, a bad
 mount) stops the relay at startup with an error, so it can't overwrite the store.
 A relay that starts on the `subscriptions.json` of an older relay takes every
 record from it.
