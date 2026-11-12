@@ -256,7 +256,23 @@ valid is kept as `subscriptions.json.corrupt-<time>` and logged as an error, and
 from the previous version. A file that can't be read at all (permissions, a bad
 mount) stops the relay at startup with an error, so it can't overwrite the store.
 A relay that starts on the `subscriptions.json` of an older relay takes every
-record from it. Only the relay's user may read the store: the data directory is
+record from it.
+
+One data directory takes one relay. A relay writes its process number and host
+name into `subscriptions.lock` before it reads the store, and removes the file
+when it stops cleanly. A second relay that finds the lock of one that still runs
+doesn't start, and logs an error with that relay's process number, host and start
+time. A lock whose relay no longer runs (it was killed, or the machine restarted)
+is taken over, with a warning. The relay tells by the process number on the same
+host, on Linux also by that process's start time, so a number handed to another
+process since doesn't count. In a container the relay gets the same number at
+every start, so a lock with its own number is an earlier run's. A lock written on
+another host can't be checked and counts as held. The compose file gives the
+container a fixed host name for that reason, so a container created anew takes
+over its predecessor's lock; with `docker run`, pass `--hostname`. Remove the file
+by hand only when no relay runs on the directory.
+
+Only the relay's user may read the store: the data directory is
 mode 700 and the store's files 600, and a start narrows what it finds wider (the
 directory with a warning in the log). The FCM and APNs key files are yours to keep
 at 600.
