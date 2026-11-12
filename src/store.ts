@@ -19,10 +19,12 @@ const UNUSED_TTL_MS = 7 * DAY_MS;
 // Expired records leave memory and the disk this often, not only at a start.
 const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 // When the store is full a new device takes the place of a record that never
-// delivered a push (the one registered longest ago first), then of the record
-// whose last push is the oldest. Never of one registered in the last 10 minutes,
-// which may be a device in the middle of its setup, and never of one that
-// delivered a push in the last 30 days.
+// delivered a push: first of one whose verification code no client collected,
+// then of one whose code was collected, the one registered longest ago first in
+// each; then of the record whose last push is the oldest. Never of one
+// registered in the last 10 minutes, which may be a device in the middle of its
+// setup, and of no record with a collected code while one without is in those
+// minutes; never of one that delivered a push in the last 30 days.
 const SETUP_GRACE_MS = 10 * 60 * 1000;
 const RECENTLY_WORKED_MS = 30 * DAY_MS;
 
@@ -171,9 +173,12 @@ class SubscriptionStore {
   // Records per client address, from `origins`.
   private perAddress = new Map<string, number>();
   // Who gives way first when the store is full. Records that never delivered a
-  // push, in the order they were last registered, and records that did, in the
-  // order of their last push. Maps keep the order they were set in.
-  private neverDelivered = new Map<string, true>();
+  // push, without a collected verification code and with one, each in the order
+  // they were last registered (or had their code collected), and records that
+  // did deliver, in the order of their last push. Maps keep the order they were
+  // set in.
+  private unconfirmed = new Map<string, true>();
+  private confirmed = new Map<string, true>();
   private delivered = new Map<string, true>();
 
   /** Once, whoever asks. Rejects when a store exists that can't be read: see readSnapshot. */
@@ -419,8 +424,9 @@ class SubscriptionStore {
    * An id that is there can always be replaced. A new id is refused when its
    * address already has `perAddress` records, and when the store holds `limit`
    * records and none of them may give way (see SETUP_GRACE_MS); otherwise the
-   * one that gives way is deleted first and named in the result. Rejects when it
-   * can't be written, and then keeps the one before.
+   * new record is written, then the one that gives way is deleted and named in
+   * the result. Rejects when the record can't be written, and then keeps the one
+   * before and the one that would have given way.
    */
   async put(
     id: string,
@@ -430,23 +436,32 @@ class SubscriptionStore {
     await this.ensureLoaded();
     return this.serial(async (): Promise<PutResult> => {
       const address = options.address ?? null;
-      let evicted: { id: string; record: SubscriptionRecord } | undefined;
+      let victim: string | null = null;
       if (!this.records.has(id)) {
         if (address && (this.perAddress.get(address) ?? 0) >= (options.perAddress ?? Infinity)) {
           return { stored: false, reason: 'address-full' };
         }
         if (this.records.size >= (options.limit ?? Infinity)) {
-          const victim = this.givesWay(Date.now());
+          victim = this.givesWay(Date.now());
           if (victim === null) return { stored: false, reason: 'full' };
-          evicted = { id: victim, record: this.records.get(victim)! };
-          await this.append(victim, null);
-          this.forget(victim);
         }
       }
       await this.append(id, record);
       this.records.set(id, record);
       this.order(id, record, false);
       this.setOrigin(id, address);
+      let evicted: { id: string; record: SubscriptionRecord } | undefined;
+      if (victim !== null) {
+        const gone = this.records.get(victim)!;
+        try {
+          await this.append(victim, null);
+          this.forget(victim);
+          evicted = { id: victim, record: gone };
+        } catch {
+          // Its delete isn't on disk, so it stays, and the store holds one
+          // record more than its limit until a record leaves.
+        }
+      }
       await this.foldIfDue();
       return evicted ? { stored: true, evicted } : { stored: true };
     });
@@ -485,8 +500,9 @@ class SubscriptionStore {
       change(next);
       await this.append(id, next);
       const pushed = next.lastPushAt !== expected.lastPushAt;
+      const collected = next.codeCollectedAt !== expected.codeCollectedAt;
       Object.assign(expected, next);
-      if (pushed) this.order(id, expected, true);
+      if (pushed || collected) this.order(id, expected, pushed);
       await this.foldIfDue();
     });
   }
@@ -567,16 +583,19 @@ class SubscriptionStore {
     });
   }
 
-  // A record's place in the order of who gives way first. A registration puts
-  // one that never delivered at the end; one that delivered moves only when it
-  // delivers again (`moved`), so its place says how long ago that was.
+  // A record's place in the order of who gives way first. A registration, or a
+  // code collected, puts one that never delivered at the end of its order; one
+  // that delivered moves only when it delivers again (`moved`), so its place
+  // says how long ago that was.
   private order(id: string, record: SubscriptionRecord, moved: boolean): void {
     if (record.lastPushAt == null) {
       this.delivered.delete(id);
-      this.neverDelivered.delete(id);
-      this.neverDelivered.set(id, true);
+      this.unconfirmed.delete(id);
+      this.confirmed.delete(id);
+      (record.codeCollectedAt == null ? this.unconfirmed : this.confirmed).set(id, true);
     } else {
-      this.neverDelivered.delete(id);
+      this.unconfirmed.delete(id);
+      this.confirmed.delete(id);
       if (moved) this.delivered.delete(id);
       this.delivered.set(id, true);
     }
@@ -600,18 +619,22 @@ class SubscriptionStore {
 
   private forget(id: string): void {
     this.records.delete(id);
-    this.neverDelivered.delete(id);
+    this.unconfirmed.delete(id);
+    this.confirmed.delete(id);
     this.delivered.delete(id);
     this.setOrigin(id, null);
   }
 
   // The record a new device takes the place of in a full store, or null: see
-  // SETUP_GRACE_MS. The first of each order is the only candidate there.
+  // SETUP_GRACE_MS. The first of each order is the only candidate there. While
+  // the first record without a collected code is in its first minutes, every
+  // other one is too, and no record with a code goes before them.
   private givesWay(now: number): string | null {
-    const first = this.neverDelivered.keys().next();
-    if (!first.done) {
-      const record = this.records.get(first.value);
-      if (record && now - registeredAt(record) > SETUP_GRACE_MS) return first.value;
+    const unconfirmed = this.unconfirmed.keys().next();
+    const neverDelivered = unconfirmed.done ? this.confirmed.keys().next() : unconfirmed;
+    if (!neverDelivered.done) {
+      const record = this.records.get(neverDelivered.value);
+      if (record && now - registeredAt(record) > SETUP_GRACE_MS) return neverDelivered.value;
     }
     const oldest = this.delivered.keys().next();
     if (!oldest.done) {

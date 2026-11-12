@@ -188,9 +188,10 @@ describe('how many records the store takes', () => {
       for (const id of [ids.unusedRecent, ids.pushed, ids.collected]) assert.equal(await known(relay, id), true);
       assert.equal((await register(relay, newId(), '/limits')).status, 200, 'its place is free');
       // The store is full now. The next device takes the place of the record that
-      // never delivered and was registered longest ago.
+      // never delivered and whose code no client collected, before the one whose code was.
       assert.equal((await register(relay, newId(), '/limits')).status, 200);
-      assert.equal(await known(relay, ids.collected), false);
+      assert.equal(await known(relay, ids.unusedRecent), false);
+      assert.equal(await known(relay, ids.collected), true);
     } finally {
       await relay.stop();
     }
@@ -246,6 +247,62 @@ describe('who gives way when the store is full', () => {
       assert.equal(await known(relay, ids.lessLongAgo), false);
       assert.equal((await register(relay, newId(), '/give-new')).status, 507);
       assert.equal(await known(relay, ids.recent), true);
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('drops records whose code no client collected before those whose code was, each registered longest ago first', async () => {
+    const now = Date.now();
+    const HOUR = 60 * 60 * 1000;
+    const ids = { collectedOlder: newId(), collected: newId(), uncollectedOlder: newId(), uncollected: newId(), quiet: newId() };
+    const dataDir = seedStore({
+      [ids.collectedOlder]: { ...base, endpoint: service.url('/order-collected-older'), verificationCode: 'c', createdAt: now - 5 * HOUR, lastRegisteredAt: now - 5 * HOUR, codeCollectedAt: now - 5 * HOUR, lastPushAt: null },
+      [ids.collected]: { ...base, endpoint: service.url('/order-collected'), verificationCode: 'c', createdAt: now - 4 * HOUR, lastRegisteredAt: now - 4 * HOUR, codeCollectedAt: now - 4 * HOUR, lastPushAt: null },
+      [ids.uncollectedOlder]: { ...base, endpoint: service.url('/order-uncollected-older'), createdAt: now - 3 * HOUR, lastRegisteredAt: now - 3 * HOUR, lastPushAt: null },
+      [ids.uncollected]: { ...base, endpoint: service.url('/order-uncollected'), createdAt: now - 2 * HOUR, lastRegisteredAt: now - 2 * HOUR, lastPushAt: null },
+      [ids.quiet]: { ...base, endpoint: service.url('/order-quiet'), createdAt: now - 90 * DAY, lastPushAt: now - 40 * DAY },
+    });
+    const relay = await startRelay({ dataDir, env: { PUSH_MAX_SUBSCRIPTIONS: '5' } });
+    try {
+      const gone: string[] = [];
+      for (let i = 0; i < 5; i++) {
+        // A new device that finishes its setup: its code is collected.
+        const id = newId();
+        assert.equal((await register(relay, id, `/order-new-${i}`)).status, 200);
+        assert.equal((await postJson(relay.base, `/api/push/jmap/${id}`, pushVerification(`code-${i}`))).status, 200);
+        assert.deepEqual((await getJson(relay.base, `/api/push/verify/${id}`)).body, { verificationCode: `code-${i}` });
+        for (const [name, seeded] of Object.entries(ids)) if (!gone.includes(name) && !(await known(relay, seeded))) gone.push(name);
+      }
+      assert.deepEqual(gone, ['uncollectedOlder', 'uncollected', 'collectedOlder', 'collected', 'quiet']);
+      // Left: five new devices in their first minutes.
+      assert.equal((await register(relay, newId(), '/order-refused')).status, 507);
+    } finally {
+      await relay.stop();
+    }
+  });
+
+  it('keeps a confirmed phone that has had no mail yet while records whose code nobody collected are there', async () => {
+    const now = Date.now();
+    const MINUTE = 60 * 1000;
+    const phone = newId();
+    const stranger = [newId(), newId(), newId()];
+    const dataDir = seedStore({
+      [phone]: { ...base, endpoint: service.url('/stranger-phone'), verificationCode: 'c', createdAt: now - 60 * MINUTE, lastRegisteredAt: now - 60 * MINUTE, codeCollectedAt: now - 59 * MINUTE, lastPushAt: null },
+      ...Object.fromEntries(stranger.map((id, i) => [id, { ...base, endpoint: service.url(`/stranger-${i}`), createdAt: now - (32 - i) * MINUTE, lastRegisteredAt: now - (32 - i) * MINUTE, lastPushAt: null }])),
+    });
+    const relay = await startRelay({ dataDir, env: { PUSH_MAX_SUBSCRIPTIONS: '4' } });
+    try {
+      // Records without a collected code go first, oldest first, though the phone was registered before them.
+      for (const id of stranger) {
+        assert.equal((await register(relay, newId(), '/stranger-new')).status, 200);
+        assert.equal(await known(relay, id), false);
+        assert.equal(await known(relay, phone), true, 'the confirmed phone gave way while records without a code were there');
+      }
+      // The records without a code are now new ones in their first minutes; the phone
+      // doesn't give way while they are there either.
+      assert.equal((await register(relay, newId(), '/stranger-new')).status, 507);
+      assert.equal(await known(relay, phone), true);
     } finally {
       await relay.stop();
     }

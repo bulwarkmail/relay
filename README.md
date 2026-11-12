@@ -182,12 +182,17 @@ once per account and start.
 | `PUSH_REGISTER_REFILL_MS` | `2000` | Time until that address may make one more |
 | `TRUST_PROXY` | `0` | Number of proxies in front of the relay, see below |
 
-Who gives way when the store is full: first a record that never delivered a push,
-the one registered longest ago, then the record whose last delivered push is the
-oldest. Never one registered in the last 10 minutes (a device in the middle of its
-setup) and never one that delivered a push in the last 30 days. A dropped device
-gets its record back the next time its client registers (every page load, every app
-start), and counts in `relay_subscriptions_unregistered_total{reason="evicted"}`. A
+Who gives way when the store is full: first a record that never delivered a push
+and whose verification code no client collected, the one registered longest ago;
+then one that never delivered but whose code was collected (a device set up that
+has had no mail yet), also the one registered longest ago; then the record whose
+last delivered push is the oldest. Never one registered in the last 10 minutes (a
+device in the middle of its setup), no record with a collected code while one
+without is in those 10 minutes, and never one that delivered a push in the last 30
+days. The new record is written before the one that gives way is deleted, so a write
+that fails loses neither. A dropped device gets its record back the next time its
+client registers (every page load, every app start), and counts in
+`relay_subscriptions_unregistered_total{reason="evicted"}`. A
 push counts as delivered when the endpoint answered 2xx; the relay can't tell a
 real push service from an endpoint the registering client runs itself, so the
 limit per address is what bounds records kept alive that way.
