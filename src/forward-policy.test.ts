@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { forwardPolicy } from './forward-policy.js';
 import type { SubscriptionRecord } from './types.js';
+import { normalizeEndpoint } from './validation.js';
 
 const record = (i: number): SubscriptionRecord => ({
   kind: 'web',
@@ -60,6 +61,58 @@ describe('one endpoint written many ways', () => {
       ['another port', 'https://push-12.example.org/a', 'https://push-12.example.org:8443/a'],
     ];
     for (const [what, a, b] of apart) assert.equal(shareBudget(a, b), false, `${what}: one budget`);
+  });
+
+  // Spellings RFC 3986 keeps apart but servers route as one path, each passed through the
+  // relay's own check of what a client registers.
+  it('shares one budget between spellings a server may route as one path', () => {
+    const cases: Array<[string, string, string]> = [
+      ['double slash in the path', 'https://f1.example.org/a/b', 'https://f1.example.org/a//b'],
+      ['trailing slash', 'https://f2.example.org/a/b', 'https://f2.example.org/a/b/'],
+      // FCM web push tokens hold a colon: https://fcm.googleapis.com/fcm/send/<id>:APA91b...
+      ['colon escaped', 'https://f3.example.org/fcm/send/x:APA91b', 'https://f3.example.org/fcm/send/x%3AAPA91b'],
+      // WNS keeps the device in `token`; another parameter next to it is the same device.
+      ['a parameter added next to the device token', 'https://f4.example.org/w/?token=AbC', 'https://f4.example.org/w/?token=AbC&x=1'],
+    ];
+    const apart = cases.filter(([, a, b]) => !shareBudget(normalizeEndpoint(a)!, normalizeEndpoint(b)!)).map(([what]) => what);
+    assert.deepEqual(apart, []);
+  });
+
+  // The endpoint shapes of the push services and distributors Bulwark's clients register.
+  const device = (i: number) => `${'AbCdEfGh'.repeat(4)}${i}`;
+  const shapes: Array<[string, (i: number) => string]> = [
+    ['WNS (Edge)', (i) => `https://wns2-am3p.notify.windows.com/w/?token=BQYAAAD${device(i)}%2b${i}%2f%3d%3d`],
+    ['the UnifiedPush FCM distributor', (i) => `https://fcm.distributor.unifiedpush.org/FCM?v2&instance=${i}-inst&token=${device(i)}:APA91b${device(i)}`],
+    ['Gotify', (i) => `https://gotify.example.org/UP?token=${device(i)}`],
+    ['FCM (Chrome)', (i) => `https://fcm.googleapis.com/fcm/send/${device(i)}:APA91b${device(i)}`],
+    ['Mozilla (Firefox, Sunup)', (i) => `https://updates.push.services.mozilla.com/wpush/v2/gAAAAAB${device(i)}`],
+    ['Apple (Safari)', (i) => `https://web.push.apple.com/Q${device(i)}`],
+    ['ntfy.sh', (i) => `https://ntfy.sh/up${device(i)}?up=1`],
+    ['a self-hosted ntfy', (i) => `https://ntfy.example.org:8443/up${device(i)}?up=1`],
+    ['NextPush', (i) => `https://cloud.example.org/index.php/apps/uppush/push/${device(i)}`],
+    ['Conversations', (i) => `https://up.conversations.im/push/${device(i)}`],
+  ];
+
+  it('keeps a budget of its own for every device of every push service', () => {
+    const shared = shapes.filter(([, shape]) => shareBudget(normalizeEndpoint(shape(1))!, normalizeEndpoint(shape(2))!)).map(([what]) => what);
+    assert.deepEqual(shared, []);
+  });
+
+  it('shares one budget between one device\'s endpoint written with different extra query parameters', () => {
+    const cases: Array<[string, string, string]> = [
+      ['WNS, a parameter in front of the token', shapes[0][1](3), shapes[0][1](3).replace('?token=', '?x=1&token=')],
+      ['WNS, the token\'s escapes in upper case', shapes[0][1](4), shapes[0][1](4).replace('%2b', '%2B').replace('%2f%3d%3d', '%2F%3D%3D')],
+      ['the FCM distributor, another instance and one more parameter', shapes[1][1](5), `${shapes[1][1](5).replace('5-inst', 'other')}&y=2`],
+      ['Gotify, a parameter added', shapes[2][1](6), `${shapes[2][1](6)}&x=1`],
+      ['FCM (Chrome), a query added', shapes[3][1](7), `${shapes[3][1](7)}?x=1`],
+      ['Mozilla, a query added', shapes[4][1](8), `${shapes[4][1](8)}?a=b`],
+      ['ntfy.sh, another query', shapes[6][1](9), shapes[6][1](9).replace('?up=1', '?up=2')],
+    ];
+    const apart = cases.filter(([, a, b]) => !shareBudget(normalizeEndpoint(a)!, normalizeEndpoint(b)!)).map(([what]) => what);
+    assert.deepEqual(apart, []);
+    // A host the relay doesn't know and a query without `token`: that service may keep the device
+    // in another parameter, so the query still counts.
+    assert.equal(shareBudget('https://push.example.net/up/a?up=1', 'https://push.example.net/up/a?up=2'), false);
   });
 
   // Whether another device on the host is held once these endpoints, each of which delivered

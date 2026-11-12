@@ -76,11 +76,16 @@ default, merging whatever arrived meanwhile into one push.
   the service (`held: "rate-limit"` or `"endpoint-rate-limit"`), and the mail
   server's next attempt carries everything that piled up. An endpoint counts as one
   however it is written: the host in lower case and without a trailing dot, no
-  default port, letters, digits and `-._~` written as `%XX` read as themselves, the
-  hex digits of other `%XX` in upper case (`%2F` stays apart from `/`), no `.` or
-  `..` segments, no fragment. Endpoints that differ in their query keep a budget
-  each, since WNS (Edge) keeps the device there. The endpoint is stored and called
-  as the client registered it.
+  default port; in the path, characters a path may hold written as `%XX` read as
+  themselves, the hex digits of other `%XX` in upper case (`%2F` stays apart from
+  `/`), repeated slashes as one, no `.` or `..` segments, no trailing slash; no
+  fragment. Of the query only the value of a `token` parameter counts when there
+  is one (WNS, which Edge uses, Gotify and the UnifiedPush FCM distributor keep the
+  device there); on FCM, Mozilla, Apple, ntfy.sh and Conversations' server, which
+  keep the device in the path, none of it; on any other host all of it, since a
+  service the relay doesn't know may keep the device in another parameter. The
+  same holds for a backoff. The endpoint is stored and called as the client
+  registered it.
 - **Backoff.** After a `429`, or any answer with `Retry-After`, the relay leaves that
   endpoint (or token) alone for as long as the service says (60 seconds without a
   header, an hour at most), for every subscription on it. Registering the same

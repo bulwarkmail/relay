@@ -74,10 +74,9 @@ const MAX_HOST_HOLD_SECONDS = 120;
 // What has run out goes this often; nothing that is still running.
 const PRUNE_INTERVAL_MS = 60_000;
 // Pushes the relay forwards to one endpoint (or token) at once, then one more
-// every ENDPOINT_REFILL_MS, whatever number of ids share it and however its path
-// is written: an endpoint gets no more for having more ids. Ten accounts in one
-// browser, each at the sustained rate one id gets, still fit. Endpoints that
-// differ in their query have a budget each: WNS (Edge) keeps the device there.
+// every ENDPOINT_REFILL_MS, whatever number of ids share it and however it is
+// written (see deviceOf): an endpoint gets no more for having more ids. Ten
+// accounts in one browser, each at the sustained rate one id gets, still fit.
 const ENDPOINT_BURST = 30;
 const ENDPOINT_REFILL_MS = 2000;
 // A host is held for everyone only when the devices it throttled were
@@ -102,15 +101,17 @@ export function hostThrottleKey(record: SubscriptionRecord, host: string): strin
   return `${record.kind}:${host}`;
 }
 
-// Characters that are the same written as themselves or as %XX (RFC 3986,
-// 2.3). Any other %XX stands for what it encodes: `%2F` is a slash inside a
-// segment, not a separator, and stays.
+// Characters that are the same written as themselves or as %XX: in a query the
+// unreserved ones (RFC 3986, 2.3), in a path also those a segment may hold as
+// they are (3.3). Any other %XX stands for what it encodes: `%2F` is a slash
+// inside a segment, not a separator, and stays.
 const UNRESERVED = /^[A-Za-z0-9._~-]$/;
+const PATH_CHARACTER = /^[A-Za-z0-9._~!$&'()*+,;=:@-]$/;
 
-function samePercentEncoding(text: string): string {
+function samePercentEncoding(text: string, same = UNRESERVED): string {
   return text.replace(/%([0-9A-Fa-f]{2})/g, (_, hex: string) => {
     const char = String.fromCharCode(parseInt(hex, 16));
-    return UNRESERVED.test(char) ? char : `%${hex.toUpperCase()}`;
+    return same.test(char) ? char : `%${hex.toUpperCase()}`;
   });
 }
 
@@ -126,28 +127,65 @@ function withoutDotSegments(pathname: string): string {
   return `/${out.join('/')}`;
 }
 
+// Hosts whose endpoints keep the device in the path, so a query on them names
+// none: FCM (Chrome and the browsers built on it), Mozilla (Firefox, Sunup),
+// Apple (Safari), the public ntfy server and Conversations' UnifiedPush server.
+const DEVICE_IN_PATH = [
+  /^fcm\.googleapis\.com$/,
+  /^android\.googleapis\.com$/,
+  /(^|\.)push\.services\.mozilla\.com$/,
+  /(^|\.)push\.apple\.com$/,
+  /^ntfy\.sh$/,
+  /^up\.conversations\.im$/,
+];
+
+// The value of the first `token` parameter, decoded; null when there is none.
+// WNS (Edge), Gotify and the UnifiedPush FCM distributor keep the device there.
+function tokenOf(search: string): string | null {
+  for (const part of search.replace(/^\?/, '').split('&')) {
+    const equals = part.indexOf('=');
+    if ((equals === -1 ? part : part.slice(0, equals)) !== 'token') continue;
+    const value = equals === -1 ? '' : part.slice(equals + 1);
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return samePercentEncoding(value);
+    }
+  }
+  return null;
+}
+
 /**
  * What an endpoint counts as, the same for every way of writing it (RFC 3986,
  * 6.2.2): scheme and host in lower case, without the default port or a trailing
- * dot on the host, unreserved characters as themselves and the hex digits of any
- * other %XX in upper case, no dot segments, no fragment (it never reaches the
- * service), and the query only when `withQuery`. The endpoint the relay stores
- * and calls stays as the client registered it.
+ * dot on the host; in the path, characters a segment may hold written as
+ * themselves and the hex digits of any other %XX in upper case (`%2F` stays apart
+ * from `/`), repeated slashes as one, no dot segments, no trailing slash; no
+ * fragment (it never reaches the service). The query, only when `withQuery`: of a
+ * query with a `token` parameter only that value counts, on a host that keeps the
+ * device in the path none of it, and on any other host all of it, since a
+ * service the relay doesn't know may keep the device there. The endpoint the
+ * relay stores and calls stays as the client registered it.
  */
 function endpointKey(endpoint: string, withQuery: boolean): string {
   try {
     const url = new URL(endpoint);
     const host = url.hostname.endsWith('.') ? url.hostname.slice(0, -1) : url.hostname;
     const port = url.port ? `:${url.port}` : '';
-    const query = withQuery && url.search ? samePercentEncoding(url.search) : '';
-    return `${url.protocol}//${host}${port}${withoutDotSegments(samePercentEncoding(url.pathname))}${query}`;
+    const segments = withoutDotSegments(samePercentEncoding(url.pathname, PATH_CHARACTER).replace(/\/{2,}/g, '/'));
+    const base = `${url.protocol}//${host}${port}${segments.length > 1 ? segments.replace(/\/$/, '') : segments}`;
+    if (!withQuery || !url.search) return base;
+    const token = tokenOf(url.search);
+    if (token !== null) return `${base}?token=${token}`;
+    return DEVICE_IN_PATH.some((pattern) => pattern.test(host)) ? base : `${base}${samePercentEncoding(url.search)}`;
   } catch {
     return endpoint;
   }
 }
 
-// What a push service throttles: the endpoint, or the token. Subscriptions on one
-// are one device, however the endpoint is written.
+// What a push service throttles, and what the budget per endpoint and a backoff
+// are kept for: the endpoint, or the token. Subscriptions on one are one device,
+// however the endpoint is written.
 function deviceOf(record: SubscriptionRecord): string {
   if (record.kind === 'fcm') return `fcm:${record.fcmToken}`;
   if (record.kind === 'apns') return `apns:${record.deviceToken}`;

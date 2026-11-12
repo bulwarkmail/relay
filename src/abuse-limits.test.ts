@@ -1106,6 +1106,29 @@ describe('one endpoint written many ways', () => {
       await relay.stop();
     }
   });
+
+  it('forwards no more to one device token than its own budget, whatever else the query holds', async () => {
+    // WNS, Gotify and the UnifiedPush FCM distributor keep the device in a `token` parameter.
+    const relay = await startRelay();
+    try {
+      const ids: string[] = [];
+      for (let i = 0; i < 5; i++) {
+        const id = newId();
+        ids.push(id);
+        assert.equal((await web(relay, id, `/w/?token=device-one&extra=${i}`)).status, 200);
+      }
+      for (const id of ids) {
+        for (let i = 0; i < 10; i++) await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', [`e${i}`]));
+      }
+      assert.equal(service.requests.filter((r) => r.path.startsWith('/w/?token=device-one')).length, 30);
+      // Another device on the same path has a budget of its own.
+      const other = newId();
+      assert.equal((await web(relay, other, '/w/?token=device-two')).status, 200);
+      assert.equal((await postJson(relay.base, `/api/push/jmap/${other}`, emailPush('a', ['e1']))).status, 200);
+    } finally {
+      await relay.stop();
+    }
+  });
 });
 
 // Cost, measured as bytes the relay process hands to write(): on a store twice the size, the same
