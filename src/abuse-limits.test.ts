@@ -463,9 +463,10 @@ describe('how fast one address may register', () => {
         for (const header of headers) statuses.push((await register(relay, newId(), '/limits', header)).status);
         return statuses;
       };
-      // One IPv6 client holds a /64: every address in it, and the same with brackets and a port, is one budget.
+      // One IPv6 client holds a /56: every address in it, and the same with brackets and a port, is one budget.
       assert.deepEqual(await run(['2001:db8:1:2::5', '2001:db8:1:2:aaaa::6', '[2001:db8:1:2::7]:4711']), [200, 200, 429]);
-      assert.deepEqual(await run(['2001:db8:1:3::5']), [200], 'the next /64 is somebody else');
+      assert.deepEqual(await run(['2001:db8:1:3::5']), [429], 'the next /64 of the same /56 is the same client');
+      assert.deepEqual(await run(['2001:db8:1:100::5']), [200], 'the next /56 is somebody else');
       // A port behind the address is the same address.
       assert.deepEqual(await run(['203.0.113.50', '203.0.113.50:4711', '203.0.113.50:4712']), [200, 200, 429]);
       // An IPv4 address written as IPv6 is that address.

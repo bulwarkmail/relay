@@ -20,6 +20,10 @@ interface BaseSubscriptionRecord {
   // subscription got verified; this is the closest the relay can see.
   codeCollectedAt?: number;
   accountLabel?: string;
+  // The SHA-256 (base64url) of the secret the record was registered with, if
+  // its client sent one. Bound when the id is first registered; from then on
+  // the id alone neither replaces, deletes, polls nor pushes through it.
+  secretHash?: string;
 }
 
 export interface FcmSubscriptionRecord extends BaseSubscriptionRecord {
@@ -87,11 +91,14 @@ export type JmapPushBody = PushVerification | StateChange | EmailPush;
 
 // What the relay actually forwards to a device. `changed` is always present
 // so clients that only understand the state-change ping keep working; `kind`
-// and `emailIds` tell newer clients which messages were delivered.
+// and `emailIds` tell newer clients which messages were delivered. `sub` names
+// the registration the push is for (see subOf in payload.ts), so a device with
+// several can tell them apart; clients that don't know it ignore it.
 export interface ForwardPayload {
   kind: 'jmap-state-change' | 'jmap-email-push';
   accountLabel: string;
   accountId: string;
   emailIds: string[];
   changed: Record<string, Record<string, string>>;
+  sub: string;
 }

@@ -40,12 +40,65 @@ label a client registered with, and timing.
 Every register route answers `503` when the relay has no credentials for that
 transport (except UnifiedPush, which needs none), `400` to a body it can't use,
 `413` to one over 64 KB, `429` past the limit per client address and `507` when
-the store is full (see [Limits](#limits)). A wrong method on a known path answers
-`405`.
+the store is full (see [Limits](#limits)). It answers `403` and `409` as described
+under [Record ownership](#record-ownership). A wrong method on a known path
+answers `405`.
 
-Anyone holding a `subscriptionId` can replace or delete its record, read its
-verification code and post to it, so it has to be long and random. Bulwark
-clients use 128 random bits. The relay only checks its format.
+## Record ownership
+
+A record is named by its `subscriptionId`, which is the JMAP `deviceClientId`:
+the mail server shows it to every client of the same user, and it is in the push
+URL. For a record registered without a secret, knowing the id is enough to
+replace or delete the record, read its verification code and post to it. Every
+webmail and app released so far registers that way, and their records keep
+working exactly like that.
+
+A client can bind its record to a secret instead:
+
+- **Registering.** Each register route takes an optional `secret` in the body:
+  32 to 128 characters of `A-Z`, `a-z`, `0-9`, `_` and `-`, random and the
+  client's own (32 random bytes in base64url are 43 characters). A `secret` of any
+  other shape answers `400` and stores nothing. The secret is bound when the id is
+  first registered, and only to an id of 40 characters or more (32 random bytes in
+  base64url again); the released clients' ids are 32 hex digits and never take
+  one. A registration that brought a secret answers `{ "ok": true, "owned": true }`.
+  An older relay ignores the field and answers `{ "ok": true }`, which tells a
+  client its record there has no secret. A browser should then not send the
+  `Authorization` header to that relay, since an older relay's CORS answer doesn't
+  allow it and the browser would block the request.
+- **Afterwards.** A registration for that id needs the same `secret` in its body,
+  on any of the four routes, and may change the transport; without it, or with
+  another one, it answers `403` and the record stays as it was.
+  `DELETE /api/push/register/:id` and `GET /api/push/verify/:id` need
+  `Authorization: Bearer <secret>` and answer `403` without it (a refused poll
+  doesn't count as the code being collected). `POST /api/push/jmap/:id` needs the
+  secret in the query, `?k=<secret>`, since a URL is all the mail server has: the
+  client hands it `.../api/push/jmap/<id>?k=<secret>` as the PushSubscription's
+  `url`, which JMAP never shows to other clients. Without it the relay answers
+  `403`, forwards nothing and stores no code. `k` given twice counts as missing;
+  percent-encoding is decoded first. Each route looks in its one place only: the
+  secret in the query of a DELETE, or in a header on the push URL, counts as
+  missing. `GET /api/push/active/:id` stays open, because other devices of the
+  account ask it about ids that aren't theirs, and it only says yes or no.
+- **`409`.** A registration that brings a `secret` for an id that exists without
+  one, or for an id shorter than 40 characters, answers `409` and changes nothing.
+  A client that wants a secret registers a new id with it. A record is never given
+  a secret in place: otherwise anyone who knows an old client's id could delete
+  its record and register the id again with a secret of their own, and the old
+  client would be locked out of its id.
+- **Freed.** When a record with a secret is deleted or expires, its id is free
+  again, and the next registration decides, with or without a secret.
+
+The relay stores a SHA-256 of the secret, never the secret, and compares in
+constant time. It doesn't log a query string, and neither the secret nor its hash
+goes into the logs or into a metric.
+
+Old and new together: a new client works with an older relay, which ignores the
+unknown `secret` field, the header and the query, so its record just has no
+secret there. The mail server posts to whatever URL it was given, query and all.
+A record a new client made with a secret can't be registered by an older client
+build on the same device (`403`) until it is deleted or expires; that only
+happens after a downgrade.
 
 ## What the mail server gets back
 
@@ -59,6 +112,29 @@ default, merging whatever arrived meanwhile into one push.
 | 404, 410 (FCM `UNREGISTERED`, APNs `Unregistered`, `BadDeviceToken`, `DeviceTokenNotForTopic`) | Deletes the record | `200 { ok: false }` |
 | 429, 408, 5xx, no answer within 8 s, network error, a name that resolves to no public address | Keeps the record | `503 { ok: false }` (`500` when FCM or APNs can't be reached at all) |
 | Any other 4xx | Keeps the record, logs it | `200 { ok: false }` |
+
+## What a device gets
+
+Every push carries the same fields, whatever the transport:
+
+| Field | What it holds |
+| --- | --- |
+| `kind` | `jmap-email-push` for an `EmailPush`, `jmap-state-change` for a `StateChange` |
+| `accountLabel` | The label the client registered (on a UnifiedPush endpoint without keys only when it looks like a sign-in name, otherwise empty) |
+| `accountId` | The JMAP account the push is about; of several in a `StateChange`, the one with new mail |
+| `emailIds` | The new messages' ids, nothing else about them |
+| `changed` | The accounts and states, in the shape of a `StateChange`, for clients that read only that |
+| `sub` | Which registration the push is for: the first 16 bytes of SHA-256 over the `subscriptionId`, base64url (22 characters) |
+
+A device with several registrations (two logins, or one browser with two
+accounts on one endpoint) compares `sub` with the same hash of each of its ids.
+The id itself never goes out: the push service reads FCM, APNs and plain
+UnifiedPush payloads, and the id is what registers a record. Web Push and
+UnifiedPush with keys get the fields as encrypted JSON, UnifiedPush without keys
+as plain JSON, FCM as `data` strings (`emailIds` and `changed` JSON-encoded), and
+APNs under `body`, next to a fixed "New message" alert. A push stays under 3,000
+bytes: older ids are left out first, then accounts without new mail; the other
+fields always stay. Clients ignore fields they don't know.
 
 ## How it treats the push services
 
@@ -95,7 +171,8 @@ default, merging whatever arrived meanwhile into one push.
   asked for it, and each one is in the log. At most 10,000 endpoints are remembered
   in backoff; past that the oldest backoff is dropped.
 - **Host hold.** After `429`s for 20 different devices on one host within a minute,
-  registered from at least 5 different client addresses, the relay leaves the whole
+  registered from at least 5 different client addresses (an IPv6 client counted by
+  its /56, as under [Limits](#limits)), the relay leaves the whole
   host alone, for two minutes at most. Only devices that have delivered a push before
   count, a device is its endpoint without query and fragment, written one way as
   above, and browsers and native apps count separately. Devices whose client address
@@ -129,8 +206,9 @@ on your own network, name it in `PUSH_ALLOW_PRIVATE_ENDPOINTS`.
 Per `subscriptionId`: an FCM token (Android app), an APNs device token (iOS
 app), a Web Push subscription (`endpoint` + `p256dh`/`auth` keys for the PWA), or
 a UnifiedPush endpoint (Android app without Google Play services), the
-verification code, an optional free-form `accountLabel` (max 120 chars), and
-timestamps. No server URL, no mail content.
+verification code, an optional free-form `accountLabel` (max 120 chars), the
+SHA-256 of the record's secret if it has one, and timestamps. No server URL, no
+mail content.
 
 Nothing else a client sends is kept. The endpoint is stored as the URL parser
 writes it, up to 2,048 characters, and is refused (`400`) with a control
@@ -144,7 +222,14 @@ real ones take a few hundred bytes.
 The `accountLabel` is what the client sends, and Bulwark clients send the sign-in
 name. It is stored here and copied into every push: encrypted to the device for Web
 Push and UnifiedPush with keys, but readable to Google and Apple in FCM and APNs
-payloads, and to the distributor on a UnifiedPush endpoint without keys.
+payloads, and to the distributor on a UnifiedPush endpoint without keys. Whatever a
+client registers is what goes to them. The relay never needs the label to be a
+sign-in name: it only hands it back, so the client can tell which account a push
+is for. A client can register any opaque text up to 120 characters instead, such
+as a random value it keeps with the account, and match pushes by that; one of
+letters, digits, `_` and `-` also reaches a UnifiedPush device without keys. The
+apps released so far pick the account by the sign-in name in the push, so the
+relay passes on whatever label was registered, unchanged.
 
 Subscriptions with no push and no registration for 90 days are evicted. One that
 never delivered a push and whose verification code no client picked up goes after
@@ -173,10 +258,30 @@ a minute later, while the journal keeps taking changes. The first one, on a stor
 without a number, comes before any journal: until it is written every change is
 answered `500`, and it too is tried at most once a minute. A snapshot that isn't
 valid is kept as `subscriptions.json.corrupt-<time>` and logged as an error, and the relay starts
-from the previous version. A file that can't be read at all (permissions, a bad
+from the previous version. The journal is replayed onto that version only when it
+continues it; a journal that continues the snapshot that isn't valid is set aside
+as above, so every change since the previous version was written is lost, and
+those records stay as the previous version has them until their clients register
+again. A file that can't be read at all (permissions, a bad
 mount) stops the relay at startup with an error, so it can't overwrite the store.
 A relay that starts on the `subscriptions.json` of an older relay takes every
-record from it. Only the relay's user may read the store: the data directory is
+record from it.
+
+One data directory takes one relay. A relay writes its process number and host
+name into `subscriptions.lock` before it reads the store, and removes the file
+when it stops cleanly. A second relay that finds the lock of one that still runs
+doesn't start, and logs an error with that relay's process number, host and start
+time. A lock whose relay no longer runs (it was killed, or the machine restarted)
+is taken over, with a warning. The relay tells by the process number on the same
+host, on Linux also by that process's start time, so a number handed to another
+process since doesn't count. In a container the relay gets the same number at
+every start, so a lock with its own number is an earlier run's. A lock written on
+another host can't be checked and counts as held. The compose file gives the
+container a fixed host name for that reason, so a container created anew takes
+over its predecessor's lock; with `docker run`, pass `--hostname`. Remove the file
+by hand only when no relay runs on the directory.
+
+Only the relay's user may read the store: the data directory is
 mode 700 and the store's files 600, and a start narrows what it finds wider (the
 directory with a warning in the log). The FCM and APNs key files are yours to keep
 at 600.
@@ -219,10 +324,12 @@ the relay started; it is kept in memory only, never in the store, so after a
 restart a record counts for no address until its client registers again.
 
 How large the store can get: 50,000 records of the largest kind the relay takes
-(every field at its limit) are 189 MB on disk. The snapshot is read a line at a
-time, and a start that also folds a journal into it peaks at about 215 MB of heap
-and 340 MB resident (measured with Node 22 on Linux, `--max-old-space-size=256`,
-which gives V8 304 MB in all). Real records are a few hundred bytes, so a full
+(every field at its limit, a secret's hash included) are 192 MB on disk. The
+snapshot is read a line at a time, and a start that also folds a journal into it
+peaks at about 215 MB of heap and 340 MB resident (measured with Node 22 on Linux,
+`--max-old-space-size=256`, which gives V8 304 MB in all). That start is the peak:
+a fold while the relay runs writes the records it holds 500 at a time, so it needs
+little beyond them. Real records are a few hundred bytes, so a full
 store of real devices is a tenth of that. Give the container memory for the store
 and Node besides; a
 `subscriptions.json` written by an older relay is read whole once, which takes
@@ -234,8 +341,11 @@ Which address a registration counts for:
 - With `TRUST_PROXY=1` it is the last entry of `X-Forwarded-For`, the one the proxy
   appended; whatever the client wrote in front of it is ignored. With `2` it is the
   second from the end, and so on. A request without the header counts by its socket.
-- A port after the address is ignored, and an IPv6 client counts by its /64. An entry
-  that is no address at all counts for one budget shared by all such entries.
+- A port after the address is ignored. An IPv4 client counts by its address, an
+  IPv6 client by its /56, since providers hand a customer a /56 or a /48: all the
+  /64s in one /56 are one client, for the rate, the records per address and the
+  host hold. An entry that is no address at all counts for one budget shared by
+  all such entries.
 - When the address is a loopback, private, shared (100.64/10) or link-local one
   the relay can't tell its clients apart, and one budget for all of them would
   refuse real devices. That is the proxy's own address with `TRUST_PROXY=0` behind a
@@ -282,12 +392,56 @@ server {
 The prefix also covers `DELETE /api/push/register/:id`, which a client sends once
 on logout.
 
+Two things about nginx's own limit. Its `429` carries none of the relay's CORS
+headers, so a browser sees a network error instead ("Could not reach the push
+relay" in the webmail), which the webmail retries the same way as a `429`, at the
+next page load. And a browser's preflight `OPTIONS` before a registration (when it
+has none cached) counts against the zone too, so the zone runs out up to twice as
+fast as the relay's own budget. nginx doesn't count a request whose key is empty,
+so to leave preflights out, key the zone on a map that is empty for `OPTIONS`:
+
+```nginx
+# http block, instead of the limit_req_zone above
+map $request_method $relay_register_key {
+    OPTIONS "";
+    default $binary_remote_addr;
+}
+limit_req_zone $relay_register_key zone=relay_register:10m rate=30r/m;
+```
+
+Keep the subscription ids and secrets out of the proxy's access log. nginx's
+default `combined` format writes the whole request line, and for `/api/push/` that
+is the id in the path and, on the push URL, the record's secret in the query.
+Log those requests without the path and the query, or not at all:
+
+```nginx
+# http block
+log_format relay_push '$remote_addr [$time_local] "$request_method" $status $body_bytes_sent $request_time';
+
+server {
+    # ...
+    location /api/push/register {
+        access_log /var/log/nginx/relay-push.log relay_push;
+        # ... limit_req and proxy_pass as above
+    }
+    location /api/push/ {
+        access_log /var/log/nginx/relay-push.log relay_push;   # or: access_log off;
+        proxy_pass http://127.0.0.1:3003;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+```
+
+nginx's error log still quotes the request line when it can't reach the relay,
+so keep it readable to the operator only.
+
 ## What it logs
 
 Requests by route, status and duration, with a short hash that follows one
 subscription through the logs. Failed forwards also log the push service's host,
-status and its reason, with any URL in it removed. Never the subscription id, an
-endpoint path, keys, tokens or the label.
+status and its reason, with any URL in it removed. Never the subscription id, a
+query string, a record's secret or its hash, an endpoint path, keys, tokens or the
+label.
 
 ## Run locally
 

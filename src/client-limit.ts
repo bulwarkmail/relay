@@ -77,10 +77,15 @@ function parseAddress(raw: string): Address | null {
   return { address: value, family: 'ipv6' };
 }
 
-/** What the limit counts by: IPv4 by address, IPv6 by its /64, which one client usually holds whole. */
+/**
+ * What the limits count by: IPv4 by address, IPv6 by its /56. Providers hand a
+ * customer a /56 or a /48, so whoever holds many /64s inside one /56 counts as
+ * one client.
+ */
 function keyOf({ address, family }: Address): string {
   if (family === 'ipv4') return address;
-  return `${ipv6Groups(address).slice(0, 4).map((group) => group.toString(16)).join(':')}::/64`;
+  const groups = ipv6Groups(address);
+  return `${[...groups.slice(0, 3), groups[3] & 0xff00].map((group) => group.toString(16)).join(':')}::/56`;
 }
 
 // Every entry of a header that names no address shares this one budget.

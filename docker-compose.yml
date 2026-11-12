@@ -3,6 +3,9 @@ services:
     build: .
     image: bulwark-relay:local
     container_name: bulwark-relay
+    # A fixed host name: a container created anew then recognises the lock its
+    # predecessor left in the data directory (README, "What it stores").
+    hostname: bulwark-relay
     restart: unless-stopped
     # A stop waits for a push still on its way, then folds the journal into
     # subscriptions.json (README, "Going back to an older image").

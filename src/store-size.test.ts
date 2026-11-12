@@ -12,7 +12,9 @@ process.env.PUSH_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-size-')
 
 const now = Date.now();
 // Every field at the limit its validator sets: an endpoint of 2,048 characters,
-// keys with padding, a label of 120 characters of three bytes each.
+// keys with padding, a label of 120 characters of three bytes each, and the hash
+// of a secret.
+const secretHash = 'h'.repeat(43);
 const largestUnifiedPush = (i = 0): SubscriptionRecord => ({
   kind: 'up',
   endpoint: `https://push.example.org/${String(i).padStart(8, '0')}/${'x'.repeat(2048 - 34)}`,
@@ -23,13 +25,14 @@ const largestUnifiedPush = (i = 0): SubscriptionRecord => ({
   lastRegisteredAt: now,
   codeCollectedAt: now,
   accountLabel: '€'.repeat(120),
+  secretHash,
 });
 // A verification code at its limit, of the character JSON writes as two.
 const largestCode = '"'.repeat(512);
 
 describe('the largest record the relay takes', () => {
   it('stays under the bound with every field and the verification code at their limits', () => {
-    const fcm: SubscriptionRecord = { kind: 'fcm', fcmToken: 'f'.repeat(2048), verificationCode: null, createdAt: now, lastPushAt: now, lastRegisteredAt: now, codeCollectedAt: now, accountLabel: '€'.repeat(120) };
+    const fcm: SubscriptionRecord = { kind: 'fcm', fcmToken: 'f'.repeat(2048), verificationCode: null, createdAt: now, lastPushAt: now, lastRegisteredAt: now, codeCollectedAt: now, accountLabel: '€'.repeat(120), secretHash };
     for (const record of [largestUnifiedPush(), fcm]) {
       assert.ok(recordBytes(record) <= MAX_REGISTRATION_BYTES, `${record.kind}: ${recordBytes(record)} bytes`);
       assert.ok(recordBytes({ ...record, verificationCode: largestCode }) <= MAX_RECORD_BYTES, `${record.kind} with a code`);

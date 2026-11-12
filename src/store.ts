@@ -1,10 +1,12 @@
 import { createReadStream } from 'node:fs';
 import { readFile, open, mkdir, rename, unlink, chmod, readdir, stat, truncate } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { logger } from './logger.js';
 import { storeWriteFailures } from './metrics.js';
 import type { SubscriptionRecord } from './types.js';
+import { sameSecretHash } from './validation.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 // Aligned with the JMAP PushSubscription expires the mobile client requests
@@ -74,6 +76,80 @@ function journalPath(): string {
   return path.join(getPushDir(), 'subscriptions.journal');
 }
 
+// Which relay process holds the data directory: written at its start, removed
+// when it stops cleanly. Two relays on one directory would each write changes
+// the other doesn't know about.
+function lockPath(): string {
+  return path.join(getPushDir(), 'subscriptions.lock');
+}
+
+/** Who wrote a lock: enough to tell on this machine whether that process still runs. */
+export interface LockHolder {
+  pid: number;
+  host: string;
+  // Linux only: the boot the process ran in, and its start time in that boot, so
+  // that a process number given to another process since doesn't count.
+  boot?: string;
+  start?: string;
+  startedAt: number;
+}
+
+async function bootId(): Promise<string | undefined> {
+  return (await readFile('/proc/sys/kernel/random/boot_id', 'utf8').catch(() => '')).trim() || undefined;
+}
+
+async function startTimeOf(pid: number): Promise<string | undefined> {
+  const stat = await readFile(`/proc/${pid}/stat`, 'utf8').catch(() => '');
+  // After the command name, which may hold spaces: field 22 is the 20th.
+  return stat ? stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19] : undefined;
+}
+
+function isRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // It runs, as another user.
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+export async function currentLockHolder(): Promise<LockHolder> {
+  return { pid: process.pid, host: os.hostname(), boot: await bootId(), start: await startTimeOf(process.pid), startedAt: Date.now() };
+}
+
+/**
+ * Whether the relay that wrote a lock may still run, as far as `me` can tell.
+ * Its process number only means something on the same host: a lock from another
+ * host (another container without a fixed host name, another machine on a shared
+ * mount) counts as held. On the same host it is free when the machine has
+ * restarted since, when the number is this process's own (an earlier run in a
+ * new container, where the relay gets the same number every time), when no
+ * process has the number, or when the process that has it started at another
+ * time (the number went to another process).
+ */
+export async function lockHolderRuns(holder: LockHolder, me: LockHolder): Promise<boolean> {
+  if (holder.host !== me.host) return true;
+  if (holder.boot && me.boot && holder.boot !== me.boot) return false;
+  if (holder.pid === me.pid) return false;
+  if (!isRunning(holder.pid)) return false;
+  if (holder.start) {
+    const start = await startTimeOf(holder.pid);
+    if (start !== undefined && start !== holder.start) return false;
+  }
+  return true;
+}
+
+function parseLock(text: string): LockHolder | null {
+  try {
+    const value = JSON.parse(text) as Partial<LockHolder>;
+    if (!value || !Number.isSafeInteger(value.pid) || typeof value.host !== 'string') return null;
+    return value as LockHolder;
+  } catch {
+    return null;
+  }
+}
+
 function message(error: unknown): string {
   return error instanceof Error ? error.message : 'Unknown error';
 }
@@ -126,7 +202,15 @@ interface Snapshot {
 
 export type PutResult =
   | { stored: true; evicted?: { id: string; record: SubscriptionRecord } }
-  | { stored: false; reason: 'full' | 'address-full' };
+  | { stored: false; reason: 'full' | 'address-full' | 'not-owner' | 'taken' };
+
+/**
+ * Whether a caller who holds the secret with this hash (null: none) may act on
+ * the record. Always on a record without a secret, as before secrets existed.
+ */
+export function mayUse(record: SubscriptionRecord, secretHash: string | null): boolean {
+  return record.secretHash === undefined || (secretHash !== null && sameSecretHash(record.secretHash, secretHash));
+}
 
 const registeredAt = (record: SubscriptionRecord) => Math.max(record.createdAt, record.lastRegisteredAt ?? 0);
 
@@ -147,6 +231,8 @@ class SubscriptionStore {
   private snapshotNumbered = false;
   private foldRetryAt = 0;
   private closed = false;
+  // What this process wrote into subscriptions.lock, while it holds it.
+  private lock: string | null = null;
   // The client address each record was last registered from, while the relay
   // runs. Never written to disk: after a start a record has none until its
   // client registers again, which it does on every page load and app start.
@@ -170,6 +256,69 @@ class SubscriptionStore {
 
   private async readFromDisk(): Promise<void> {
     await this.makePrivate();
+    await this.takeLock();
+    try {
+      await this.readStore();
+    } catch (error) {
+      await this.releaseLock();
+      throw error;
+    }
+  }
+
+  /**
+   * Takes subscriptions.lock for this process before anything is read. Rejects,
+   * so the relay doesn't start, while another relay that may still run holds it
+   * (see lockHolderRuns); one left by a relay that is gone is taken over.
+   */
+  private async takeLock(): Promise<void> {
+    const file = lockPath();
+    const text = JSON.stringify(await currentLockHolder());
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const handle = await open(file, 'wx', PRIVATE_FILE);
+        try {
+          await handle.writeFile(text, 'utf-8');
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        this.lock = text;
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+          logger.error('store: could not write subscriptions.lock', { error: message(error) });
+          throw error;
+        }
+      }
+      const found = await readFile(file, 'utf-8').catch(() => null);
+      if (found === null) continue;
+      const holder = parseLock(found);
+      if (holder && (await lockHolderRuns(holder, JSON.parse(text) as LockHolder))) {
+        logger.error('store: another relay holds this data directory, so this one does not start; stop that relay first, or remove subscriptions.lock if it no longer runs', {
+          pid: holder.pid,
+          host: holder.host,
+          since: Number.isFinite(holder.startedAt) ? new Date(holder.startedAt).toISOString() : undefined,
+        });
+        throw new Error('the data directory is held by another relay');
+      }
+      // Only the lock judged here goes, not one a relay starting at the same time wrote since.
+      if ((await readFile(file, 'utf-8').catch(() => null)) !== found) continue;
+      await unlink(file).catch(() => undefined);
+      logger.warn('store: took over subscriptions.lock from a relay that no longer runs', holder ? { pid: holder.pid, host: holder.host } : {});
+    }
+    logger.error('store: could not take subscriptions.lock; another relay keeps writing it');
+    throw new Error('could not take subscriptions.lock');
+  }
+
+  // Removes subscriptions.lock, if it is still the one this process wrote.
+  private async releaseLock(): Promise<void> {
+    if (this.lock === null) return;
+    const file = lockPath();
+    if ((await readFile(file, 'utf-8').catch(() => null)) === this.lock) await unlink(file).catch(() => undefined);
+    this.lock = null;
+  }
+
+  private async readStore(): Promise<void> {
     const snapshot =
       (await this.readSnapshot(subscriptionsPath())) ?? (await this.readSnapshot(previousVersionPath()));
     for (const [id, record] of Object.entries(snapshot?.records ?? {})) {
@@ -392,12 +541,16 @@ class SubscriptionStore {
 
   /**
    * Stores a record, registered from `address` (null when the relay can't tell).
-   * An id that is there can always be replaced. A new id is refused when its
-   * address already has `perAddress` records, and when the store holds `limit`
-   * records and none of them may give way (see SETUP_GRACE_MS); otherwise the
-   * new record is written, then the one that gives way is deleted and named in
-   * the result. Rejects when the record can't be written, and then keeps the one
-   * before and the one that would have given way.
+   * The id is the first registration's: a record bound to a secret is replaced
+   * only by one bound to the same secret ('not-owner' otherwise), and a record
+   * without one is never bound to one in place ('taken'), so nobody who merely
+   * knows an id can lock its client out. Past that, an id that is there can
+   * always be replaced. A new id is refused when its address already has
+   * `perAddress` records, and when the store holds `limit` records and none of
+   * them may give way (see SETUP_GRACE_MS); otherwise the new record is written,
+   * then the one that gives way is deleted and named in the result. Rejects when
+   * the record can't be written, and then keeps the one before and the one that
+   * would have given way.
    */
   async put(
     id: string,
@@ -407,8 +560,13 @@ class SubscriptionStore {
     await this.ensureLoaded();
     return this.serial(async (): Promise<PutResult> => {
       const address = options.address ?? null;
+      const current = this.records.get(id);
+      if (current) {
+        if (!mayUse(current, record.secretHash ?? null)) return { stored: false, reason: 'not-owner' };
+        if (current.secretHash === undefined && record.secretHash !== undefined) return { stored: false, reason: 'taken' };
+      }
       let victim: string | null = null;
-      if (!this.records.has(id)) {
+      if (!current) {
         if (address && (this.perAddress.get(address) ?? 0) >= (options.perAddress ?? Infinity)) {
           return { stored: false, reason: 'address-full' };
         }
@@ -443,13 +601,20 @@ class SubscriptionStore {
     return this.origins.get(id) ?? null;
   }
 
-  async delete(id: string): Promise<void> {
+  /**
+   * Deletes a record, if the caller may (see mayUse; `secretHash` is the hash of
+   * the secret it presented, null for none). Says what happened.
+   */
+  async delete(id: string, secretHash: string | null = null): Promise<'deleted' | 'absent' | 'not-owner'> {
     await this.ensureLoaded();
-    await this.serial(async () => {
-      if (!this.records.has(id)) return;
+    return this.serial(async () => {
+      const current = this.records.get(id);
+      if (!current) return 'absent';
+      if (!mayUse(current, secretHash)) return 'not-owner';
       await this.append(id, null);
       this.forget(id);
       await this.foldIfDue();
+      return 'deleted';
     });
   }
 
@@ -518,15 +683,17 @@ class SubscriptionStore {
   /**
    * Folds the journal into the snapshot, after every change already on its way,
    * and takes no change after that: an older relay reads subscriptions.json only.
-   * Says whether the journal is gone.
+   * Then gives up the data directory's lock. Says whether the journal is gone.
    */
   async close(): Promise<boolean> {
     if (!this.loaded) return true;
-    return this.serial(async () => {
+    const folded = await this.serial(async () => {
       this.closed = true;
       if (this.journalBytes > 0) await this.fold();
       return true;
     }).catch(() => false);
+    await this.releaseLock();
+    return folded;
   }
 
   private isExpired(record: SubscriptionRecord, now = Date.now()): boolean {

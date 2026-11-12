@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { isForwardableBody, toForwardPayload } from './payload.js';
+import { isForwardableBody, subOf, toForwardPayload } from './payload.js';
+
+const SUB = subOf('subscription-id-0001');
 
 describe('toForwardPayload', () => {
   it('wraps a StateChange as the legacy ping and names the first account', () => {
     const payload = toForwardPayload(
       { '@type': 'StateChange', changed: { acc1: { EmailDelivery: 's1' } } },
       'Work',
+      SUB,
     );
     assert.deepEqual(payload, {
       kind: 'jmap-state-change',
@@ -14,7 +17,14 @@ describe('toForwardPayload', () => {
       accountId: 'acc1',
       emailIds: [],
       changed: { acc1: { EmailDelivery: 's1' } },
+      sub: SUB,
     });
+  });
+
+  it('names the registration by a hash of its id, never by the id', () => {
+    assert.match(SUB, /^[A-Za-z0-9_-]{22}$/);
+    assert.notEqual(subOf('subscription-id-0002'), SUB);
+    assert.equal(SUB.includes('subscription'), false);
   });
 
   it('forwards only the ids of an EmailPush, never other properties', () => {
@@ -31,6 +41,7 @@ describe('toForwardPayload', () => {
         ],
       },
       undefined,
+      SUB,
     );
     assert.deepEqual(payload, {
       kind: 'jmap-email-push',
@@ -38,6 +49,7 @@ describe('toForwardPayload', () => {
       accountId: 'acc1',
       emailIds: ['m1', 'm2'],
       changed: { acc1: { EmailDelivery: 's9' } },
+      sub: SUB,
     });
     assert.equal(JSON.stringify(payload).includes('secret'), false);
   });
@@ -46,6 +58,7 @@ describe('toForwardPayload', () => {
     const payload = toForwardPayload(
       { '@type': 'EmailPush', accountId: 'acc1', emails: [{ id: 'm1' }] },
       '',
+      SUB,
     );
     assert.deepEqual(payload.changed, { acc1: { EmailDelivery: '' } });
   });
@@ -56,14 +69,15 @@ describe('payload limits', () => {
 
   it('fits a push however many ids the server sent, keeping the newest', () => {
     const ids = Array.from({ length: 3000 }, (_, i) => `e${i}`);
-    const payload = toForwardPayload(body(ids.map((id) => ({ id }))), 'label');
+    const payload = toForwardPayload(body(ids.map((id) => ({ id }))), 'label', SUB);
     assert.ok(Buffer.byteLength(JSON.stringify(payload)) <= 3000);
     assert.equal(payload.emailIds.at(-1), 'e2999');
     assert.ok(payload.emailIds.length > 100);
+    assert.equal(payload.sub, SUB);
   });
 
   it('drops ids and accounts that are not JMAP ids', () => {
-    const payload = toForwardPayload(body([{ id: 'good_1-A' }, { id: '<script>' }, { id: 'x'.repeat(300) }, { id: 5 }, null]), '');
+    const payload = toForwardPayload(body([{ id: 'good_1-A' }, { id: '<script>' }, { id: 'x'.repeat(300) }, { id: 5 }, null]), '', SUB);
     assert.deepEqual(payload.emailIds, ['good_1-A']);
     const state = toForwardPayload({
       '@type': 'StateChange',
@@ -72,7 +86,7 @@ describe('payload limits', () => {
         a: { EmailDelivery: 's1', 'Not A Type': 's', Email: 5, Mailbox: 'x'.repeat(300) },
         b: 'nonsense',
       },
-    } as never, '');
+    } as never, '', SUB);
     assert.deepEqual(state.changed, { a: { EmailDelivery: 's1' } });
     assert.equal(state.accountId, 'a');
   });
@@ -81,7 +95,7 @@ describe('payload limits', () => {
     const changed: Record<string, Record<string, string>> = {};
     for (let i = 0; i < 500; i++) changed[`quiet${i}`] = { Email: `state${i}`, Mailbox: `state${i}` };
     changed.mail = { EmailDelivery: 's' };
-    const payload = toForwardPayload({ '@type': 'StateChange', changed } as never, '');
+    const payload = toForwardPayload({ '@type': 'StateChange', changed } as never, '', SUB);
     assert.ok(Buffer.byteLength(JSON.stringify(payload)) <= 3000);
     assert.equal(payload.changed.mail.EmailDelivery, 's');
   });
@@ -90,13 +104,13 @@ describe('payload limits', () => {
     const payload = toForwardPayload({
       '@type': 'StateChange',
       changed: { a: { Mailbox: 's' }, b: { EmailDelivery: 's' } },
-    } as never, '');
+    } as never, '', SUB);
     assert.equal(payload.accountId, 'b');
     assert.deepEqual(Object.keys(payload.changed), ['a', 'b']);
   });
 
   it('caps a long label from a record stored before the limit', () => {
-    const payload = toForwardPayload({ '@type': 'StateChange', changed: { a: { EmailDelivery: 's' } } } as never, 'x'.repeat(5000));
+    const payload = toForwardPayload({ '@type': 'StateChange', changed: { a: { EmailDelivery: 's' } } } as never, 'x'.repeat(5000), SUB);
     assert.equal(payload.accountLabel.length, 120);
   });
 });

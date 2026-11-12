@@ -183,6 +183,7 @@ async function sendWithProject(
         accountId: payload.accountId,
         emailIds: JSON.stringify(payload.emailIds),
         changed: JSON.stringify(payload.changed),
+        sub: payload.sub,
       },
     },
   };
