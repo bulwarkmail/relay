@@ -503,7 +503,8 @@ The image is published to the GitHub Container Registry for amd64 and arm64:
 | `ghcr.io/bulwarkmail/relay:edge` | The newest commit on `main` |
 | `ghcr.io/bulwarkmail/relay:sha-<commit>` | One commit on `main` |
 
-`docker-compose.yml` runs `latest`. Put it, and a `.env` with your settings (see
+`docker-compose.yml` runs `edge` until the first release is tagged; switch it
+to `latest` then. Put it, and a `.env` with your settings (see
 [Environment](#environment)), in a directory, then:
 
 ```sh
