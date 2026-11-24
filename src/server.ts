@@ -728,7 +728,7 @@ async function dispatch(
 ): Promise<SendResult> {
   if (record.kind === 'fcm') {
     const timer = fcmDurationSeconds.startTimer();
-    const result = await sendFcmPush(record, payload);
+    const result = await sendFcmPush(record, payload, delivery);
     timer();
     return result;
   }

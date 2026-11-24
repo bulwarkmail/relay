@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
-import { isSenderMismatch, resetFcmState, sendFcmPush } from './fcm.js';
+import { fcmPriority, isSenderMismatch, resetFcmState, sendFcmPush } from './fcm.js';
+import type { DeliveryOptions } from './forward-policy.js';
 import type { FcmSubscriptionRecord, ForwardPayload } from './types.js';
 
 const payload = {
@@ -14,6 +15,7 @@ const payload = {
   emailIds: [],
   changed: {},
 } as unknown as ForwardPayload;
+const high: DeliveryOptions = { urgency: 'high' };
 
 function record(token: string): FcmSubscriptionRecord {
   return { kind: 'fcm', fcmToken: token } as unknown as FcmSubscriptionRecord;
@@ -33,6 +35,7 @@ function account(projectId: string) {
 
 // Each fake project accepts only its own tokens ("<project>:<id>"), like FCM.
 const sends: string[] = [];
+const priorities: string[] = [];
 const realFetch = globalThis.fetch;
 let dir: string;
 
@@ -44,6 +47,7 @@ beforeEach(() => {
   delete process.env.FCM_SERVICE_ACCOUNT_JSON;
   resetFcmState();
   sends.length = 0;
+  priorities.length = 0;
   globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
     const url = String(input);
     if (url === 'https://oauth.test/token') {
@@ -52,6 +56,7 @@ beforeEach(() => {
     const project = decodeURIComponent(url.match(/projects\/([^/]+)\/messages:send/)![1]);
     const token = JSON.parse(String(init!.body)).message.token as string;
     sends.push(project);
+    priorities.push(JSON.parse(String(init!.body)).message.android.priority as string);
     if (token.startsWith(`${project}:`)) {
       return new Response(JSON.stringify({ name: 'm' }), { status: 200 });
     }
@@ -69,27 +74,42 @@ afterEach(() => {
 
 describe('sendFcmPush across Firebase projects', () => {
   it('sends a new-project token through the main account only', async () => {
-    const result = await sendFcmPush(record('new-project:1'), payload);
+    const result = await sendFcmPush(record('new-project:1'), payload, high);
     assert.equal(result.ok, true);
     assert.deepEqual(sends, ['new-project']);
   });
 
   it('falls back to the old project on a sender mismatch, then goes there first', async () => {
-    const first = await sendFcmPush(record('old-project:1'), payload);
+    const first = await sendFcmPush(record('old-project:1'), payload, high);
     assert.equal(first.ok, true);
     assert.deepEqual(sends, ['new-project', 'old-project']);
 
     sends.length = 0;
-    const second = await sendFcmPush(record('old-project:1'), payload);
+    const second = await sendFcmPush(record('old-project:1'), payload, high);
     assert.equal(second.ok, true);
     assert.deepEqual(sends, ['old-project']);
   });
 
   it('reports the failure when no project takes the token', async () => {
-    const result = await sendFcmPush(record('third-project:1'), payload);
+    const result = await sendFcmPush(record('third-project:1'), payload, high);
     assert.equal(result.ok, false);
     assert.equal(result.status, 403);
     assert.deepEqual(sends, ['new-project', 'old-project']);
+  });
+});
+
+describe('FCM priority', () => {
+  it('is HIGH for new mail only', () => {
+    assert.equal(fcmPriority('high'), 'HIGH');
+    assert.equal(fcmPriority('normal'), 'NORMAL');
+    assert.equal(fcmPriority('low'), 'NORMAL');
+    assert.equal(fcmPriority('very-low'), 'NORMAL');
+  });
+
+  it('goes out with the push', async () => {
+    await sendFcmPush(record('new-project:1'), payload, high);
+    await sendFcmPush(record('new-project:1'), payload, { urgency: 'normal' });
+    assert.deepEqual(priorities, ['HIGH', 'NORMAL']);
   });
 });
 

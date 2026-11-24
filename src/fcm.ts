@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { failureReason, forwardTimeoutMs, type SendResult } from './forward-result.js';
-import { parseRetryAfter } from './forward-policy.js';
+import { parseRetryAfter, type DeliveryOptions, type Urgency } from './forward-policy.js';
 import type { FcmSubscriptionRecord, ForwardPayload } from './types.js';
 
 interface ServiceAccount {
@@ -133,9 +133,20 @@ export interface FcmSendResult extends SendResult {
   body?: unknown;
 }
 
+/**
+ * FCM priority for a push of the given urgency (deliveryOptions). Only new mail
+ * goes HIGH: Android wakes the app for it, but lowers an app whose high-priority
+ * messages post no notification, which would delay the next new mail. Reads,
+ * moves and other changes go NORMAL.
+ */
+export function fcmPriority(urgency: Urgency): 'HIGH' | 'NORMAL' {
+  return urgency === 'high' ? 'HIGH' : 'NORMAL';
+}
+
 export async function sendFcmPush(
   record: FcmSubscriptionRecord,
   payload: ForwardPayload,
+  delivery: DeliveryOptions,
 ): Promise<FcmSendResult> {
   const projects = await loadProjects();
   const known = projectForToken.get(record.fcmToken);
@@ -151,7 +162,7 @@ export async function sendFcmPush(
   // One deadline for the lot: the mail server waits 10 s, however many steps it takes.
   const signal = AbortSignal.timeout(forwardTimeoutMs());
   for (const project of ordered) {
-    result = await sendWithProject(project, record, payload, signal);
+    result = await sendWithProject(project, record, payload, fcmPriority(delivery.urgency), signal);
     if (!result.senderMismatch) break;
   }
   if (result.ok && result.projectId) projectForToken.set(record.fcmToken, result.projectId);
@@ -164,6 +175,7 @@ async function sendWithProject(
   project: FcmProject,
   record: FcmSubscriptionRecord,
   payload: ForwardPayload,
+  priority: 'HIGH' | 'NORMAL',
   signal: AbortSignal,
 ): Promise<FcmSendResult & { senderMismatch: boolean; projectId: string }> {
   const { account } = project;
@@ -175,7 +187,7 @@ async function sendWithProject(
     message: {
       token: record.fcmToken,
       android: {
-        priority: 'HIGH',
+        priority,
       },
       data: {
         kind: payload.kind,

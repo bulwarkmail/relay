@@ -159,10 +159,13 @@ fields always stay. Clients ignore fields they don't know.
 
 ## How it treats the push services
 
-- **Urgency**, for Web Push and UnifiedPush. New mail goes out at high urgency, or
-  what the client asked for in its `emailPush` config. A ping with `Email` but no
-  `EmailDelivery` goes at normal urgency, anything else at low. FCM and APNs always
-  go at high priority.
+- **Urgency.** New mail goes out at high urgency, or what the client asked for in
+  its `emailPush` config. A ping with `Email` but no `EmailDelivery` goes at normal
+  urgency, anything else at low. Web Push and UnifiedPush carry this as the
+  `Urgency` header. FCM sends high urgency at `HIGH` priority and the rest at
+  `NORMAL`, so reads and moves on another client don't count against the app as
+  high-priority messages without a notification. APNs always goes at priority 10,
+  since every APNs push shows an alert.
 - **Topic.** Web Push pings for new mail in one account carry an RFC 8030 `Topic`,
   so a device that was offline gets the last one, not all of them. `EmailPush` pushes
   don't, since each names other messages. UnifiedPush gets no Topic.

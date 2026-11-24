@@ -330,6 +330,24 @@ describe('APNs and FCM against fakes', () => {
     await postJson(native.base, `/api/push/jmap/${id}`, emailPush('d', ['e6']));
     assert.equal((await getJson(native.base, `/api/push/verify/${id}`)).status, 404);
   });
+
+  it('sends FCM only new mail at high priority, reads and moves elsewhere at normal', async () => {
+    const send = `/v1/projects/${projectId}/messages:send`;
+    service.answer(send, { status: 200, headers: { 'content-type': 'application/json' }, body: '{"name":"x"}' });
+    const priorityOf = async (body: unknown) => {
+      const id = newId();
+      assert.equal((await postJson(native.base, '/api/push/register', { subscriptionId: id, fcmToken: `p${id}`.padEnd(100, 'p'), accountLabel: 'a@b' })).status, 200);
+      assert.equal((await postJson(native.base, `/api/push/jmap/${id}`, body)).status, 200);
+      return JSON.parse(service.to(send).at(-1)!.body.toString()).message.android.priority;
+    };
+    assert.equal(await priorityOf(stateChange({ a: { EmailDelivery: 's1', Email: 's2' } })), 'HIGH');
+    // One account with new mail is enough, whatever the others say.
+    assert.equal(await priorityOf(stateChange({ a: { Email: 's3' }, b: { EmailDelivery: 's4' } })), 'HIGH');
+    assert.equal(await priorityOf(emailPush('a', ['e1'])), 'HIGH');
+    assert.equal(await priorityOf(stateChange({ a: { Email: 's5' } })), 'NORMAL');
+    assert.equal(await priorityOf(stateChange({ a: { Mailbox: 's6' } })), 'NORMAL');
+    assert.equal(await priorityOf(stateChange({ a: { ContactCard: 's7' } })), 'NORMAL');
+  });
 });
 
 describe('DELETE /api/push/register/:id', () => {
