@@ -1,7 +1,8 @@
 services:
   relay:
-    build: .
-    image: bulwark-relay:local
+    # The published image (README, "Run in Docker"). To build from this checkout
+    # instead, replace the line with `build: .` and `image: bulwark-relay:local`.
+    image: ghcr.io/bulwarkmail/relay:latest
     container_name: bulwark-relay
     restart: unless-stopped
     # A stop waits for a push still on its way, then folds the journal into

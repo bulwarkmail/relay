@@ -491,10 +491,36 @@ npm run dev
 
 ## Run in Docker
 
+The image is published to the GitHub Container Registry for amd64 and arm64:
+
+| Tag | What it is |
+| --- | --- |
+| `ghcr.io/bulwarkmail/relay:latest` | The newest release |
+| `ghcr.io/bulwarkmail/relay:<version>` | One release, such as `1.0.0`; `1.0` and `1` follow the newest release of that line |
+| `ghcr.io/bulwarkmail/relay:edge` | The newest commit on `main` |
+| `ghcr.io/bulwarkmail/relay:sha-<commit>` | One commit on `main` |
+
+`docker-compose.yml` runs `latest`. Put it, and a `.env` with your settings (see
+[Environment](#environment)), in a directory, then:
+
 ```sh
 mkdir -p data
-cp path/to/fcm-service-account.json data/
+cp path/to/fcm-service-account.json data/   # only for FCM
+sudo chown -R 100:101 data                   # the container's relay user
+docker network create bulwark                # once, see below
+docker compose pull
 docker compose up -d
+```
+
+To update, run `docker compose pull` and `docker compose up -d` again. To build the
+image from a checkout of this repository instead, replace the `image:` line in
+`docker-compose.yml` with `build: .` and `image: bulwark-relay:local`.
+
+Every image carries a signed build provenance attestation. Check that one was
+built by this repository's workflow with:
+
+```sh
+gh attestation verify oci://ghcr.io/bulwarkmail/relay:latest --owner bulwarkmail
 ```
 
 The container runs read-only, without capabilities and with `no-new-privileges`:
